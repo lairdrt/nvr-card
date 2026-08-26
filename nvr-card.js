@@ -538,11 +538,11 @@ class NVRCard extends HTMLElement {
               </button>
 
               <div
-                class="sidebar-section-body"
+                class="sidebar-section-body sidebar-layout-body"
                 ${this._sidebarSections.layouts ? "" : "hidden"}
               >
-                <div class="sidebar-placeholder">
-                  -
+                <div class="sidebar-layout-grid">
+                  ${this.buildSidebarLayouts()}
                 </div>
               </div>
 
@@ -769,6 +769,127 @@ class NVRCard extends HTMLElement {
         color: #555;
 
         font-size: 10px;
+      }
+
+
+      .sidebar-layout-body {
+        max-height: 220px;
+
+        overflow-y: auto;
+
+        padding-right: 6px;
+
+        scrollbar-color: #666 #181818;
+        scrollbar-width: thin;
+      }
+
+
+      .sidebar-layout-body::-webkit-scrollbar {
+        width: 6px;
+      }
+
+
+      .sidebar-layout-body::-webkit-scrollbar-track {
+        background: #181818;
+      }
+
+
+      .sidebar-layout-body::-webkit-scrollbar-thumb {
+        background: #666;
+
+        border-radius: 0;
+      }
+
+
+      .sidebar-layout-body::-webkit-scrollbar-thumb:hover {
+        background: #888;
+      }
+
+
+      .sidebar-layout-body::-webkit-scrollbar-button {
+        width: 0 !important;
+        height: 0 !important;
+        min-width: 0 !important;
+        min-height: 0 !important;
+
+        display: none !important;
+
+        -webkit-appearance: none !important;
+        appearance: none !important;
+
+        background: transparent !important;
+
+        border: 0 !important;
+      }
+
+
+      .sidebar-layout-body::-webkit-scrollbar-button:vertical {
+        width: 0 !important;
+        height: 0 !important;
+        min-width: 0 !important;
+        min-height: 0 !important;
+
+        display: none !important;
+
+        -webkit-appearance: none !important;
+        appearance: none !important;
+
+        background: transparent !important;
+
+        border: 0 !important;
+      }
+
+
+      .sidebar-layout-grid {
+        display: grid;
+        grid-template-columns:
+          repeat(2, minmax(0, 1fr));
+
+        gap: 6px;
+
+        padding: 8px 0;
+      }
+
+
+      .sidebar-layout-item {
+        min-width: 0;
+
+        padding: 5px 3px;
+
+        background: #181818;
+
+        color: #aaa;
+
+        border: 1px solid #444;
+        border-radius: 0;
+
+        font-family: inherit;
+
+        cursor: pointer;
+      }
+
+
+      .sidebar-layout-item:hover {
+        color: #fff;
+        border-color: #888;
+      }
+
+
+      .sidebar-layout-item.selected {
+        color: #fff;
+        border-color: #fff;
+      }
+
+
+      .sidebar-layout-label {
+        margin-top: 4px;
+
+        overflow: hidden;
+
+        font-size: 9px;
+
+        text-overflow: ellipsis;
+        white-space: nowrap;
       }
 
 
@@ -1280,6 +1401,32 @@ class NVRCard extends HTMLElement {
             ${this.buildMiniature(layout)}
 
             <div class="button-label">
+              ${layout.label}
+            </div>
+
+          </button>
+        `;
+      })
+      .join("");
+  }
+
+
+  buildSidebarLayouts() {
+    return Object
+      .entries(this.layouts)
+      .map(([key, layout]) => {
+
+        return `
+          <button
+            type="button"
+            class="sidebar-layout-item"
+            data-layout="${key}"
+            aria-label="${layout.label} layout"
+          >
+
+            ${this.buildMiniature(layout)}
+
+            <div class="sidebar-layout-label">
               ${layout.label}
             </div>
 
@@ -2068,29 +2215,35 @@ class NVRCard extends HTMLElement {
   attachLayoutHandlers() {
     this
       .querySelectorAll(
-        ".layout-button"
+        ".layout-button, .sidebar-layout-item"
       )
       .forEach(button => {
 
         button.addEventListener(
           "click",
           () => {
-
-            this._layout =
-              button.dataset.layout;
-
-
-            /*
-             * No grid rebuild.
-             * No stream recreation.
-             */
-            this.applyLayout();
-
-
-            this.updateSelectedButton();
+            this.selectLayout(
+              button.dataset.layout
+            );
           }
         );
       });
+  }
+
+
+  selectLayout(layoutKey) {
+    if (!this.layouts[layoutKey]) {
+      return;
+    }
+
+    this._layout = layoutKey;
+
+    /*
+     * No grid rebuild.
+     * No stream recreation.
+     */
+    this.applyLayout();
+    this.updateSelectedButton();
   }
 
 
@@ -2248,7 +2401,7 @@ class NVRCard extends HTMLElement {
   updateSelectedButton() {
     this
       .querySelectorAll(
-        ".layout-button"
+        ".layout-button, .sidebar-layout-item"
       )
       .forEach(button => {
 
