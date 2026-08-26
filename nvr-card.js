@@ -4,6 +4,9 @@
 
 const NVR_BUILD = "__NVR_BUILD__";
 
+// Internal camera-inventory safety limit; not a viewer slot limit.
+const MAX_CAMERAS = 256;
+
 class NVRCard extends HTMLElement {
   constructor() {
     super();
@@ -11,20 +14,10 @@ class NVRCard extends HTMLElement {
     this._layout = "2x2";
     this._hass = null;
 
-    this._cameras = [
-      { name: "Garage",     entity: "camera.garage" },
-      { name: "Front Door", entity: "camera.front_door" },
-      { name: "Drive Down", entity: "camera.drive_down" },
-      { name: "Drive Up",   entity: "camera.drive_up" },
+    this._cameras = [];
 
-      { name: "Side Gate",   entity: null },
-      { name: "Fireplace",   entity: null },
-      { name: "Front Entry", entity: null },
-      { name: "AC",          entity: null },
-      { name: "Patio Roof",  entity: null },
-      { name: "Patio",       entity: null },
-      { name: "Backyard",    entity: null }
-    ];
+    this._cameraAspectRatio =
+      16 / 9;
 
     /*
      * Fixed 16-slot assignment array.
@@ -253,8 +246,187 @@ class NVRCard extends HTMLElement {
 
 
   setConfig(config) {
+    const normalized =
+      this.normalizeConfig(config);
+
     this.config = config;
+    this._cameras = normalized.cameras;
+    this._cameraAspectRatio =
+      normalized.cameraAspectRatio;
+
     this.render();
+  }
+
+
+  normalizeConfig(config) {
+    if (
+      !config ||
+      typeof config !== "object" ||
+      Array.isArray(config)
+    ) {
+      throw new Error(
+        "NVR card configuration must be an object."
+      );
+    }
+
+    const hasCameras =
+      Object.prototype.hasOwnProperty.call(
+        config,
+        "cameras"
+      );
+
+    if (!hasCameras) {
+      throw new Error(
+        "NVR card configuration requires a cameras array."
+      );
+    }
+
+    const hasAspectRatio =
+      Object.prototype.hasOwnProperty.call(
+        config,
+        "camera_aspect_ratio"
+      );
+
+    const cameras =
+      this.normalizeCameras(config.cameras);
+
+    const cameraAspectRatio =
+      this.parseAspectRatio(
+        hasAspectRatio
+          ? config.camera_aspect_ratio
+          : "16:9"
+      );
+
+    return {
+      cameras,
+      cameraAspectRatio
+    };
+  }
+
+
+  normalizeCameras(cameras) {
+    if (!Array.isArray(cameras)) {
+      throw new Error(
+        "cameras must be an array."
+      );
+    }
+
+    if (cameras.length > MAX_CAMERAS) {
+      throw new Error(
+        `cameras cannot contain more than ${MAX_CAMERAS} entries.`
+      );
+    }
+
+    const names = new Set();
+    const allowedFields =
+      new Set(["name", "entity", "active"]);
+
+    return cameras.map((camera, index) => {
+      const number = index + 1;
+
+      if (
+        !camera ||
+        typeof camera !== "object" ||
+        Array.isArray(camera)
+      ) {
+        throw new Error(
+          `Camera ${number} must be an object.`
+        );
+      }
+
+      const unsupportedField =
+        Object.keys(camera).find(
+          field => !allowedFields.has(field)
+        );
+
+      if (unsupportedField) {
+        throw new Error(
+          `Camera ${number} has unsupported field "${unsupportedField}".`
+        );
+      }
+
+      if (
+        typeof camera.name !== "string" ||
+        camera.name.trim().length === 0
+      ) {
+        throw new Error(
+          `Camera ${number} name must be a nonempty string.`
+        );
+      }
+
+      if (
+        typeof camera.entity !== "string" ||
+        camera.entity.trim().length === 0
+      ) {
+        throw new Error(
+          `Camera ${number} entity must be a nonempty string.`
+        );
+      }
+
+      if (names.has(camera.name)) {
+        throw new Error(
+          `Camera names must be unique: "${camera.name}".`
+        );
+      }
+
+      names.add(camera.name);
+
+      const hasActive =
+        Object.prototype.hasOwnProperty.call(
+          camera,
+          "active"
+        );
+
+      if (
+        hasActive &&
+        typeof camera.active !== "boolean"
+      ) {
+        throw new Error(
+          `Camera ${number} active must be a boolean.`
+        );
+      }
+
+      return {
+        name: camera.name,
+        entity: camera.entity,
+        active: hasActive
+          ? camera.active
+          : true
+      };
+    });
+  }
+
+
+  parseAspectRatio(value) {
+    if (typeof value !== "string") {
+      throw new Error(
+        "camera_aspect_ratio must be a string such as \"16:9\"."
+      );
+    }
+
+    const parts = value.split(":");
+
+    if (parts.length !== 2) {
+      throw new Error(
+        "camera_aspect_ratio must contain exactly one colon."
+      );
+    }
+
+    const width = Number(parts[0]);
+    const height = Number(parts[1]);
+
+    if (
+      !Number.isFinite(width) ||
+      !Number.isFinite(height) ||
+      width <= 0 ||
+      height <= 0
+    ) {
+      throw new Error(
+        "camera_aspect_ratio values must be positive finite numbers."
+      );
+    }
+
+    return width / height;
   }
 
 
@@ -884,6 +1056,9 @@ class NVRCard extends HTMLElement {
 
   buildCameraList() {
     return this._cameras
+      .filter(camera => {
+        return camera.active === true;
+      })
       .map((camera, index) => {
 
         const liveClass =
@@ -1501,7 +1676,7 @@ class NVRCard extends HTMLElement {
 
   fitLiveCameras() {
     const CAMERA_RATIO =
-      16 / 9;
+      this._cameraAspectRatio;
 
 
     this

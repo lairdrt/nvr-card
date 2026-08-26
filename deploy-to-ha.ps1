@@ -52,14 +52,17 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 $BuildIdentifier = "NVR $ShortHash"
-if ($GitStatus.Count -gt 0) {
-    $BuildIdentifier += "-dev"
-}
-
 $Placeholder = "__NVR_BUILD__"
 
 try {
     $SourceContent = Get-Content -LiteralPath $SourceFile -Raw -ErrorAction Stop
+
+    if ($GitStatus.Count -gt 0) {
+        $SourceHash = (Get-FileHash -LiteralPath $SourceFile -Algorithm SHA256 -ErrorAction Stop).Hash
+        $BuildIdentifier += "-$($SourceHash.Substring(0, 6).ToLowerInvariant())"
+    }
+
+    Write-Host "Deploying build: $BuildIdentifier"
 
     if (-not $SourceContent.Contains($Placeholder)) {
         Write-Error "Build placeholder was not found in the source file: $Placeholder"
