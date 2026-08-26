@@ -8,6 +8,8 @@ const NVR_BUILD = "__NVR_BUILD__";
 const MAX_CAMERAS = 256;
 const NVR_LAYOUT_DRAG_TYPE =
   "application/x-nvr-layout";
+const NVR_CAMERA_DRAG_TYPE =
+  "application/x-nvr-camera";
 
 class NVRCard extends HTMLElement {
   constructor() {
@@ -15,6 +17,31 @@ class NVRCard extends HTMLElement {
 
     this._layout = "2x2";
     this._hass = null;
+    this._selectedCamera = null;
+    this._selectedLayout = null;
+    this._cameraContextSlot = null;
+
+    this._cameraContextPointerHandler =
+      event => {
+        const menu =
+          this.querySelector(
+            ".camera-context-menu"
+          );
+
+        if (
+          !menu ||
+          !event.composedPath().includes(menu)
+        ) {
+          this.closeCameraContextMenu();
+        }
+      };
+
+    this._cameraContextKeyHandler =
+      event => {
+        if (event.key === "Escape") {
+          this.closeCameraContextMenu();
+        }
+      };
 
     this._sidebarSections = {
       cameras: true,
@@ -460,6 +487,8 @@ class NVRCard extends HTMLElement {
 
 
   disconnectedCallback() {
+    this.closeCameraContextMenu();
+
     if (this._resizeObserver) {
       this._resizeObserver.disconnect();
       this._resizeObserver = null;
@@ -476,6 +505,8 @@ class NVRCard extends HTMLElement {
 
 
   render() {
+    this.closeCameraContextMenu();
+
     this.innerHTML = `
       <ha-card>
         <div class="nvr-shell">
@@ -508,13 +539,6 @@ class NVRCard extends HTMLElement {
                 <div class="camera-items">
                   ${this.buildCameraList()}
                 </div>
-
-                <button
-                  type="button"
-                  class="clear-button"
-                >
-                  Clear Grid
-                </button>
 
               </div>
 
@@ -581,6 +605,22 @@ class NVRCard extends HTMLElement {
             </section>
 
 
+            <div class="sidebar-utility">
+
+              <button
+                type="button"
+                class="clear-button"
+              >
+                Clear Grid
+              </button>
+
+              <span class="build-identifier">
+                ${NVR_BUILD}
+              </span>
+
+            </div>
+
+
           </aside>
 
 
@@ -593,21 +633,17 @@ class NVRCard extends HTMLElement {
           </main>
 
 
-          <footer class="layout-bar">
-
-            <div class="layout-label">
-              LAYOUT
-            </div>
-
-            <div class="layout-buttons">
-              ${this.buildLayoutButtons()}
-            </div>
-
-            <span class="build-identifier">
-              ${NVR_BUILD}
-            </span>
-
-          </footer>
+          <div
+            class="camera-context-menu"
+            hidden
+          >
+            <button
+              type="button"
+              class="camera-context-command"
+            >
+              Close Camera
+            </button>
+          </div>
 
         </div>
       </ha-card>
@@ -621,6 +657,8 @@ class NVRCard extends HTMLElement {
     style.textContent = `
       ha-card {
         height: 700px;
+
+        position: relative;
 
         background: #000;
         color: #fff;
@@ -642,12 +680,10 @@ class NVRCard extends HTMLElement {
           minmax(0, 1fr);
 
         grid-template-rows:
-          minmax(0, 1fr)
-          105px;
+          minmax(0, 1fr);
 
         grid-template-areas:
-          "cameras video"
-          "cameras layouts";
+          "cameras video";
       }
 
 
@@ -765,6 +801,21 @@ class NVRCard extends HTMLElement {
       }
 
 
+      .sidebar-utility {
+        flex: 0 0 auto;
+
+        display: flex;
+        align-items: center;
+
+        gap: 8px;
+
+        margin-top: 8px;
+        padding-top: 8px;
+
+        border-top: 1px solid #555;
+      }
+
+
       .sidebar-placeholder {
         padding: 7px 4px 8px;
 
@@ -878,6 +929,12 @@ class NVRCard extends HTMLElement {
 
 
       .sidebar-layout-item.selected {
+        color: #ddd;
+        border-color: #777;
+      }
+
+
+      .sidebar-layout-item.target-selected {
         color: #fff;
         border-color: #fff;
       }
@@ -943,8 +1000,20 @@ class NVRCard extends HTMLElement {
 
       .camera-item.assigned {
         background: #1e1e1e;
+        color: #ddd;
+        border-color: transparent;
+      }
+
+
+      .camera-item.target-selected {
+        background: #181818;
         color: #fff;
-        border-color: #777;
+        border-color: #aaa;
+      }
+
+
+      .camera-item.dragging {
+        opacity: 0.65;
       }
 
 
@@ -985,9 +1054,7 @@ class NVRCard extends HTMLElement {
       .clear-button {
         flex: 0 0 auto;
 
-        margin-top: 10px;
-
-        padding: 7px 8px;
+        padding: 4px 6px;
 
         background: #181818;
 
@@ -995,6 +1062,8 @@ class NVRCard extends HTMLElement {
 
         border: 1px solid #555;
         border-radius: 3px;
+
+        font-size: 10px;
 
         cursor: pointer;
       }
@@ -1066,6 +1135,12 @@ class NVRCard extends HTMLElement {
 
       .video-cell.hidden-slot {
         display: none;
+      }
+
+
+      .video-cell.camera-drop-target {
+        outline: 1px solid #aaa;
+        outline-offset: -2px;
       }
 
 
@@ -1177,52 +1252,8 @@ class NVRCard extends HTMLElement {
 
 
       /* ================================================
-         LAYOUT BAR
+         CAMERA CONTEXT MENU
          ================================================ */
-
-      .layout-bar {
-        grid-area: layouts;
-
-        min-width: 0;
-
-        display: flex;
-        align-items: center;
-
-        gap: 14px;
-
-        padding: 8px 14px;
-
-        background: #111;
-
-        border-top: 1px solid #555;
-      }
-
-
-      .layout-label {
-        flex: 0 0 auto;
-
-        color: #999;
-
-        font-size: 11px;
-        font-weight: 600;
-
-        letter-spacing: 0.08em;
-      }
-
-
-      .layout-buttons {
-        min-width: 0;
-
-        display: flex;
-        align-items: center;
-
-        gap: 8px;
-
-        overflow-x: auto;
-
-        padding-bottom: 2px;
-      }
-
 
       .build-identifier {
         flex: 0 0 auto;
@@ -1239,45 +1270,49 @@ class NVRCard extends HTMLElement {
       }
 
 
-      .layout-button {
-        flex: 0 0 auto;
+      .camera-context-menu {
+        position: absolute;
 
-        min-width: 68px;
+        z-index: 20;
+
+        min-width: 104px;
+
+        padding: 2px;
+
+        background: #111;
+
+        border: 1px solid #777;
+      }
+
+
+      .camera-context-menu[hidden] {
+        display: none;
+      }
+
+
+      .camera-context-command {
+        width: 100%;
 
         padding: 5px 7px;
 
-        background: #181818;
+        background: transparent;
 
         color: #ccc;
 
-        border: 1px solid #555;
-        border-radius: 3px;
+        border: 0;
+        border-radius: 0;
+
+        font-family: inherit;
+        font-size: 11px;
+        text-align: left;
 
         cursor: pointer;
       }
 
 
-      .layout-button:hover {
+      .camera-context-command:hover {
         background: #222;
-        border-color: #999;
         color: #fff;
-      }
-
-
-      .layout-button.selected {
-        border-color: #fff;
-
-        box-shadow:
-          0 0 0 1px #fff inset;
-      }
-
-
-      .button-label {
-        margin-top: 4px;
-
-        font-size: 9px;
-
-        white-space: nowrap;
       }
 
 
@@ -1318,11 +1353,13 @@ class NVRCard extends HTMLElement {
 
 
     this.attachCameraHandlers();
+    this.attachCameraDragHandlers();
     this.attachSidebarHandlers();
     this.attachLayoutHandlers();
     this.attachLayoutDragHandlers();
     this.attachClearHandler();
     this.attachSlotHandlers();
+    this.attachCameraContextMenuHandlers();
 
     /*
      * Persistent grid already exists.
@@ -1382,6 +1419,7 @@ class NVRCard extends HTMLElement {
             type="button"
             class="camera-item ${liveClass}"
             data-camera="${camera.name}"
+            draggable="true"
           >
 
             <span class="camera-index">
@@ -1391,31 +1429,6 @@ class NVRCard extends HTMLElement {
             <span class="camera-name">
               ${camera.name}
             </span>
-
-          </button>
-        `;
-      })
-      .join("");
-  }
-
-
-  buildLayoutButtons() {
-    return Object
-      .entries(this.layouts)
-      .map(([key, layout]) => {
-
-        return `
-          <button
-            type="button"
-            class="layout-button"
-            data-layout="${key}"
-          >
-
-            ${this.buildMiniature(layout)}
-
-            <div class="button-label">
-              ${layout.label}
-            </div>
 
           </button>
         `;
@@ -1565,17 +1578,64 @@ class NVRCard extends HTMLElement {
   }
 
 
-  /*
-   * THIS IS THE ORIGINAL KNOWN-GOOD REMOVAL BEHAVIOR.
-   *
-   * It does NOT compact cameras.
-   *
-   * That means the previously discovered 1x1 edge case
-   * still exists, intentionally, until we fix it safely.
-   */
-    
+  assignCameraToSlot(cameraName, targetSlot) {
+    const camera =
+      this.getCameraByName(cameraName);
+
+    const targetCell =
+      this.querySelector(
+        `.video-cell[data-slot="${targetSlot}"]`
+      );
+
+    if (
+      !camera ||
+      camera.active !== true ||
+      !Number.isInteger(targetSlot) ||
+      targetSlot < 0 ||
+      targetSlot >= this._assignedCameras.length ||
+      !targetCell ||
+      targetCell.classList.contains(
+        "hidden-slot"
+      )
+    ) {
+      return;
+    }
+
+    const sourceSlot =
+      this._assignedCameras.indexOf(
+        cameraName
+      );
+
+    if (sourceSlot === targetSlot) {
+      return;
+    }
+
+    if (sourceSlot !== -1) {
+      this._assignedCameras[sourceSlot] =
+        null;
+    }
+
+    this._assignedCameras[targetSlot] =
+      cameraName;
+
+    /*
+     * Targeted placement never compacts other slots.
+     * Re-render only the moved camera's source and
+     * the exact replacement target.
+     */
+    if (sourceSlot !== -1) {
+      this.renderSlot(sourceSlot);
+    }
+
+    this.renderSlot(targetSlot);
+    this.updateCameraListState();
+    this.scheduleCameraFit();
+  }
+
+
   removeCameraFromSlot(slot) {
     if (
+      !Number.isInteger(slot) ||
       slot < 0 ||
       slot >= this._assignedCameras.length
     ) {
@@ -1588,144 +1648,94 @@ class NVRCard extends HTMLElement {
       return;
     }
 
-    /*
-    * Remove ONLY the selected camera.
-    * This intentionally destroys that one stream.
-    */
-    const removedCell =
-      this.querySelector(
-        `.video-cell[data-slot="${slot}"]`
-      );
-
-    if (removedCell) {
-      removedCell.innerHTML = "";
-    }
-
     this._assignedCameras[slot] = null;
 
     /*
-    * Compact later cameras toward the front.
-    *
-    * IMPORTANT:
-    * We MOVE their existing DOM nodes rather than
-    * calling renderSlot(), so surviving hui-image
-    * streams should remain alive.
-    */
-    for (
-      let targetSlot = slot;
-      targetSlot < this._assignedCameras.length - 1;
-      targetSlot++
-    ) {
+     * Targeted removal intentionally leaves a hole.
+     * Only the removed camera's slot is rebuilt.
+     */
+    this.renderSlot(slot);
 
-      /*
-      * Find the next occupied slot after targetSlot.
-      */
-      let sourceSlot = -1;
+    this.updateCameraListState();
+  }
 
-      for (
-        let searchSlot = targetSlot + 1;
-        searchSlot < this._assignedCameras.length;
-        searchSlot++
-      ) {
-        if (
-          this._assignedCameras[searchSlot] !== null
-        ) {
-          sourceSlot = searchSlot;
-          break;
+
+  repackAssignedCameras() {
+    const occupied =
+      this._assignedCameras
+        .map((cameraName, sourceSlot) => {
+          return {
+            cameraName,
+            sourceSlot
+          };
+        })
+        .filter(entry => {
+          return entry.cameraName !== null;
+        });
+
+    const cells =
+      Array.from(
+        { length: this._assignedCameras.length },
+        (_, slot) => {
+          return this.querySelector(
+            `.video-cell[data-slot="${slot}"]`
+          );
         }
-      }
+      );
 
-      /*
-      * No more cameras exist after this point.
-      */
-      if (sourceSlot === -1) {
-        break;
-      }
-
-      const targetCell =
-        this.querySelector(
-          `.video-cell[data-slot="${targetSlot}"]`
-        );
-
-      const sourceCell =
-        this.querySelector(
-          `.video-cell[data-slot="${sourceSlot}"]`
-        );
-
-      if (
-        !targetCell ||
-        !sourceCell
-      ) {
-        continue;
-      }
-
-      /*
-      * Update the assignment array.
-      */
-      this._assignedCameras[targetSlot] =
-        this._assignedCameras[sourceSlot];
-
-      this._assignedCameras[sourceSlot] =
-        null;
-
-      /*
-      * Clear only the target's old contents.
-      * The removed camera is already gone.
-      */
-      targetCell.innerHTML = "";
-
-      /*
-      * MOVE every existing node from source to target.
-      *
-      * appendChild() moves nodes; it does not clone them.
-      * Thus the surviving hui-image object remains the
-      * exact same DOM object.
-      */
-      while (sourceCell.firstChild) {
-        targetCell.appendChild(
-          sourceCell.firstChild
-        );
-      }
-
-      /*
-      * Camera has moved, so update its displayed
-      * slot number if that overlay exists.
-      */
-      const number =
-        targetCell.querySelector(
-          ".cell-number"
-        );
-
-      if (number) {
-        number.textContent =
-          String(targetSlot + 1);
-      }
+    if (cells.some(cell => !cell)) {
+      return;
     }
 
-    /*
-    * Restore empty-slot markers wherever necessary.
-    */
-    for (
-      let i = 0;
-      i < this._assignedCameras.length;
-      i++
-    ) {
+    occupied.forEach(
+      (entry, targetSlot) => {
+        if (entry.sourceSlot === targetSlot) {
+          return;
+        }
 
-      if (
-        this._assignedCameras[i] !== null
-      ) {
-        continue;
+        const sourceCell =
+          cells[entry.sourceSlot];
+
+        const targetCell =
+          cells[targetSlot];
+
+        targetCell.innerHTML = "";
+
+        while (sourceCell.firstChild) {
+          targetCell.appendChild(
+            sourceCell.firstChild
+          );
+        }
+
+        const number =
+          targetCell.querySelector(
+            ".cell-number"
+          );
+
+        if (number) {
+          number.textContent =
+            String(targetSlot + 1);
+        }
       }
+    );
 
-      const cell =
-        this.querySelector(
-          `.video-cell[data-slot="${i}"]`
-        );
+    this._assignedCameras.fill(null);
 
-      if (
-        !cell ||
-        cell.children.length > 0
-      ) {
+    occupied.forEach(
+      (entry, targetSlot) => {
+        this._assignedCameras[targetSlot] =
+          entry.cameraName;
+      }
+    );
+
+    for (
+      let slot = occupied.length;
+      slot < cells.length;
+      slot++
+    ) {
+      const cell = cells[slot];
+
+      if (cell.children.length > 0) {
         continue;
       }
 
@@ -1736,18 +1746,11 @@ class NVRCard extends HTMLElement {
         "empty-cell-center";
 
       empty.textContent =
-        String(i + 1);
+        String(slot + 1);
 
       cell.appendChild(empty);
     }
 
-    this.updateCameraListState();
-
-    /*
-    * Geometry may have changed slightly after the moves.
-    * Do NOT rebuild any streams.
-    */
-    this.scheduleCameraFit();
   }
 
   
@@ -2134,13 +2137,237 @@ class NVRCard extends HTMLElement {
         button.addEventListener(
           "click",
           () => {
-
-            this.assignCamera(
+            this.toggleCameraTargetSelection(
               button.dataset.camera
             );
           }
         );
       });
+  }
+
+
+  toggleCameraTargetSelection(cameraName) {
+    const camera =
+      this.getCameraByName(cameraName);
+
+    if (
+      !camera ||
+      camera.active !== true
+    ) {
+      return;
+    }
+
+    this.clearLayoutTargetSelection();
+
+    this._selectedCamera =
+      this._selectedCamera === cameraName
+        ? null
+        : cameraName;
+
+    this.updateCameraListState();
+  }
+
+
+  clearCameraTargetSelection() {
+    if (this._selectedCamera === null) {
+      return;
+    }
+
+    this._selectedCamera = null;
+    this.updateCameraListState();
+  }
+
+
+  toggleLayoutTargetSelection(layoutKey) {
+    if (!this.layouts[layoutKey]) {
+      return;
+    }
+
+    this.clearCameraTargetSelection();
+
+    this._selectedLayout =
+      this._selectedLayout === layoutKey
+        ? null
+        : layoutKey;
+
+    this.updateSelectedButton();
+  }
+
+
+  clearLayoutTargetSelection() {
+    if (this._selectedLayout === null) {
+      return;
+    }
+
+    this._selectedLayout = null;
+    this.updateSelectedButton();
+  }
+
+
+  attachCameraDragHandlers() {
+    this
+      .querySelectorAll(".camera-item")
+      .forEach(item => {
+        item.addEventListener(
+          "dragstart",
+          event => {
+            const cameraName =
+              item.dataset.camera;
+
+            const camera =
+              this.getCameraByName(cameraName);
+
+            if (
+              !event.dataTransfer ||
+              !camera ||
+              camera.active !== true
+            ) {
+              event.preventDefault();
+              return;
+            }
+
+            this.closeCameraContextMenu();
+            this.clearLayoutTargetSelection();
+
+            event.dataTransfer.effectAllowed =
+              "move";
+
+            event.dataTransfer.setData(
+              NVR_CAMERA_DRAG_TYPE,
+              cameraName
+            );
+
+            item.classList.add("dragging");
+          }
+        );
+
+        item.addEventListener(
+          "dragend",
+          () => {
+            item.classList.remove("dragging");
+            this.setCameraDropTarget(null);
+          }
+        );
+      });
+
+    this
+      .querySelectorAll(".video-cell")
+      .forEach(cell => {
+        cell.addEventListener(
+          "dragenter",
+          event => {
+            if (
+              !this.isCameraDrag(event) ||
+              cell.classList.contains(
+                "hidden-slot"
+              )
+            ) {
+              return;
+            }
+
+            event.preventDefault();
+            this.setCameraDropTarget(cell);
+          }
+        );
+
+        cell.addEventListener(
+          "dragover",
+          event => {
+            if (
+              !this.isCameraDrag(event) ||
+              cell.classList.contains(
+                "hidden-slot"
+              )
+            ) {
+              return;
+            }
+
+            event.preventDefault();
+            event.dataTransfer.dropEffect =
+              "move";
+
+            this.setCameraDropTarget(cell);
+          }
+        );
+
+        cell.addEventListener(
+          "dragleave",
+          event => {
+            if (
+              event.relatedTarget &&
+              cell.contains(event.relatedTarget)
+            ) {
+              return;
+            }
+
+            cell.classList.remove(
+              "camera-drop-target"
+            );
+          }
+        );
+
+        cell.addEventListener(
+          "drop",
+          event => {
+            if (
+              !this.isCameraDrag(event) ||
+              cell.classList.contains(
+                "hidden-slot"
+              )
+            ) {
+              return;
+            }
+
+            event.preventDefault();
+            this.setCameraDropTarget(null);
+
+            const cameraName =
+              event.dataTransfer.getData(
+                NVR_CAMERA_DRAG_TYPE
+              );
+
+            const targetSlot =
+              Number(cell.dataset.slot);
+
+            this.assignCameraToSlot(
+              cameraName,
+              targetSlot
+            );
+
+            this.clearCameraTargetSelection();
+          }
+        );
+      });
+  }
+
+
+  isCameraDrag(event) {
+    if (!event.dataTransfer) {
+      return false;
+    }
+
+    return Array
+      .from(event.dataTransfer.types)
+      .includes(NVR_CAMERA_DRAG_TYPE);
+  }
+
+
+  setCameraDropTarget(targetCell) {
+    this
+      .querySelectorAll(
+        ".video-cell.camera-drop-target"
+      )
+      .forEach(cell => {
+        cell.classList.remove(
+          "camera-drop-target"
+        );
+      });
+
+    if (targetCell) {
+      targetCell.classList.add(
+        "camera-drop-target"
+      );
+    }
   }
 
 
@@ -2229,14 +2456,14 @@ class NVRCard extends HTMLElement {
   attachLayoutHandlers() {
     this
       .querySelectorAll(
-        ".layout-button, .sidebar-layout-item"
+        ".sidebar-layout-item"
       )
       .forEach(button => {
 
         button.addEventListener(
           "click",
           () => {
-            this.selectLayout(
+            this.toggleLayoutTargetSelection(
               button.dataset.layout
             );
           }
@@ -2250,13 +2477,19 @@ class NVRCard extends HTMLElement {
       return;
     }
 
+    this.closeCameraContextMenu();
+    this.clearCameraTargetSelection();
+    this.repackAssignedCameras();
+
     this._layout = layoutKey;
+    this._selectedLayout = null;
 
     /*
      * No grid rebuild.
      * No stream recreation.
      */
     this.applyLayout();
+    this.updateCameraListState();
     this.updateSelectedButton();
   }
 
@@ -2280,6 +2513,9 @@ class NVRCard extends HTMLElement {
               event.preventDefault();
               return;
             }
+
+            this.closeCameraContextMenu();
+            this.clearCameraTargetSelection();
 
             event.dataTransfer.effectAllowed =
               "copy";
@@ -2398,28 +2634,188 @@ class NVRCard extends HTMLElement {
 
 
   attachSlotHandlers() {
+    const grid =
+      this.querySelector(".video-grid");
+
+    if (!grid) {
+      return;
+    }
+
+    grid.addEventListener(
+      "click",
+      event => {
+        if (this._selectedLayout !== null) {
+          this.selectLayout(
+            this._selectedLayout
+          );
+          return;
+        }
+
+        if (this._selectedCamera === null) {
+          return;
+        }
+
+        const cell =
+          event.target.closest(".video-cell");
+
+        if (
+          !cell ||
+          cell.classList.contains(
+            "hidden-slot"
+          )
+        ) {
+          return;
+        }
+
+        const slot =
+          Number(cell.dataset.slot);
+
+        this.assignCameraToSlot(
+          this._selectedCamera,
+          slot
+        );
+
+        this.clearCameraTargetSelection();
+      }
+    );
+  }
+
+
+  attachCameraContextMenuHandlers() {
     this
-      .querySelectorAll(
-        ".video-cell"
-      )
+      .querySelectorAll(".video-cell")
       .forEach(cell => {
-
         cell.addEventListener(
-          "click",
-          () => {
-
+          "contextmenu",
+          event => {
             const slot =
-              Number(
-                cell.dataset.slot
-              );
+              Number(cell.dataset.slot);
 
+            if (
+              !Number.isInteger(slot) ||
+              this._assignedCameras[slot] === null
+            ) {
+              this.closeCameraContextMenu();
+              return;
+            }
 
-            this.removeCameraFromSlot(
-              slot
+            event.preventDefault();
+
+            this.openCameraContextMenu(
+              slot,
+              event.clientX,
+              event.clientY
             );
           }
         );
       });
+
+    const command =
+      this.querySelector(
+        ".camera-context-command"
+      );
+
+    if (command) {
+      command.addEventListener(
+        "click",
+        () => {
+          const slot =
+            this._cameraContextSlot;
+
+          this.closeCameraContextMenu();
+
+          if (slot !== null) {
+            this.removeCameraFromSlot(slot);
+          }
+        }
+      );
+    }
+  }
+
+
+  openCameraContextMenu(
+    slot,
+    clientX,
+    clientY
+  ) {
+    const card =
+      this.querySelector("ha-card");
+
+    const menu =
+      this.querySelector(
+        ".camera-context-menu"
+      );
+
+    if (!card || !menu) {
+      return;
+    }
+
+    this.closeCameraContextMenu();
+    this.clearCameraTargetSelection();
+    this.clearLayoutTargetSelection();
+
+    this._cameraContextSlot = slot;
+    menu.hidden = false;
+
+    const cardRect =
+      card.getBoundingClientRect();
+
+    const margin = 4;
+
+    const left = Math.max(
+      margin,
+      Math.min(
+        clientX - cardRect.left,
+        cardRect.width - menu.offsetWidth - margin
+      )
+    );
+
+    const top = Math.max(
+      margin,
+      Math.min(
+        clientY - cardRect.top,
+        cardRect.height - menu.offsetHeight - margin
+      )
+    );
+
+    menu.style.left = `${left}px`;
+    menu.style.top = `${top}px`;
+
+    document.addEventListener(
+      "pointerdown",
+      this._cameraContextPointerHandler,
+      true
+    );
+
+    document.addEventListener(
+      "keydown",
+      this._cameraContextKeyHandler
+    );
+  }
+
+
+  closeCameraContextMenu() {
+    const menu =
+      this.querySelector(
+        ".camera-context-menu"
+      );
+
+    if (menu) {
+      menu.hidden = true;
+    }
+
+    this._cameraContextSlot = null;
+
+    document.removeEventListener(
+      "pointerdown",
+      this._cameraContextPointerHandler,
+      true
+    );
+
+    document.removeEventListener(
+      "keydown",
+      this._cameraContextKeyHandler
+    );
   }
 
 
@@ -2544,6 +2940,13 @@ class NVRCard extends HTMLElement {
             cameraName
           )
         );
+
+        button.classList.toggle(
+          "target-selected",
+
+          cameraName ===
+            this._selectedCamera
+        );
       });
   }
 
@@ -2551,7 +2954,7 @@ class NVRCard extends HTMLElement {
   updateSelectedButton() {
     this
       .querySelectorAll(
-        ".layout-button, .sidebar-layout-item"
+        ".sidebar-layout-item"
       )
       .forEach(button => {
 
@@ -2560,6 +2963,13 @@ class NVRCard extends HTMLElement {
 
           button.dataset.layout ===
             this._layout
+        );
+
+        button.classList.toggle(
+          "target-selected",
+
+          button.dataset.layout ===
+            this._selectedLayout
         );
       });
   }
