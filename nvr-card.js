@@ -1,3 +1,7 @@
+/*
+ For Home Assisstant
+*/
+
 class NVRCard extends HTMLElement {
   constructor() {
     super();
