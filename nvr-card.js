@@ -2,6 +2,8 @@
  For Home Assisstant
 */
 
+const NVR_BUILD = "__NVR_BUILD__";
+
 class NVRCard extends HTMLElement {
   constructor() {
     super();
@@ -257,8 +259,23 @@ class NVRCard extends HTMLElement {
 
 
   set hass(hass) {
+    if (hass === this._hass) {
+      return;
+    }
+
     this._hass = hass;
     this.updateLiveStreams();
+  }
+
+
+  connectedCallback() {
+    if (
+      this.isConnected &&
+      this._resizeObserver === null &&
+      this.querySelector(".video-grid")
+    ) {
+      this.installResizeObserver();
+    }
   }
 
 
@@ -321,6 +338,10 @@ class NVRCard extends HTMLElement {
             <div class="layout-buttons">
               ${this.buildLayoutButtons()}
             </div>
+
+            <span class="build-identifier">
+              ${NVR_BUILD}
+            </span>
 
           </footer>
 
@@ -719,6 +740,21 @@ class NVRCard extends HTMLElement {
         overflow-x: auto;
 
         padding-bottom: 2px;
+      }
+
+
+      .build-identifier {
+        flex: 0 0 auto;
+
+        margin-left: auto;
+
+        color: #666;
+
+        font-size: 9px;
+
+        white-space: nowrap;
+
+        pointer-events: none;
       }
 
 
