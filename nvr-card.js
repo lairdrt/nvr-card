@@ -6,6 +6,8 @@ const NVR_BUILD = "__NVR_BUILD__";
 
 // Internal camera-inventory safety limit; not a viewer slot limit.
 const MAX_CAMERAS = 256;
+const NVR_LAYOUT_DRAG_TYPE =
+  "application/x-nvr-layout";
 
 class NVRCard extends HTMLElement {
   constructor() {
@@ -881,6 +883,11 @@ class NVRCard extends HTMLElement {
       }
 
 
+      .sidebar-layout-item.dragging {
+        opacity: 0.65;
+      }
+
+
       .sidebar-layout-label {
         margin-top: 4px;
 
@@ -1029,6 +1036,11 @@ class NVRCard extends HTMLElement {
         background: #fff;
 
         border: 1px solid #fff;
+      }
+
+
+      .video-grid.layout-drop-target {
+        border-color: #888;
       }
 
 
@@ -1308,6 +1320,7 @@ class NVRCard extends HTMLElement {
     this.attachCameraHandlers();
     this.attachSidebarHandlers();
     this.attachLayoutHandlers();
+    this.attachLayoutDragHandlers();
     this.attachClearHandler();
     this.attachSlotHandlers();
 
@@ -1422,6 +1435,7 @@ class NVRCard extends HTMLElement {
             class="sidebar-layout-item"
             data-layout="${key}"
             aria-label="${layout.label} layout"
+            draggable="true"
           >
 
             ${this.buildMiniature(layout)}
@@ -2244,6 +2258,142 @@ class NVRCard extends HTMLElement {
      */
     this.applyLayout();
     this.updateSelectedButton();
+  }
+
+
+  attachLayoutDragHandlers() {
+    this
+      .querySelectorAll(
+        ".sidebar-layout-item"
+      )
+      .forEach(item => {
+        item.addEventListener(
+          "dragstart",
+          event => {
+            const layoutKey =
+              item.dataset.layout;
+
+            if (
+              !event.dataTransfer ||
+              !this.layouts[layoutKey]
+            ) {
+              event.preventDefault();
+              return;
+            }
+
+            event.dataTransfer.effectAllowed =
+              "copy";
+
+            event.dataTransfer.setData(
+              NVR_LAYOUT_DRAG_TYPE,
+              layoutKey
+            );
+
+            item.classList.add("dragging");
+          }
+        );
+
+        item.addEventListener(
+          "dragend",
+          () => {
+            item.classList.remove("dragging");
+            this.setLayoutDropFeedback(false);
+          }
+        );
+      });
+
+    const grid =
+      this.querySelector(".video-grid");
+
+    if (!grid) {
+      return;
+    }
+
+    grid.addEventListener(
+      "dragenter",
+      event => {
+        if (!this.isLayoutDrag(event)) {
+          return;
+        }
+
+        event.preventDefault();
+        this.setLayoutDropFeedback(true);
+      }
+    );
+
+    grid.addEventListener(
+      "dragover",
+      event => {
+        if (!this.isLayoutDrag(event)) {
+          return;
+        }
+
+        event.preventDefault();
+        event.dataTransfer.dropEffect = "copy";
+        this.setLayoutDropFeedback(true);
+      }
+    );
+
+    grid.addEventListener(
+      "dragleave",
+      event => {
+        if (
+          event.relatedTarget &&
+          grid.contains(event.relatedTarget)
+        ) {
+          return;
+        }
+
+        this.setLayoutDropFeedback(false);
+      }
+    );
+
+    grid.addEventListener(
+      "drop",
+      event => {
+        if (!this.isLayoutDrag(event)) {
+          return;
+        }
+
+        event.preventDefault();
+        this.setLayoutDropFeedback(false);
+
+        const layoutKey =
+          event.dataTransfer.getData(
+            NVR_LAYOUT_DRAG_TYPE
+          );
+
+        if (!this.layouts[layoutKey]) {
+          return;
+        }
+
+        this.selectLayout(layoutKey);
+      }
+    );
+  }
+
+
+  isLayoutDrag(event) {
+    if (!event.dataTransfer) {
+      return false;
+    }
+
+    return Array
+      .from(event.dataTransfer.types)
+      .includes(NVR_LAYOUT_DRAG_TYPE);
+  }
+
+
+  setLayoutDropFeedback(active) {
+    const grid =
+      this.querySelector(".video-grid");
+
+    if (grid) {
+      grid.classList.toggle(
+        "layout-drop-target",
+        active
+      );
+    }
   }
 
 
