@@ -1491,7 +1491,7 @@ class NVRCard extends HTMLElement {
       }
     );
 
-    this.scheduleCameraFit();
+    this.fitLiveCameras();
   }
 
 
