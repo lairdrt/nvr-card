@@ -14,6 +14,12 @@ class NVRCard extends HTMLElement {
     this._layout = "2x2";
     this._hass = null;
 
+    this._sidebarSections = {
+      cameras: true,
+      layouts: true,
+      views: false
+    };
+
     this._cameras = [];
 
     this._cameraAspectRatio =
@@ -32,7 +38,7 @@ class NVRCard extends HTMLElement {
 
     this.layouts = {
       "1x1": {
-        label: "1×1",
+        label: "1x1",
         columns: "1fr",
         rows: "1fr",
         cells: [
@@ -41,7 +47,7 @@ class NVRCard extends HTMLElement {
       },
 
       "2x2": {
-        label: "2×2",
+        label: "2x2",
         columns: "repeat(2, 1fr)",
         rows: "repeat(2, 1fr)",
         cells: [
@@ -53,7 +59,7 @@ class NVRCard extends HTMLElement {
       },
 
       "3x3": {
-        label: "3×3",
+        label: "3x3",
         columns: "repeat(3, 1fr)",
         rows: "repeat(3, 1fr)",
         cells: Array.from(
@@ -63,7 +69,7 @@ class NVRCard extends HTMLElement {
       },
 
       "4x4": {
-        label: "4×4",
+        label: "4x4",
         columns: "repeat(4, 1fr)",
         rows: "repeat(4, 1fr)",
         cells: Array.from(
@@ -472,22 +478,106 @@ class NVRCard extends HTMLElement {
       <ha-card>
         <div class="nvr-shell">
 
-          <aside class="camera-list">
+          <aside class="camera-list nvr-sidebar">
 
-            <div class="camera-title">
-              CAMERAS
-            </div>
-
-            <div class="camera-items">
-              ${this.buildCameraList()}
-            </div>
-
-            <button
-              type="button"
-              class="clear-button"
+            <section
+              class="sidebar-section camera-section ${this._sidebarSections.cameras ? "expanded" : ""}"
+              data-section="cameras"
             >
-              Clear Grid
-            </button>
+
+              <button
+                type="button"
+                class="sidebar-section-header"
+                data-section="cameras"
+                aria-expanded="${this._sidebarSections.cameras}"
+              >
+                <span>CAMERAS</span>
+                <span
+                  class="section-indicator"
+                  aria-hidden="true"
+                ></span>
+              </button>
+
+              <div
+                class="sidebar-section-body camera-section-body"
+                ${this._sidebarSections.cameras ? "" : "hidden"}
+              >
+
+                <div class="camera-items">
+                  ${this.buildCameraList()}
+                </div>
+
+                <button
+                  type="button"
+                  class="clear-button"
+                >
+                  Clear Grid
+                </button>
+
+              </div>
+
+            </section>
+
+
+            <section
+              class="sidebar-section ${this._sidebarSections.layouts ? "expanded" : ""}"
+              data-section="layouts"
+            >
+
+              <button
+                type="button"
+                class="sidebar-section-header"
+                data-section="layouts"
+                aria-expanded="${this._sidebarSections.layouts}"
+              >
+                <span>LAYOUTS</span>
+                <span
+                  class="section-indicator"
+                  aria-hidden="true"
+                ></span>
+              </button>
+
+              <div
+                class="sidebar-section-body"
+                ${this._sidebarSections.layouts ? "" : "hidden"}
+              >
+                <div class="sidebar-placeholder">
+                  -
+                </div>
+              </div>
+
+            </section>
+
+
+            <section
+              class="sidebar-section ${this._sidebarSections.views ? "expanded" : ""}"
+              data-section="views"
+            >
+
+              <button
+                type="button"
+                class="sidebar-section-header"
+                data-section="views"
+                aria-expanded="${this._sidebarSections.views}"
+              >
+                <span>VIEWS</span>
+                <span
+                  class="section-indicator"
+                  aria-hidden="true"
+                ></span>
+              </button>
+
+              <div
+                class="sidebar-section-body"
+                ${this._sidebarSections.views ? "" : "hidden"}
+              >
+                <div class="sidebar-placeholder">
+                  -
+                </div>
+              </div>
+
+            </section>
+
 
           </aside>
 
@@ -581,18 +671,104 @@ class NVRCard extends HTMLElement {
       }
 
 
-      .camera-title {
-        padding-bottom: 8px;
-        margin-bottom: 8px;
+      .sidebar-section {
+        flex: 0 0 auto;
 
+        min-width: 0;
+        min-height: 0;
+      }
+
+
+      .camera-section.expanded {
+        flex: 1 1 auto;
+
+        display: flex;
+        flex-direction: column;
+      }
+
+
+      .sidebar-section-header {
+        width: 100%;
+        min-height: 30px;
+
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+
+        padding: 0;
+
+        background: transparent;
+
+        border: 0;
         border-bottom: 1px solid #555;
 
+        color: #ddd;
+
+        font-family: inherit;
         font-size: 13px;
         font-weight: 700;
 
         letter-spacing: 0.08em;
 
-        color: #ddd;
+        text-align: left;
+
+        cursor: pointer;
+      }
+
+
+      .sidebar-section-header:hover {
+        color: #fff;
+      }
+
+
+      .section-indicator {
+        width: 0;
+        height: 0;
+
+        border-top: 4.375px solid transparent;
+        border-bottom: 4.375px solid transparent;
+        border-left: 7.5px solid #888;
+
+        transform-origin: center;
+      }
+
+
+      .sidebar-section.expanded
+      > .sidebar-section-header
+      > .section-indicator {
+        transform: rotate(90deg);
+      }
+
+
+      .sidebar-section-body {
+        min-width: 0;
+        min-height: 0;
+      }
+
+
+      .sidebar-section-body[hidden] {
+        display: none;
+      }
+
+
+      .camera-section-body {
+        flex: 1 1 auto;
+
+        min-height: 0;
+
+        display: flex;
+        flex-direction: column;
+
+        padding-top: 8px;
+      }
+
+
+      .sidebar-placeholder {
+        padding: 7px 4px 8px;
+
+        color: #555;
+
+        font-size: 10px;
       }
 
 
@@ -1009,6 +1185,7 @@ class NVRCard extends HTMLElement {
 
 
     this.attachCameraHandlers();
+    this.attachSidebarHandlers();
     this.attachLayoutHandlers();
     this.attachClearHandler();
     this.attachSlotHandlers();
@@ -1803,6 +1980,88 @@ class NVRCard extends HTMLElement {
           }
         );
       });
+  }
+
+
+  attachSidebarHandlers() {
+    const sidebar =
+      this.querySelector(".nvr-sidebar");
+
+    if (!sidebar) {
+      return;
+    }
+
+    sidebar.addEventListener(
+      "click",
+      event => {
+        const header =
+          event.target.closest(
+            ".sidebar-section-header"
+          );
+
+        if (!header) {
+          return;
+        }
+
+        this.toggleSidebarSection(
+          header.dataset.section
+        );
+      }
+    );
+  }
+
+
+  toggleSidebarSection(sectionName) {
+    if (
+      !Object.prototype.hasOwnProperty.call(
+        this._sidebarSections,
+        sectionName
+      )
+    ) {
+      return;
+    }
+
+    const expanded =
+      !this._sidebarSections[sectionName];
+
+    this._sidebarSections[sectionName] =
+      expanded;
+
+    const section =
+      this.querySelector(
+        `.sidebar-section[data-section="${sectionName}"]`
+      );
+
+    if (!section) {
+      return;
+    }
+
+    const header =
+      section.querySelector(
+        ".sidebar-section-header"
+      );
+
+    const body =
+      section.querySelector(
+        ".sidebar-section-body"
+      );
+
+    section.classList.toggle(
+      "expanded",
+      expanded
+    );
+
+    if (header) {
+      header.setAttribute(
+        "aria-expanded",
+        String(expanded)
+      );
+    }
+
+    if (body) {
+      body.hidden = !expanded;
+    }
+
   }
 
 
