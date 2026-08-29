@@ -10,6 +10,8 @@ const NVR_LAYOUT_DRAG_TYPE =
   "application/x-nvr-layout";
 const NVR_CAMERA_DRAG_TYPE =
   "application/x-nvr-camera";
+const NVR_GRID_CAMERA_DRAG_TYPE =
+  "application/x-nvr-grid-camera";
 
 class NVRCard extends HTMLElement {
   constructor() {
@@ -1638,6 +1640,71 @@ class NVRCard extends HTMLElement {
   }
 
 
+  moveCameraBetweenSlots(sourceSlot, targetSlot) {
+    const sourceCell =
+      this.querySelector(
+        `.video-cell[data-slot="${sourceSlot}"]`
+      );
+
+    const targetCell =
+      this.querySelector(
+        `.video-cell[data-slot="${targetSlot}"]`
+      );
+
+    if (
+      !Number.isInteger(sourceSlot) ||
+      !Number.isInteger(targetSlot) ||
+      sourceSlot < 0 ||
+      targetSlot < 0 ||
+      sourceSlot >= this._assignedCameras.length ||
+      targetSlot >= this._assignedCameras.length ||
+      sourceSlot === targetSlot ||
+      !sourceCell ||
+      !targetCell ||
+      targetCell.classList.contains("hidden-slot")
+    ) {
+      return;
+    }
+
+    const cameraName =
+      this._assignedCameras[sourceSlot];
+
+    const camera =
+      this.getCameraByName(cameraName);
+
+    if (!camera || camera.active !== true) {
+      return;
+    }
+
+    this._assignedCameras[sourceSlot] = null;
+    this._assignedCameras[targetSlot] = cameraName;
+
+    targetCell.innerHTML = "";
+
+    sourceCell.dataset.slot =
+      String(targetSlot);
+
+    targetCell.dataset.slot =
+      String(sourceSlot);
+
+    const number =
+      sourceCell.querySelector(
+        ".cell-number"
+      );
+
+    if (number) {
+      number.textContent =
+        String(targetSlot + 1);
+    }
+
+    this.renderSlot(sourceSlot);
+    this.applyLayout();
+
+    this.updateCameraListState();
+    this.scheduleCameraFit();
+  }
+
+
   removeCameraFromSlot(slot) {
     if (
       !Number.isInteger(slot) ||
@@ -1733,6 +1800,11 @@ class NVRCard extends HTMLElement {
       }
     );
 
+    cells.forEach((cell, slot) => {
+      cell.draggable =
+        this._assignedCameras[slot] !== null;
+    });
+
     for (
       let slot = occupied.length;
       slot < cells.length;
@@ -1781,6 +1853,10 @@ class NVRCard extends HTMLElement {
 
     const cameraName =
       this._assignedCameras[slot];
+
+
+    cell.draggable =
+      Boolean(cameraName);
 
 
     /*
@@ -1974,6 +2050,8 @@ class NVRCard extends HTMLElement {
 
         cell.style.gridColumn = "";
         cell.style.gridRow = "";
+        cell.style.order =
+          cell.dataset.slot;
       });
 
 
@@ -2259,6 +2337,44 @@ class NVRCard extends HTMLElement {
       .querySelectorAll(".video-cell")
       .forEach(cell => {
         cell.addEventListener(
+          "dragstart",
+          event => {
+            const sourceSlot =
+              Number(cell.dataset.slot);
+
+            const cameraName =
+              this._assignedCameras[sourceSlot];
+
+            if (
+              !event.dataTransfer ||
+              !Number.isInteger(sourceSlot) ||
+              !cameraName
+            ) {
+              event.preventDefault();
+              return;
+            }
+
+            this.closeCameraContextMenu();
+            this.clearLayoutTargetSelection();
+
+            event.dataTransfer.effectAllowed =
+              "move";
+
+            event.dataTransfer.setData(
+              NVR_GRID_CAMERA_DRAG_TYPE,
+              String(sourceSlot)
+            );
+          }
+        );
+
+        cell.addEventListener(
+          "dragend",
+          () => {
+            this.setCameraDropTarget(null);
+          }
+        );
+
+        cell.addEventListener(
           "dragenter",
           event => {
             if (
@@ -2331,13 +2447,26 @@ class NVRCard extends HTMLElement {
                 NVR_CAMERA_DRAG_TYPE
               );
 
+            const sourceSlotValue =
+              event.dataTransfer.getData(
+                NVR_GRID_CAMERA_DRAG_TYPE
+              );
+
             const targetSlot =
               Number(cell.dataset.slot);
 
-            this.assignCameraToSlot(
-              cameraName,
-              targetSlot
-            );
+            if (sourceSlotValue !== "") {
+              this.moveCameraBetweenSlots(
+                Number(sourceSlotValue),
+                targetSlot
+              );
+            }
+            else {
+              this.assignCameraToSlot(
+                cameraName,
+                targetSlot
+              );
+            }
 
             this.clearCameraTargetSelection();
           }
@@ -2351,9 +2480,13 @@ class NVRCard extends HTMLElement {
       return false;
     }
 
-    return Array
-      .from(event.dataTransfer.types)
-      .includes(NVR_CAMERA_DRAG_TYPE);
+    const types =
+      Array.from(event.dataTransfer.types);
+
+    return (
+      types.includes(NVR_CAMERA_DRAG_TYPE) ||
+      types.includes(NVR_GRID_CAMERA_DRAG_TYPE)
+    );
   }
 
 
