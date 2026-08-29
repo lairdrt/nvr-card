@@ -1733,18 +1733,6 @@ class NVRCard extends HTMLElement {
 
 
   repackAssignedCameras() {
-    const occupied =
-      this._assignedCameras
-        .map((cameraName, sourceSlot) => {
-          return {
-            cameraName,
-            sourceSlot
-          };
-        })
-        .filter(entry => {
-          return entry.cameraName !== null;
-        });
-
     const cells =
       Array.from(
         { length: this._assignedCameras.length },
@@ -1755,78 +1743,101 @@ class NVRCard extends HTMLElement {
         }
       );
 
-    if (cells.some(cell => !cell)) {
+    if (
+      cells.some(cell => !cell) ||
+      new Set(cells).size !== cells.length
+    ) {
       return;
     }
 
-    occupied.forEach(
-      (entry, targetSlot) => {
-        if (entry.sourceSlot === targetSlot) {
+    const occupied = [];
+    const emptyCells = [];
+
+    this._assignedCameras.forEach(
+      (cameraName, sourceSlot) => {
+        const cell = cells[sourceSlot];
+
+        if (cameraName === null) {
+          emptyCells.push(cell);
           return;
         }
 
-        const sourceCell =
-          cells[entry.sourceSlot];
+        occupied.push({
+          cameraName,
+          cell
+        });
+      }
+    );
 
-        const targetCell =
-          cells[targetSlot];
-
-        targetCell.innerHTML = "";
-
-        while (sourceCell.firstChild) {
-          targetCell.appendChild(
-            sourceCell.firstChild
-          );
+    const desiredMapping = [
+      ...occupied.map(
+        (entry, logicalSlot) => {
+          return {
+            cell: entry.cell,
+            logicalSlot,
+            cameraName: entry.cameraName
+          };
         }
+      ),
+      ...emptyCells.map(
+        (cell, emptyIndex) => {
+          return {
+            cell,
+            logicalSlot:
+              occupied.length + emptyIndex,
+            cameraName: null
+          };
+        }
+      )
+    ];
+
+    /*
+     * Keep every occupied physical cell and its live
+     * camera subtree connected. Only logical slot
+     * identities change during compaction.
+     */
+    this._assignedCameras.fill(null);
+
+    desiredMapping.forEach(entry => {
+      const {
+        cell,
+        logicalSlot,
+        cameraName
+      } = entry;
+
+      cell.dataset.slot = String(logicalSlot);
+      cell.draggable = cameraName !== null;
+
+      if (cameraName !== null) {
+        this._assignedCameras[logicalSlot] =
+          cameraName;
 
         const number =
-          targetCell.querySelector(
-            ".cell-number"
-          );
+          cell.querySelector(".cell-number");
 
         if (number) {
           number.textContent =
-            String(targetSlot + 1);
+            String(logicalSlot + 1);
         }
-      }
-    );
 
-    this._assignedCameras.fill(null);
-
-    occupied.forEach(
-      (entry, targetSlot) => {
-        this._assignedCameras[targetSlot] =
-          entry.cameraName;
-      }
-    );
-
-    cells.forEach((cell, slot) => {
-      cell.draggable =
-        this._assignedCameras[slot] !== null;
-    });
-
-    for (
-      let slot = occupied.length;
-      slot < cells.length;
-      slot++
-    ) {
-      const cell = cells[slot];
-
-      if (cell.children.length > 0) {
-        continue;
+        return;
       }
 
-      const empty =
-        document.createElement("div");
+      let empty =
+        cell.querySelector(
+          ".empty-cell-center"
+        );
 
-      empty.className =
-        "empty-cell-center";
+      if (!empty) {
+        empty = document.createElement("div");
+        empty.className =
+          "empty-cell-center";
+        cell.appendChild(empty);
+      }
 
       empty.textContent =
-        String(slot + 1);
-
-      cell.appendChild(empty);
-    }
+        String(logicalSlot + 1);
+    });
 
   }
 
