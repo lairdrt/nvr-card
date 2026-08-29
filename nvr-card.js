@@ -44,8 +44,8 @@ class NVRCard extends HTMLElement {
       };
 
     this._sidebarSections = {
-      cameras: true,
-      layouts: true,
+      cameras: false,
+      layouts: false,
       views: false
     };
 
@@ -536,7 +536,7 @@ class NVRCard extends HTMLElement {
                 ${this._sidebarSections.cameras ? "" : "hidden"}
               >
 
-                <div class="camera-items">
+                <div class="camera-items sidebar-scroll-region">
                   ${this.buildCameraList()}
                 </div>
 
@@ -564,7 +564,7 @@ class NVRCard extends HTMLElement {
               </button>
 
               <div
-                class="sidebar-section-body sidebar-layout-body"
+                class="sidebar-section-body sidebar-layout-body sidebar-scroll-region"
                 ${this._sidebarSections.layouts ? "" : "hidden"}
               >
                 <div class="sidebar-layout-grid">
@@ -594,7 +594,7 @@ class NVRCard extends HTMLElement {
               </button>
 
               <div
-                class="sidebar-section-body"
+                class="sidebar-section-body sidebar-scroll-region"
                 ${this._sidebarSections.views ? "" : "hidden"}
               >
                 <div class="sidebar-placeholder">
@@ -831,35 +831,40 @@ class NVRCard extends HTMLElement {
         overflow-y: auto;
 
         padding-right: 6px;
+      }
+
+
+      .sidebar-scroll-region {
+        margin-right: -2px;
 
         scrollbar-color: #666 #181818;
         scrollbar-width: thin;
       }
 
 
-      .sidebar-layout-body::-webkit-scrollbar {
+      .sidebar-scroll-region::-webkit-scrollbar {
         width: 6px;
       }
 
 
-      .sidebar-layout-body::-webkit-scrollbar-track {
+      .sidebar-scroll-region::-webkit-scrollbar-track {
         background: #181818;
       }
 
 
-      .sidebar-layout-body::-webkit-scrollbar-thumb {
+      .sidebar-scroll-region::-webkit-scrollbar-thumb {
         background: #666;
 
         border-radius: 0;
       }
 
 
-      .sidebar-layout-body::-webkit-scrollbar-thumb:hover {
+      .sidebar-scroll-region::-webkit-scrollbar-thumb:hover {
         background: #888;
       }
 
 
-      .sidebar-layout-body::-webkit-scrollbar-button {
+      .sidebar-scroll-region::-webkit-scrollbar-button {
         width: 0 !important;
         height: 0 !important;
         min-width: 0 !important;
@@ -876,7 +881,7 @@ class NVRCard extends HTMLElement {
       }
 
 
-      .sidebar-layout-body::-webkit-scrollbar-button:vertical {
+      .sidebar-scroll-region::-webkit-scrollbar-button:vertical {
         width: 0 !important;
         height: 0 !important;
         min-width: 0 !important;
