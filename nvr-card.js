@@ -21,6 +21,8 @@ class NVRCard extends HTMLElement {
     this._hass = null;
     this._selectedCamera = null;
     this._selectedLayout = null;
+    this._maximizedSlot = null;
+    this._placementClickPending = false;
     this._cameraContextSlot = null;
 
     this._cameraContextPointerHandler =
@@ -508,6 +510,8 @@ class NVRCard extends HTMLElement {
 
   render() {
     this.closeCameraContextMenu();
+    this._maximizedSlot = null;
+    this._placementClickPending = false;
 
     this.innerHTML = `
       <ha-card>
@@ -1145,6 +1149,22 @@ class NVRCard extends HTMLElement {
       }
 
 
+      .video-grid.camera-maximized
+        .video-cell:not(.maximized-camera) {
+        display: none;
+      }
+
+
+      .video-grid.camera-maximized
+        .video-cell.maximized-camera {
+        display: block;
+
+        grid-column: 1 / -1 !important;
+        grid-row: 1 / -1 !important;
+        order: 0 !important;
+      }
+
+
       .video-cell.camera-drop-target {
         outline: 1px solid #aaa;
         outline-offset: -2px;
@@ -1366,6 +1386,7 @@ class NVRCard extends HTMLElement {
     this.attachLayoutDragHandlers();
     this.attachClearHandler();
     this.attachSlotHandlers();
+    this.attachCameraMaximizeHandlers();
     this.attachCameraContextMenuHandlers();
 
     /*
@@ -1523,6 +1544,10 @@ class NVRCard extends HTMLElement {
 
 
   assignCamera(cameraName) {
+    if (this._maximizedSlot !== null) {
+      return;
+    }
+
     const layout =
       this.layouts[this._layout];
 
@@ -1586,6 +1611,10 @@ class NVRCard extends HTMLElement {
 
 
   assignCameraToSlot(cameraName, targetSlot) {
+    if (this._maximizedSlot !== null) {
+      return;
+    }
+
     const camera =
       this.getCameraByName(cameraName);
 
@@ -1706,6 +1735,10 @@ class NVRCard extends HTMLElement {
 
 
   removeCameraFromSlot(slot) {
+    if (this._maximizedSlot !== null) {
+      return;
+    }
+
     if (
       !Number.isInteger(slot) ||
       slot < 0 ||
@@ -2217,6 +2250,139 @@ class NVRCard extends HTMLElement {
   }
 
 
+  maximizeCameraSlot(slot) {
+    if (
+      this._maximizedSlot !== null ||
+      !Number.isInteger(slot) ||
+      this._assignedCameras[slot] === null
+    ) {
+      return;
+    }
+
+    const grid =
+      this.querySelector(".video-grid");
+
+    const cell =
+      this.querySelector(
+        `.video-cell[data-slot="${slot}"]`
+      );
+
+    if (
+      !grid ||
+      !cell ||
+      cell.classList.contains("hidden-slot")
+    ) {
+      return;
+    }
+
+    this.closeCameraContextMenu();
+    this.setCameraDropTarget(null);
+    this.setLayoutDropFeedback(false);
+
+    this._maximizedSlot = slot;
+    grid.classList.add("camera-maximized");
+    cell.classList.add("maximized-camera");
+
+    this.fitLiveCameras();
+    this.scheduleCameraFit();
+  }
+
+
+  replaceMaximizedCamera(cameraName) {
+    const slot = this._maximizedSlot;
+    const camera = this.getCameraByName(cameraName);
+
+    const cell =
+      this.querySelector(
+        `.video-cell[data-slot="${slot}"]`
+      );
+
+    if (
+      slot === null ||
+      !camera ||
+      camera.active !== true ||
+      !cell ||
+      !cell.classList.contains(
+        "maximized-camera"
+      )
+    ) {
+      return;
+    }
+
+    const existingSlot =
+      this._assignedCameras.indexOf(cameraName);
+
+    if (existingSlot === slot) {
+      return;
+    }
+
+    if (existingSlot !== -1) {
+      this.moveCameraBetweenSlots(
+        existingSlot,
+        slot
+      );
+
+      const movedCell =
+        this.querySelector(
+          `.video-cell[data-slot="${slot}"]`
+        );
+
+      if (
+        this._assignedCameras[slot] !== cameraName ||
+        !movedCell
+      ) {
+        return;
+      }
+
+      movedCell.classList.add(
+        "maximized-camera"
+      );
+
+      cell.classList.remove(
+        "maximized-camera"
+      );
+
+      this.fitLiveCameras();
+      this.scheduleCameraFit();
+      return;
+    }
+
+    this._assignedCameras[slot] = cameraName;
+    this.renderSlot(slot);
+    this.updateCameraListState();
+    this.fitLiveCameras();
+    this.scheduleCameraFit();
+  }
+
+
+  restoreMaximizedCamera() {
+    if (this._maximizedSlot === null) {
+      return;
+    }
+
+    const grid =
+      this.querySelector(".video-grid");
+
+    if (grid) {
+      grid.classList.remove("camera-maximized");
+    }
+
+    this
+      .querySelectorAll(
+        ".video-cell.maximized-camera"
+      )
+      .forEach(cell => {
+        cell.classList.remove(
+          "maximized-camera"
+        );
+      });
+
+    this._maximizedSlot = null;
+    this.applyLayout();
+    this.scheduleCameraFit();
+  }
+
+
   /* ================================================
      EVENT HANDLERS
      ================================================ */
@@ -2350,6 +2516,11 @@ class NVRCard extends HTMLElement {
         cell.addEventListener(
           "dragstart",
           event => {
+            if (this._maximizedSlot !== null) {
+              event.preventDefault();
+              return;
+            }
+
             const sourceSlot =
               Number(cell.dataset.slot);
 
@@ -2388,6 +2559,20 @@ class NVRCard extends HTMLElement {
         cell.addEventListener(
           "dragenter",
           event => {
+            if (this._maximizedSlot !== null) {
+              if (
+                this.isCameraListDrag(event) &&
+                cell.classList.contains(
+                  "maximized-camera"
+                )
+              ) {
+                event.preventDefault();
+                this.setCameraDropTarget(cell);
+              }
+
+              return;
+            }
+
             if (
               !this.isCameraDrag(event) ||
               cell.classList.contains(
@@ -2405,6 +2590,22 @@ class NVRCard extends HTMLElement {
         cell.addEventListener(
           "dragover",
           event => {
+            if (this._maximizedSlot !== null) {
+              if (
+                this.isCameraListDrag(event) &&
+                cell.classList.contains(
+                  "maximized-camera"
+                )
+              ) {
+                event.preventDefault();
+                event.dataTransfer.dropEffect =
+                  "move";
+                this.setCameraDropTarget(cell);
+              }
+
+              return;
+            }
+
             if (
               !this.isCameraDrag(event) ||
               cell.classList.contains(
@@ -2441,6 +2642,29 @@ class NVRCard extends HTMLElement {
         cell.addEventListener(
           "drop",
           event => {
+            if (this._maximizedSlot !== null) {
+              if (
+                this.isCameraListDrag(event) &&
+                cell.classList.contains(
+                  "maximized-camera"
+                )
+              ) {
+                event.preventDefault();
+
+                const cameraName =
+                  event.dataTransfer.getData(
+                    NVR_CAMERA_DRAG_TYPE
+                  );
+
+                this.replaceMaximizedCamera(
+                  cameraName
+                );
+              }
+
+              this.setCameraDropTarget(null);
+              return;
+            }
+
             if (
               !this.isCameraDrag(event) ||
               cell.classList.contains(
@@ -2622,6 +2846,10 @@ class NVRCard extends HTMLElement {
 
 
   selectLayout(layoutKey) {
+    if (this._maximizedSlot !== null) {
+      return;
+    }
+
     if (!this.layouts[layoutKey]) {
       return;
     }
@@ -2736,6 +2964,28 @@ class NVRCard extends HTMLElement {
     grid.addEventListener(
       "drop",
       event => {
+        if (this._maximizedSlot !== null) {
+          if (!this.isLayoutDrag(event)) {
+            return;
+          }
+
+          event.preventDefault();
+          this.setLayoutDropFeedback(false);
+
+          const layoutKey =
+            event.dataTransfer.getData(
+              NVR_LAYOUT_DRAG_TYPE
+            );
+
+          if (!this.layouts[layoutKey]) {
+            return;
+          }
+
+          this.restoreMaximizedCamera();
+          this.selectLayout(layoutKey);
+          return;
+        }
+
         if (!this.isLayoutDrag(event)) {
           return;
         }
@@ -2793,6 +3043,11 @@ class NVRCard extends HTMLElement {
     grid.addEventListener(
       "click",
       event => {
+        if (this._maximizedSlot !== null) {
+          event.preventDefault();
+          return;
+        }
+
         if (this._selectedLayout !== null) {
           this.selectLayout(
             this._selectedLayout
@@ -2830,6 +3085,97 @@ class NVRCard extends HTMLElement {
   }
 
 
+  isCameraListDrag(event) {
+    if (!event.dataTransfer) {
+      return false;
+    }
+
+    const types =
+      Array.from(event.dataTransfer.types);
+
+    return (
+      types.includes(NVR_CAMERA_DRAG_TYPE) &&
+      !types.includes(NVR_GRID_CAMERA_DRAG_TYPE)
+    );
+  }
+
+
+  attachCameraMaximizeHandlers() {
+    const grid =
+      this.querySelector(".video-grid");
+
+    if (!grid) {
+      return;
+    }
+
+    grid.addEventListener(
+      "click",
+      event => {
+        if (
+          this._maximizedSlot === null &&
+          event.detail === 1
+        ) {
+          this._placementClickPending =
+            this._selectedCamera !== null ||
+            this._selectedLayout !== null;
+        }
+      },
+      true
+    );
+
+    grid.addEventListener(
+      "dblclick",
+      event => {
+        const cell =
+          event.composedPath().find(node => {
+            return (
+              node instanceof Element &&
+              node.classList.contains(
+                "video-cell"
+              )
+            );
+          });
+
+        if (!cell) {
+          return;
+        }
+
+        const slot = Number(cell.dataset.slot);
+
+        if (this._maximizedSlot !== null) {
+          event.preventDefault();
+
+          if (
+            slot === this._maximizedSlot &&
+            cell.classList.contains(
+              "maximized-camera"
+            )
+          ) {
+            this.restoreMaximizedCamera();
+          }
+
+          return;
+        }
+
+        if (
+          this._placementClickPending ||
+          this._selectedCamera !== null ||
+          this._selectedLayout !== null ||
+          !Number.isInteger(slot) ||
+          this._assignedCameras[slot] === null
+        ) {
+          this._placementClickPending = false;
+          return;
+        }
+
+        this._placementClickPending = false;
+        event.preventDefault();
+        this.maximizeCameraSlot(slot);
+      }
+    );
+  }
+
+
   attachCameraContextMenuHandlers() {
     this
       .querySelectorAll(".video-cell")
@@ -2837,6 +3183,12 @@ class NVRCard extends HTMLElement {
         cell.addEventListener(
           "contextmenu",
           event => {
+            if (this._maximizedSlot !== null) {
+              event.preventDefault();
+              this.closeCameraContextMenu();
+              return;
+            }
+
             const slot =
               Number(cell.dataset.slot);
 
@@ -2868,6 +3220,11 @@ class NVRCard extends HTMLElement {
       command.addEventListener(
         "click",
         () => {
+          if (this._maximizedSlot !== null) {
+            this.closeCameraContextMenu();
+            return;
+          }
+
           const slot =
             this._cameraContextSlot;
 
@@ -2983,6 +3340,9 @@ class NVRCard extends HTMLElement {
     button.addEventListener(
       "click",
       () => {
+        if (this._maximizedSlot !== null) {
+          return;
+        }
 
         this._assignedCameras
           .forEach(
