@@ -53,6 +53,14 @@ class NVRCard extends HTMLElement {
       views: false
     };
 
+    this._sidebarCollapsed = null;
+    this._viewportListenersInstalled = false;
+
+    this._viewportResizeHandler = () => {
+      this.updateAvailableHeight();
+      this.updateResponsiveShell();
+    };
+
     this._cameras = [];
 
     this._cameraAspectRatio =
@@ -476,10 +484,13 @@ class NVRCard extends HTMLElement {
 
     this._hass = hass;
     this.updateLiveStreams();
+    this.updateCameraStatuses();
   }
 
 
   connectedCallback() {
+    this.installViewportListeners();
+
     if (
       this.isConnected &&
       this._resizeObserver === null &&
@@ -492,6 +503,7 @@ class NVRCard extends HTMLElement {
 
   disconnectedCallback() {
     this.closeCameraContextMenu();
+    this.removeViewportListeners();
 
     if (this._resizeObserver) {
       this._resizeObserver.disconnect();
@@ -517,6 +529,32 @@ class NVRCard extends HTMLElement {
       <ha-card>
         <div class="nvr-shell">
 
+          <header class="card-title-bar">
+            <button
+              type="button"
+              class="sidebar-toggle"
+              aria-label="Collapse sidebar"
+              title="Collapse sidebar"
+              aria-expanded="true"
+            >
+              <svg
+                viewBox="0 0 24 24"
+                aria-hidden="true"
+              >
+                <rect
+                  x="3.5"
+                  y="4.5"
+                  width="17"
+                  height="15"
+                  rx="2"
+                ></rect>
+                <path d="M9 5v14"></path>
+              </svg>
+            </button>
+
+            <div class="card-title">NVR Card</div>
+          </header>
+
           <aside class="camera-list nvr-sidebar">
 
             <section
@@ -530,7 +568,10 @@ class NVRCard extends HTMLElement {
                 data-section="cameras"
                 aria-expanded="${this._sidebarSections.cameras}"
               >
-                <span>CAMERAS</span>
+                <span class="section-title">
+                  <ha-icon icon="mdi:video-outline"></ha-icon>
+                  <span>CAMERAS</span>
+                </span>
                 <span
                   class="section-indicator"
                   aria-hidden="true"
@@ -562,7 +603,10 @@ class NVRCard extends HTMLElement {
                 data-section="layouts"
                 aria-expanded="${this._sidebarSections.layouts}"
               >
-                <span>LAYOUTS</span>
+                <span class="section-title">
+                  <ha-icon icon="mdi:view-grid-outline"></ha-icon>
+                  <span>LAYOUTS</span>
+                </span>
                 <span
                   class="section-indicator"
                   aria-hidden="true"
@@ -592,7 +636,10 @@ class NVRCard extends HTMLElement {
                 data-section="views"
                 aria-expanded="${this._sidebarSections.views}"
               >
-                <span>VIEWS</span>
+                <span class="section-title">
+                  <ha-icon icon="mdi:view-dashboard-outline"></ha-icon>
+                  <span>VIEWS</span>
+                </span>
                 <span
                   class="section-indicator"
                   aria-hidden="true"
@@ -604,7 +651,8 @@ class NVRCard extends HTMLElement {
                 ${this._sidebarSections.views ? "" : "hidden"}
               >
                 <div class="sidebar-placeholder">
-                  -
+                  <ha-icon icon="mdi:view-dashboard-outline"></ha-icon>
+                  <span>No saved views</span>
                 </div>
               </div>
 
@@ -662,7 +710,16 @@ class NVRCard extends HTMLElement {
 
     style.textContent = `
       ha-card {
-        height: 700px;
+        height: calc(
+          100vh - var(--nvr-card-top, 0px)
+        );
+        height: calc(
+          100dvh - var(--nvr-card-top, 0px)
+        );
+        height: var(
+          --nvr-card-available-height,
+          calc(100dvh - var(--nvr-card-top, 0px))
+        );
 
         position: relative;
 
@@ -686,10 +743,54 @@ class NVRCard extends HTMLElement {
           minmax(0, 1fr);
 
         grid-template-rows:
+          44px
           minmax(0, 1fr);
 
         grid-template-areas:
+          "title title"
           "cameras video";
+
+        position: relative;
+      }
+
+
+      .nvr-shell.sidebar-collapsed {
+        grid-template-columns:
+          0
+          minmax(0, 1fr);
+      }
+
+
+      .card-title-bar {
+        grid-area: title;
+
+        min-width: 0;
+
+        display: flex;
+        align-items: center;
+
+        padding: 0 12px 0 4px;
+
+        background: #12171d;
+
+        border-bottom: 1px solid #26313b;
+
+        box-sizing: border-box;
+      }
+
+
+      .card-title {
+        margin-left: 4px;
+
+        overflow: hidden;
+
+        color: #e4e9ed;
+
+        font-size: 15px;
+        font-weight: 600;
+
+        text-overflow: ellipsis;
+        white-space: nowrap;
       }
 
 
@@ -705,13 +806,126 @@ class NVRCard extends HTMLElement {
         display: flex;
         flex-direction: column;
 
-        background: #111;
+        background: #11161c;
 
-        border-right: 1px solid #555;
+        border-right: 1px solid #26313b;
 
         padding: 14px;
 
-        overflow: hidden;
+        overflow-x: hidden;
+        overflow-y: auto;
+
+        scrollbar-width: none;
+
+        touch-action: pan-y;
+        overscroll-behavior-y: contain;
+        -webkit-overflow-scrolling: touch;
+
+        transition: transform 160ms ease;
+      }
+
+
+      .nvr-shell.sidebar-collapsed
+      > .camera-list {
+        visibility: hidden;
+        pointer-events: none;
+
+        transform: translateX(-100%);
+      }
+
+
+      .sidebar-toggle {
+        width: 42px;
+        height: 42px;
+
+        flex: 0 0 42px;
+
+        padding: 0;
+
+        display: grid;
+        place-items: center;
+
+        background: transparent;
+        color: #aab8c2;
+
+        border: 0;
+        border-radius: 4px;
+
+        cursor: pointer;
+      }
+
+
+      .sidebar-toggle:hover,
+      .sidebar-toggle:focus-visible {
+        background: #202a33;
+        color: #e5f2fa;
+
+        outline: none;
+      }
+
+
+      .sidebar-toggle svg {
+        width: 22px;
+        height: 22px;
+
+        fill: none;
+        stroke: currentColor;
+        stroke-width: 1.6;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+
+        pointer-events: none;
+      }
+
+
+      .nvr-shell.phone-layout {
+        grid-template-columns:
+          minmax(0, 1fr);
+        grid-template-areas:
+          "title"
+          "video";
+
+        isolation: isolate;
+      }
+
+
+      .nvr-shell.phone-layout
+      > .camera-list {
+        width: 190px;
+        height: calc(100% - 44px);
+
+        position: absolute;
+        top: 44px;
+        left: 0;
+        z-index: 100;
+
+        box-sizing: border-box;
+      }
+
+
+      .nvr-shell.phone-layout
+      > .main-area {
+        position: relative;
+        z-index: 0;
+      }
+
+
+      .nvr-shell.phone-layout:not(.sidebar-collapsed)
+      > .main-area {
+        pointer-events: none;
+        touch-action: none;
+      }
+
+
+      .nvr-shell.phone-layout:not(.sidebar-collapsed)
+      > .camera-context-menu {
+        pointer-events: none;
+      }
+
+
+      .nvr-shell.phone-layout:not(.sidebar-collapsed)
+      > .camera-list {
+        pointer-events: auto;
       }
 
 
@@ -720,14 +934,6 @@ class NVRCard extends HTMLElement {
 
         min-width: 0;
         min-height: 0;
-      }
-
-
-      .camera-section.expanded {
-        flex: 1 1 auto;
-
-        display: flex;
-        flex-direction: column;
       }
 
 
@@ -744,9 +950,9 @@ class NVRCard extends HTMLElement {
         background: transparent;
 
         border: 0;
-        border-bottom: 1px solid #555;
+        border-bottom: 1px solid #26313b;
 
-        color: #ddd;
+        color: #6faed9;
 
         font-family: inherit;
         font-size: 13px;
@@ -761,7 +967,34 @@ class NVRCard extends HTMLElement {
 
 
       .sidebar-section-header:hover {
-        color: #fff;
+        background: #172029;
+        color: #91c8ed;
+      }
+
+
+      .sidebar-section-header:focus-visible {
+        background: #172029;
+        color: #91c8ed;
+
+        outline: 1px solid #477a9e;
+        outline-offset: -1px;
+      }
+
+
+      .section-title {
+        min-width: 0;
+
+        display: flex;
+        align-items: center;
+
+        gap: 8px;
+      }
+
+
+      .section-title ha-icon {
+        --mdc-icon-size: 17px;
+
+        flex: 0 0 auto;
       }
 
 
@@ -771,7 +1004,7 @@ class NVRCard extends HTMLElement {
 
         border-top: 4.375px solid transparent;
         border-bottom: 4.375px solid transparent;
-        border-left: 7.5px solid #888;
+        border-left: 7.5px solid #6f8798;
 
         transform-origin: center;
       }
@@ -796,13 +1029,6 @@ class NVRCard extends HTMLElement {
 
 
       .camera-section-body {
-        flex: 1 1 auto;
-
-        min-height: 0;
-
-        display: flex;
-        flex-direction: column;
-
         padding-top: 8px;
       }
 
@@ -818,36 +1044,42 @@ class NVRCard extends HTMLElement {
         margin-top: 8px;
         padding-top: 8px;
 
-        border-top: 1px solid #555;
+        border-top: 1px solid #26313b;
       }
 
 
       .sidebar-placeholder {
-        padding: 7px 4px 8px;
+        min-height: 38px;
 
-        color: #555;
+        display: flex;
+        align-items: center;
 
-        font-size: 10px;
+        gap: 8px;
+
+        padding: 4px 8px;
+
+        color: #70808c;
+
+        font-size: 12px;
+      }
+
+
+      .sidebar-placeholder ha-icon {
+        --mdc-icon-size: 17px;
       }
 
 
       .sidebar-layout-body {
-        max-height: 220px;
-
-        overflow-y: auto;
-
         padding-right: 6px;
       }
 
 
       .sidebar-scroll-region {
         margin-right: -2px;
-
-        scrollbar-width: none;
       }
 
 
-      .sidebar-scroll-region::-webkit-scrollbar {
+      .camera-list::-webkit-scrollbar {
         display: none;
 
         width: 0;
@@ -857,10 +1089,9 @@ class NVRCard extends HTMLElement {
 
       .sidebar-layout-grid {
         display: grid;
-        grid-template-columns:
-          repeat(2, minmax(0, 1fr));
+        grid-template-columns: minmax(0, 1fr);
 
-        gap: 6px;
+        gap: 2px;
 
         padding: 8px 0;
       }
@@ -868,15 +1099,21 @@ class NVRCard extends HTMLElement {
 
       .sidebar-layout-item {
         min-width: 0;
+        min-height: 40px;
 
-        padding: 5px 3px;
+        display: flex;
+        align-items: center;
 
-        background: #181818;
+        gap: 10px;
 
-        color: #aaa;
+        padding: 5px 8px;
 
-        border: 1px solid #444;
-        border-radius: 0;
+        background: transparent;
+
+        color: #c4ccd2;
+
+        border: 1px solid transparent;
+        border-radius: 4px;
 
         font-family: inherit;
 
@@ -885,20 +1122,23 @@ class NVRCard extends HTMLElement {
 
 
       .sidebar-layout-item:hover {
+        background: #1b242c;
         color: #fff;
-        border-color: #888;
+        border-color: #2c3b46;
       }
 
 
       .sidebar-layout-item.selected {
-        color: #ddd;
-        border-color: #777;
+        background: #182630;
+        color: #dbeaf4;
+        border-color: transparent;
       }
 
 
       .sidebar-layout-item.target-selected {
+        background: #1c303e;
         color: #fff;
-        border-color: #fff;
+        border-color: #568db3;
       }
 
 
@@ -908,23 +1148,12 @@ class NVRCard extends HTMLElement {
 
 
       .sidebar-layout-label {
-        margin-top: 4px;
-
         overflow: hidden;
 
-        font-size: 9px;
+        font-size: 13px;
 
         text-overflow: ellipsis;
         white-space: nowrap;
-      }
-
-
-      .camera-items {
-        flex: 1 1 auto;
-
-        min-height: 0;
-
-        overflow-y: auto;
       }
 
 
@@ -934,14 +1163,18 @@ class NVRCard extends HTMLElement {
         display: flex;
         align-items: center;
 
-        padding: 7px 8px;
-        margin-bottom: 3px;
+        gap: 9px;
+
+        min-height: 40px;
+
+        padding: 5px 8px;
+        margin-bottom: 2px;
 
         box-sizing: border-box;
 
         background: transparent;
 
-        color: #ccc;
+        color: #cbd2d7;
 
         border: 1px solid transparent;
         border-radius: 3px;
@@ -954,23 +1187,23 @@ class NVRCard extends HTMLElement {
 
 
       .camera-item:hover {
-        background: #222;
+        background: #1b242c;
         color: #fff;
-        border-color: #444;
+        border-color: #2c3b46;
       }
 
 
       .camera-item.assigned {
-        background: #1e1e1e;
-        color: #ddd;
+        background: #18232b;
+        color: #dce3e8;
         border-color: transparent;
       }
 
 
       .camera-item.target-selected {
-        background: #181818;
+        background: #1c303e;
         color: #fff;
-        border-color: #aaa;
+        border-color: #568db3;
       }
 
 
@@ -979,37 +1212,50 @@ class NVRCard extends HTMLElement {
       }
 
 
-      .camera-item.live-capable::after {
-        content: "";
+      .camera-row-icon {
+        --mdc-icon-size: 18px;
 
-        width: 6px;
-        height: 6px;
+        flex: 0 0 18px;
 
-        margin-left: auto;
+        color: #9caab4;
 
-        border-radius: 50%;
-
-        background: #aaa;
-      }
-
-
-      .camera-index {
-        width: 22px;
-
-        flex: 0 0 22px;
-
-        color: #777;
-
-        font-size: 11px;
+        pointer-events: none;
       }
 
 
       .camera-name {
+        min-width: 0;
+
+        flex: 1 1 auto;
+
         overflow: hidden;
 
         text-overflow: ellipsis;
 
         white-space: nowrap;
+      }
+
+
+      .camera-status {
+        width: 7px;
+        height: 7px;
+
+        flex: 0 0 7px;
+
+        margin-left: auto;
+
+        border: 1.5px solid #d45b5b;
+        border-radius: 50%;
+
+        box-sizing: border-box;
+
+        pointer-events: none;
+      }
+
+
+      .camera-status.online {
+        background: #4caf70;
+        border-color: #4caf70;
       }
 
 
@@ -1299,10 +1545,10 @@ class NVRCard extends HTMLElement {
          ================================================ */
 
       .layout-icon {
-        width: 52px;
-        height: 36px;
+        width: 30px;
+        height: 22px;
 
-        margin: auto;
+        flex: 0 0 30px;
 
         display: grid;
 
@@ -1310,9 +1556,9 @@ class NVRCard extends HTMLElement {
 
         box-sizing: border-box;
 
-        background: #777;
+        background: #687b89;
 
-        border: 1px solid #888;
+        border: 1px solid #687b89;
       }
 
 
@@ -1322,7 +1568,7 @@ class NVRCard extends HTMLElement {
 
         box-sizing: border-box;
 
-        background: #050505;
+        background: #11161c;
       }
     `;
 
@@ -1333,6 +1579,7 @@ class NVRCard extends HTMLElement {
     this.attachCameraHandlers();
     this.attachCameraDragHandlers();
     this.attachSidebarHandlers();
+    this.attachSidebarToggleHandler();
     this.attachLayoutHandlers();
     this.attachLayoutDragHandlers();
     this.attachClearHandler();
@@ -1348,6 +1595,9 @@ class NVRCard extends HTMLElement {
 
     this.updateSelectedButton();
     this.updateCameraListState();
+
+    this.updateAvailableHeight();
+    this.updateResponsiveShell();
 
     this.installResizeObserver();
   }
@@ -1386,12 +1636,18 @@ class NVRCard extends HTMLElement {
       .filter(camera => {
         return camera.active === true;
       })
-      .map((camera, index) => {
+      .map(camera => {
 
         const liveClass =
           camera.entity
             ? "live-capable"
             : "";
+
+        const online =
+          this.isCameraOnline(camera);
+
+        const statusLabel =
+          online ? "Online" : "Offline";
 
         return `
           <button
@@ -1401,13 +1657,22 @@ class NVRCard extends HTMLElement {
             draggable="true"
           >
 
-            <span class="camera-index">
-              ${index + 1}
-            </span>
+            <ha-icon
+              class="camera-row-icon"
+              icon="mdi:cctv"
+              aria-hidden="true"
+            ></ha-icon>
 
             <span class="camera-name">
               ${camera.name}
             </span>
+
+            <span
+              class="camera-status ${online ? "online" : "offline"}"
+              role="img"
+              aria-label="${statusLabel}"
+              title="${statusLabel}"
+            ></span>
 
           </button>
         `;
@@ -1491,6 +1756,30 @@ class NVRCard extends HTMLElement {
       camera =>
         camera.name === cameraName
     );
+  }
+
+
+  isCameraOnline(camera) {
+    if (
+      !camera ||
+      !camera.entity ||
+      !this._hass ||
+      !this._hass.states
+    ) {
+      return false;
+    }
+
+    const entityState =
+      this._hass.states[camera.entity];
+
+    if (!entityState) {
+      return false;
+    }
+
+    return ![
+      "unavailable",
+      "unknown"
+    ].includes(entityState.state);
   }
 
 
@@ -2723,6 +3012,91 @@ class NVRCard extends HTMLElement {
   }
 
 
+  attachSidebarToggleHandler() {
+    const button =
+      this.querySelector(".sidebar-toggle");
+
+    if (!button) {
+      return;
+    }
+
+    button.addEventListener("click", () => {
+      const shell =
+        this.querySelector(".nvr-shell");
+
+      if (!shell) {
+        return;
+      }
+
+      this._sidebarCollapsed =
+        !shell.classList.contains(
+          "sidebar-collapsed"
+        );
+
+      this.updateResponsiveShell();
+      this.scheduleCameraFit();
+    });
+  }
+
+
+  updateResponsiveShell() {
+    const shell =
+      this.querySelector(".nvr-shell");
+
+    const sidebar =
+      this.querySelector(".nvr-sidebar");
+
+    const button =
+      this.querySelector(".sidebar-toggle");
+
+    if (!shell || !sidebar || !button) {
+      return;
+    }
+
+    const phoneLayout =
+      shell.clientWidth <= 600;
+
+    const collapsed =
+      this._sidebarCollapsed === null
+        ? phoneLayout
+        : this._sidebarCollapsed;
+
+    shell.classList.toggle(
+      "phone-layout",
+      phoneLayout
+    );
+
+    shell.classList.toggle(
+      "sidebar-collapsed",
+      collapsed
+    );
+
+    sidebar.setAttribute(
+      "aria-hidden",
+      String(collapsed)
+    );
+
+    button.setAttribute(
+      "aria-expanded",
+      String(!collapsed)
+    );
+
+    button.setAttribute(
+      "aria-label",
+      collapsed
+        ? "Expand sidebar"
+        : "Collapse sidebar"
+    );
+
+    button.setAttribute(
+      "title",
+      collapsed
+        ? "Expand sidebar"
+        : "Collapse sidebar"
+    );
+  }
+
+
   toggleSidebarSection(sectionName) {
     if (
       !Object.prototype.hasOwnProperty.call(
@@ -3348,6 +3722,85 @@ class NVRCard extends HTMLElement {
      RESIZE HANDLING
      ================================================ */
 
+  installViewportListeners() {
+    if (this._viewportListenersInstalled) {
+      return;
+    }
+
+    window.addEventListener(
+      "resize",
+      this._viewportResizeHandler
+    );
+
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener(
+        "resize",
+        this._viewportResizeHandler
+      );
+    }
+
+    this._viewportListenersInstalled = true;
+    this._viewportResizeHandler();
+  }
+
+
+  removeViewportListeners() {
+    if (!this._viewportListenersInstalled) {
+      return;
+    }
+
+    window.removeEventListener(
+      "resize",
+      this._viewportResizeHandler
+    );
+
+    if (window.visualViewport) {
+      window.visualViewport.removeEventListener(
+        "resize",
+        this._viewportResizeHandler
+      );
+    }
+
+    this._viewportListenersInstalled = false;
+  }
+
+
+  updateAvailableHeight() {
+    const card = this.querySelector("ha-card");
+
+    if (!card) {
+      return;
+    }
+
+    const viewport = window.visualViewport;
+    const viewportHeight =
+      viewport
+        ? viewport.height
+        : window.innerHeight;
+
+    const viewportTop =
+      viewport ? viewport.offsetTop : 0;
+
+    const cardTop =
+      card.getBoundingClientRect().top;
+
+    const availableHeight = Math.max(
+      0,
+      viewportHeight -
+        Math.max(0, cardTop - viewportTop)
+    );
+
+    card.style.setProperty(
+      "--nvr-card-top",
+      `${Math.max(0, cardTop)}px`
+    );
+
+    card.style.setProperty(
+      "--nvr-card-available-height",
+      `${Math.floor(availableHeight)}px`
+    );
+  }
+
   installResizeObserver() {
     if (
       this._resizeObserver
@@ -3362,6 +3815,8 @@ class NVRCard extends HTMLElement {
         ".video-grid"
       );
 
+    const card = this.querySelector("ha-card");
+
 
     if (!grid) {
       return;
@@ -3369,18 +3824,70 @@ class NVRCard extends HTMLElement {
 
     this._resizeObserver =
       new ResizeObserver(() => {
+        this.updateResponsiveShell();
         this.scheduleCameraFit();
       });
 
     this._resizeObserver.observe(
       grid
     );
+
+    if (card) {
+      this._resizeObserver.observe(card);
+    }
   }
 
 
   /* ================================================
      UI STATE
      ================================================ */
+
+  updateCameraStatuses() {
+    this
+      .querySelectorAll(".camera-item")
+      .forEach(button => {
+        const camera =
+          this.getCameraByName(
+            button.dataset.camera
+          );
+
+        const status =
+          button.querySelector(
+            ".camera-status"
+          );
+
+        if (!status) {
+          return;
+        }
+
+        const online =
+          this.isCameraOnline(camera);
+
+        const statusLabel =
+          online ? "Online" : "Offline";
+
+        status.classList.toggle(
+          "online",
+          online
+        );
+
+        status.classList.toggle(
+          "offline",
+          !online
+        );
+
+        status.setAttribute(
+          "aria-label",
+          statusLabel
+        );
+
+        status.setAttribute(
+          "title",
+          statusLabel
+        );
+      });
+  }
+
 
   updateCameraListState() {
     this
