@@ -733,7 +733,7 @@ class NVRCard extends HTMLElement {
 
       .sidebar-section-header {
         width: 100%;
-        min-height: 30px;
+        min-height: 42px;
 
         display: flex;
         align-items: center;
@@ -843,64 +843,15 @@ class NVRCard extends HTMLElement {
       .sidebar-scroll-region {
         margin-right: -2px;
 
-        scrollbar-color: #666 #181818;
-        scrollbar-width: thin;
+        scrollbar-width: none;
       }
 
 
       .sidebar-scroll-region::-webkit-scrollbar {
-        width: 6px;
-      }
+        display: none;
 
-
-      .sidebar-scroll-region::-webkit-scrollbar-track {
-        background: #181818;
-      }
-
-
-      .sidebar-scroll-region::-webkit-scrollbar-thumb {
-        background: #666;
-
-        border-radius: 0;
-      }
-
-
-      .sidebar-scroll-region::-webkit-scrollbar-thumb:hover {
-        background: #888;
-      }
-
-
-      .sidebar-scroll-region::-webkit-scrollbar-button {
-        width: 0 !important;
-        height: 0 !important;
-        min-width: 0 !important;
-        min-height: 0 !important;
-
-        display: none !important;
-
-        -webkit-appearance: none !important;
-        appearance: none !important;
-
-        background: transparent !important;
-
-        border: 0 !important;
-      }
-
-
-      .sidebar-scroll-region::-webkit-scrollbar-button:vertical {
-        width: 0 !important;
-        height: 0 !important;
-        min-width: 0 !important;
-        min-height: 0 !important;
-
-        display: none !important;
-
-        -webkit-appearance: none !important;
-        appearance: none !important;
-
-        background: transparent !important;
-
-        border: 0 !important;
+        width: 0;
+        height: 0;
       }
 
 
