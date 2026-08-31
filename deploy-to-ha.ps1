@@ -4,9 +4,11 @@ $HaConfigShare = "Z:"
 
 $SourceFile = Join-Path $PSScriptRoot "nvr-card.js"
 $LoaderSourceFile = Join-Path $PSScriptRoot "loader.js"
+$LiveSourceDirectory = Join-Path $PSScriptRoot "src\live"
 $HaWwwDirectory = Join-Path $HaConfigShare "www\nvr-card"
 $DestinationFile = Join-Path $HaWwwDirectory "nvr-card.js"
 $LoaderDestinationFile = Join-Path $HaWwwDirectory "loader.js"
+$LiveDestinationDirectory = Join-Path $HaWwwDirectory "src\live"
 
 Write-Host "Local source: $SourceFile"
 Write-Host "HA destination: $DestinationFile"
@@ -20,6 +22,11 @@ if (-not (Test-Path -LiteralPath $SourceFile -PathType Leaf)) {
 
 if (-not (Test-Path -LiteralPath $LoaderSourceFile -PathType Leaf)) {
     Write-Error "Local loader file does not exist: $LoaderSourceFile"
+    exit 1
+}
+
+if (-not (Test-Path -LiteralPath $LiveSourceDirectory -PathType Container)) {
+    Write-Error "Live source directory does not exist: $LiveSourceDirectory"
     exit 1
 }
 
@@ -74,6 +81,8 @@ try {
     $DeployedBytes = $Utf8NoBom.GetBytes($DeployedContent)
     [System.IO.File]::WriteAllBytes($DestinationFile, $DeployedBytes)
     Copy-Item -LiteralPath $LoaderSourceFile -Destination $LoaderDestinationFile -Force -ErrorAction Stop
+    New-Item -ItemType Directory -Path $LiveDestinationDirectory -Force -ErrorAction Stop | Out-Null
+    Copy-Item -Path (Join-Path $LiveSourceDirectory "*.js") -Destination $LiveDestinationDirectory -Force -ErrorAction Stop
 }
 catch {
     Write-Error "Failed to deploy NVR card files: $($_.Exception.Message)"
@@ -87,6 +96,11 @@ if (-not (Test-Path -LiteralPath $DestinationFile -PathType Leaf)) {
 
 if (-not (Test-Path -LiteralPath $LoaderDestinationFile -PathType Leaf)) {
     Write-Error "Loader destination file does not exist after deployment: $LoaderDestinationFile"
+    exit 1
+}
+
+if (-not (Test-Path -LiteralPath (Join-Path $LiveDestinationDirectory "nvr-live-presentation.js") -PathType Leaf)) {
+    Write-Error "Live presentation module was not deployed."
     exit 1
 }
 

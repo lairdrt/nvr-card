@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test test/nvr-card.test.js"
+    "test": "node --test test/*.test.js"
   },
   "devDependencies": {
     "happy-dom": "^20.8.8"

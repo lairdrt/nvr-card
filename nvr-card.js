@@ -3,6 +3,91 @@
 */
 
 const NVR_BUILD = "__NVR_BUILD__";
+const NVR_STAGE2A_CAMERA_NAME = "garage";
+const NVR_STAGE2A_STREAM_ID = "garage";
+const NVR_MAXIMIZE_DIAGNOSTICS = false;
+const NVR_MAXIMIZE_FLIGHT_RECORDER = true;
+const NVR_DIAGNOSTIC_LIVE_SLOT_LIMIT = 4;
+const NVR_FLIGHT_RECORDER_SIZE = 256;
+const NVR_MEDIA_SNAPSHOT_EVENTS = new Set([
+  "maximize-start",
+  "maximize-classes-applied",
+  "fit-end",
+  "restore-start",
+  "layout-end"
+]);
+const NVR_MAXIMIZE_MEDIA_SAMPLE_INTERVAL = 250;
+const NVR_MAXIMIZE_MEDIA_SAMPLE_DURATION = 8000;
+const NVR_MAXIMIZE_MEDIA_SESSION_LIMIT = 10;
+const NVR_FLIGHT_RECORDER_STATE_KEY =
+  Symbol.for("nvr.maximizeFlightRecorder");
+const NVR_FLIGHT_RECORDER_STATE =
+  window[NVR_FLIGHT_RECORDER_STATE_KEY] ?? {
+    records: new Array(NVR_FLIGHT_RECORDER_SIZE),
+    index: 0,
+    count: 0,
+    fitRequestCount: 0,
+    nextInstanceId: 1,
+    mediaSessions: [],
+    nextMediaSessionId: 1
+  };
+
+NVR_FLIGHT_RECORDER_STATE.mediaSessions ??= [];
+NVR_FLIGHT_RECORDER_STATE.nextMediaSessionId ??= 1;
+
+window[NVR_FLIGHT_RECORDER_STATE_KEY] =
+  NVR_FLIGHT_RECORDER_STATE;
+
+window.dumpNvrFlightRecorder = () => {
+  if (!NVR_MAXIMIZE_FLIGHT_RECORDER) {
+    return [];
+  }
+
+  const state = NVR_FLIGHT_RECORDER_STATE;
+  const start =
+    (state.index -
+      state.count +
+      NVR_FLIGHT_RECORDER_SIZE) %
+    NVR_FLIGHT_RECORDER_SIZE;
+
+  return Array.from(
+    { length: state.count },
+    (_, offset) => {
+      const record = state.records[
+        (start + offset) %
+          NVR_FLIGHT_RECORDER_SIZE
+      ];
+
+      return {
+        ...record,
+        ...(record.media
+          ? {
+              media: record.media.map(
+                snapshot => ({ ...snapshot })
+              )
+            }
+          : {})
+      };
+    }
+  );
+};
+
+window.dumpNvrMaximizeMediaSessions = () => {
+  return NVR_FLIGHT_RECORDER_STATE.mediaSessions.map(
+    session => ({
+      ...session,
+      samples: session.samples.map(sample => ({ ...sample })),
+      events: {
+        waiting: [...session.events.waiting],
+        stalled: [...session.events.stalled],
+        playing: [...session.events.playing]
+      },
+      visibility: session.visibility.map(
+        entry => ({ ...entry })
+      )
+    })
+  );
+};
 
 // Internal camera-inventory safety limit; not a viewer slot limit.
 const MAX_CAMERAS = 256;
@@ -56,10 +141,29 @@ class NVRCard extends HTMLElement {
     this._sidebarCollapsed = null;
     this._viewportListenersInstalled = false;
 
-    this._viewportResizeHandler = () => {
+    this._viewportResizeHandler = event => {
+      const source =
+        event?.currentTarget === window.visualViewport
+          ? "visual-viewport-resize"
+          : event
+            ? "window-resize"
+            : "viewport-initial";
+
+      this.logMaximizeDiagnostic(
+        source,
+        this.getMaximizeDiagnosticSnapshot()
+      );
+
+      this.recordNvrFlight(source);
+
       this.updateAvailableHeight();
       this.updateResponsiveShell();
     };
+
+    this._diagnosticMediaChecked =
+      NVR_MAXIMIZE_DIAGNOSTICS
+        ? new WeakSet()
+        : null;
 
     this._cameras = [];
 
@@ -76,6 +180,15 @@ class NVRCard extends HTMLElement {
 
     this._resizeObserver = null;
     this._cameraFitFrame = null;
+    this._maximizedPlayerFit = null;
+    this._mediaDiagnosticStates = new WeakMap();
+    this._activeMaximizeMediaSession = null;
+    this._nvrInstanceId =
+      NVR_FLIGHT_RECORDER_STATE.nextInstanceId++;
+    this._nvrVisibilityHandler = () => {
+      this.recordNvrFlight("visibility-change");
+      this.recordMaximizeMediaVisibility();
+    };
 
     this.layouts = {
       "1x1": {
@@ -489,6 +602,7 @@ class NVRCard extends HTMLElement {
 
 
   connectedCallback() {
+    this.recordNvrFlight("card-connected");
     this.installViewportListeners();
 
     if (
@@ -502,6 +616,8 @@ class NVRCard extends HTMLElement {
 
 
   disconnectedCallback() {
+    this.recordNvrFlight("card-disconnected");
+    this.completeMaximizeMediaSession("disconnected");
     this.closeCameraContextMenu();
     this.removeViewportListeners();
 
@@ -1348,7 +1464,8 @@ class NVRCard extends HTMLElement {
 
       .video-grid.camera-maximized
         .video-cell:not(.maximized-camera) {
-        display: none;
+        visibility: hidden;
+        pointer-events: none;
       }
 
 
@@ -1956,6 +2073,8 @@ class NVRCard extends HTMLElement {
     targetCell.dataset.slot =
       String(sourceSlot);
 
+    this.updateCameraViewForCell(sourceCell);
+
     const number =
       sourceCell.querySelector(
         ".cell-number"
@@ -2085,6 +2204,8 @@ class NVRCard extends HTMLElement {
         this._assignedCameras[logicalSlot] =
           cameraName;
 
+        this.updateCameraViewForCell(cell);
+
         const number =
           cell.querySelector(".cell-number");
 
@@ -2115,6 +2236,20 @@ class NVRCard extends HTMLElement {
   }
 
   
+  updateCameraViewForCell(cell) {
+    const image =
+      cell?.querySelector("hui-image.nvr-live-camera");
+    const slot = Number(cell?.dataset.slot);
+
+    if (image && Number.isInteger(slot)) {
+      image.cameraView =
+        slot < NVR_DIAGNOSTIC_LIVE_SLOT_LIMIT
+          ? "live"
+          : "auto";
+    }
+  }
+
+
   renderSlot(slot) {
     const cell =
       this.querySelector(
@@ -2188,6 +2323,28 @@ class NVRCard extends HTMLElement {
         "camera-frame";
 
 
+      if (camera.name === NVR_STAGE2A_CAMERA_NAME) {
+        const presentation = document.createElement(
+          "nvr-live-presentation"
+        );
+
+        presentation.className = "nvr-live-camera";
+        presentation.liveConfig = {
+          cameraId: camera.name,
+          variantId: "garage-stage2a",
+          role: "custom",
+          sourceId: NVR_STAGE2A_STREAM_ID
+        };
+
+        if (this._hass) {
+          presentation.hass = this._hass;
+        }
+
+        frame.appendChild(presentation);
+        cell.appendChild(frame);
+        return;
+      }
+
       const image =
         document.createElement(
           "hui-image"
@@ -2207,7 +2364,9 @@ class NVRCard extends HTMLElement {
 
 
       image.cameraView =
-        "live";
+        slot < NVR_DIAGNOSTIC_LIVE_SLOT_LIMIT
+          ? "live"
+          : "auto";
 
 
       if (this._hass) {
@@ -2308,6 +2467,8 @@ class NVRCard extends HTMLElement {
       return;
     }
 
+    this.recordNvrFlight("layout-start");
+
 
     grid.style.gridTemplateColumns =
       layout.columns;
@@ -2375,6 +2536,7 @@ class NVRCard extends HTMLElement {
     );
 
     this.fitLiveCameras();
+    this.recordNvrFlight("layout-end");
   }
 
 
@@ -2382,9 +2544,587 @@ class NVRCard extends HTMLElement {
      16:9 LETTERBOX ENGINE
      ================================================ */
 
-  fitLiveCameras() {
+  recordNvrFlight(
+    event,
+    slot = -1,
+    cell = null,
+    image = null,
+    frameWidth = -1,
+    frameHeight = -1,
+    oldWidth = "",
+    oldHeight = "",
+    newWidth = "",
+    newHeight = ""
+  ) {
+    if (!NVR_MAXIMIZE_FLIGHT_RECORDER) {
+      return;
+    }
+
+    const state = NVR_FLIGHT_RECORDER_STATE;
+
+    state.fitRequestCount +=
+      event === "fit-request" ? 1 : 0;
+
+    const media =
+      NVR_MEDIA_SNAPSHOT_EVENTS.has(event)
+        ? this.captureAnonymousMediaSnapshot()
+        : null;
+
+    state.records[state.index] = {
+      time: performance.now(),
+      event,
+      instanceId: this._nvrInstanceId,
+      slot,
+      maximizedSlot:
+        this._maximizedSlot ?? -1,
+      visibility: document.visibilityState,
+      cellConnected:
+        cell ? cell.isConnected : null,
+      imageConnected:
+        image ? image.isConnected : null,
+      maximizedClass:
+        cell
+          ? cell.classList.contains(
+              "maximized-camera"
+            )
+          : null,
+      frameWidth,
+      frameHeight,
+      oldWidth,
+      oldHeight,
+      newWidth,
+      newHeight,
+      fitPending: this._cameraFitFrame !== null,
+      fitRequestCount: state.fitRequestCount,
+      ...(media ? { media } : {})
+    };
+
+    state.index =
+      (state.index + 1) %
+      NVR_FLIGHT_RECORDER_SIZE;
+    state.count = Math.min(
+      state.count + 1,
+      NVR_FLIGHT_RECORDER_SIZE
+    );
+  }
+
+
+  getOpenMediaElements(image) {
+    const elements = [image];
+    const roots = image.shadowRoot
+      ? [image.shadowRoot]
+      : [];
+
+    while (roots.length > 0) {
+      const root = roots.shift();
+
+      root.querySelectorAll("*").forEach(element => {
+        elements.push(element);
+
+        if (element.shadowRoot) {
+          roots.push(element.shadowRoot);
+        }
+      });
+    }
+
+    return elements;
+  }
+
+
+  getAnonymousMediaEventState(video) {
+    let state = this._mediaDiagnosticStates.get(video);
+
+    if (state) {
+      return state;
+    }
+
+    state = {
+      lastWaitingTime: null,
+      lastStalledTime: null,
+      lastPlayingTime: null,
+      latestSnapshot: null,
+      activeSession: null
+    };
+
+    const update = (field, eventName) => {
+      const time = performance.now();
+      state[field] = time;
+
+      if (state.latestSnapshot) {
+        state.latestSnapshot[field] = time;
+      }
+
+      if (state.activeSession) {
+        state.activeSession.events[eventName].push(
+          time - state.activeSession.startTime
+        );
+      }
+    };
+
+    video.addEventListener(
+      "waiting",
+      () => update("lastWaitingTime", "waiting"),
+      { passive: true }
+    );
+    video.addEventListener(
+      "stalled",
+      () => update("lastStalledTime", "stalled"),
+      { passive: true }
+    );
+    video.addEventListener(
+      "playing",
+      () => update("lastPlayingTime", "playing"),
+      { passive: true }
+    );
+
+    this._mediaDiagnosticStates.set(video, state);
+    return state;
+  }
+
+
+  captureSafeVideoState(video) {
+    let totalFrames = null;
+    let droppedFrames = null;
+
+    if (
+      typeof video.getVideoPlaybackQuality ===
+        "function"
+    ) {
+      try {
+        const quality = video.getVideoPlaybackQuality();
+
+        totalFrames = Number.isFinite(
+          quality?.totalVideoFrames
+        )
+          ? quality.totalVideoFrames
+          : null;
+        droppedFrames = Number.isFinite(
+          quality?.droppedVideoFrames
+        )
+          ? quality.droppedVideoFrames
+          : null;
+      } catch {
+        totalFrames = null;
+        droppedFrames = null;
+      }
+    }
+
+    return {
+      currentTime: Number.isFinite(video.currentTime)
+        ? video.currentTime
+        : null,
+      readyState: video.readyState,
+      paused: video.paused,
+      ended: video.ended,
+      videoWidth: video.videoWidth,
+      videoHeight: video.videoHeight,
+      totalFrames,
+      droppedFrames
+    };
+  }
+
+
+  recordMaximizeMediaVisibility() {
+    const session = this._activeMaximizeMediaSession;
+
+    if (!session) {
+      return;
+    }
+
+    const visibility =
+      document.visibilityState === "hidden"
+        ? "hidden"
+        : "visible";
+    const previous = session.visibility.at(-1);
+
+    if (previous?.state !== visibility) {
+      session.visibility.push({
+        elapsed: performance.now() - session.startTime,
+        state: visibility
+      });
+    }
+  }
+
+
+  sampleMaximizeMediaSession() {
+    const session = this._activeMaximizeMediaSession;
+
+    if (!session) {
+      return;
+    }
+
+    if (!session.video.isConnected) {
+      this.completeMaximizeMediaSession("disconnected");
+      return;
+    }
+
+    const elapsed = performance.now() - session.startTime;
+
+    if (elapsed >= NVR_MAXIMIZE_MEDIA_SAMPLE_DURATION) {
+      this.completeMaximizeMediaSession("duration");
+      return;
+    }
+
+    session.samples.push({
+      elapsed,
+      ...this.captureSafeVideoState(session.video)
+    });
+  }
+
+
+  completeMaximizeMediaSession(reason) {
+    const session = this._activeMaximizeMediaSession;
+
+    if (!session) {
+      return;
+    }
+
+    window.clearInterval(session.intervalId);
+    session.eventState.activeSession = null;
+    this._activeMaximizeMediaSession = null;
+
+    const completed = {
+      sessionId: session.sessionId,
+      slot: session.slot,
+      startTime: session.startTime,
+      completionReason: reason,
+      completionTime: performance.now(),
+      samples: session.samples,
+      events: session.events,
+      visibility: session.visibility
+    };
+    const history =
+      NVR_FLIGHT_RECORDER_STATE.mediaSessions;
+
+    history.push(completed);
+
+    if (history.length > NVR_MAXIMIZE_MEDIA_SESSION_LIMIT) {
+      history.splice(
+        0,
+        history.length - NVR_MAXIMIZE_MEDIA_SESSION_LIMIT
+      );
+    }
+  }
+
+
+  startMaximizeMediaSession(slot, image) {
+    this.completeMaximizeMediaSession("replaced");
+
+    const video = this.getOpenMediaElements(image)
+      .find(element => element.localName === "video");
+
+    if (!video) {
+      return;
+    }
+
+    const startTime = performance.now();
+    const eventState =
+      this.getAnonymousMediaEventState(video);
+    const session = {
+      sessionId:
+        NVR_FLIGHT_RECORDER_STATE.nextMediaSessionId++,
+      slot,
+      startTime,
+      video,
+      eventState,
+      intervalId: null,
+      samples: [],
+      events: {
+        waiting: [],
+        stalled: [],
+        playing: []
+      },
+      visibility: [{
+        elapsed: 0,
+        state:
+          document.visibilityState === "hidden"
+            ? "hidden"
+            : "visible"
+      }]
+    };
+
+    this._activeMaximizeMediaSession = session;
+    eventState.activeSession = session;
+    this.sampleMaximizeMediaSession();
+
+    if (this._activeMaximizeMediaSession !== session) {
+      return;
+    }
+
+    session.intervalId = window.setInterval(
+      () => this.sampleMaximizeMediaSession(),
+      NVR_MAXIMIZE_MEDIA_SAMPLE_INTERVAL
+    );
+  }
+
+
+  captureAnonymousMediaSnapshot() {
+    return Array.from(
+      this.querySelectorAll(".video-cell"),
+      cell => {
+        const slot = Number(cell.dataset.slot);
+        const image = cell.querySelector(
+          "hui-image.nvr-live-camera"
+        );
+
+        if (!Number.isInteger(slot) || !image) {
+          return null;
+        }
+
+        const elements = this.getOpenMediaElements(image);
+        const tags = new Set(
+          elements.map(element => element.localName)
+        );
+        const hasCameraStream =
+          tags.has("ha-camera-stream");
+        const video = elements.find(
+          element => element.localName === "video"
+        );
+        let transport = "none";
+
+        if (hasCameraStream) {
+          if (tags.has("ha-hls-player")) {
+            transport = "hls";
+          } else if (tags.has("ha-web-rtc-player")) {
+            transport = "webrtc";
+          } else if (
+            tags.has("ha-camera-image") ||
+            tags.has("img")
+          ) {
+            transport = "mjpeg";
+          } else {
+            transport = "unknown";
+          }
+        }
+
+        const snapshot = {
+          slot,
+          transport,
+          hasVideo: Boolean(video)
+        };
+
+        if (video) {
+          const eventState =
+            this.getAnonymousMediaEventState(video);
+
+          Object.assign(snapshot, {
+            ...this.captureSafeVideoState(video),
+            lastWaitingTime: eventState.lastWaitingTime,
+            lastStalledTime: eventState.lastStalledTime,
+            lastPlayingTime: eventState.lastPlayingTime
+          });
+
+          eventState.latestSnapshot = snapshot;
+        }
+
+        return snapshot;
+      }
+    )
+      .filter(Boolean)
+      .sort((left, right) => left.slot - right.slot);
+  }
+
+
+  dumpNvrFlightRecorder() {
+    return window.dumpNvrFlightRecorder();
+  }
+
+
+  clearNvrFlightRecorder() {
+    if (!NVR_MAXIMIZE_FLIGHT_RECORDER) {
+      return;
+    }
+
+    NVR_FLIGHT_RECORDER_STATE.records.fill(undefined);
+    NVR_FLIGHT_RECORDER_STATE.index = 0;
+    NVR_FLIGHT_RECORDER_STATE.count = 0;
+    NVR_FLIGHT_RECORDER_STATE.fitRequestCount = 0;
+  }
+
+
+  logMaximizeDiagnostic(eventName, details = {}) {
+    if (!NVR_MAXIMIZE_DIAGNOSTICS) {
+      return;
+    }
+
+    console.debug(
+      "[NVR maximize diagnostic]",
+      {
+        timestamp: new Date().toISOString(),
+        timeMs: Number(performance.now().toFixed(1)),
+        event: eventName,
+        ...details
+      }
+    );
+  }
+
+
+  getDiagnosticDimensions(element) {
+    if (!NVR_MAXIMIZE_DIAGNOSTICS || !element) {
+      return null;
+    }
+
+    const rect = element.getBoundingClientRect();
+
+    return {
+      width: Math.round(rect.width),
+      height: Math.round(rect.height)
+    };
+  }
+
+
+  getMaximizeDiagnosticSnapshot(
+    slot = this._maximizedSlot
+  ) {
+    if (!NVR_MAXIMIZE_DIAGNOSTICS) {
+      return {};
+    }
+
+    const grid = this.querySelector(".video-grid");
+    const shell = this.querySelector(".nvr-shell");
+    const cell = Number.isInteger(slot)
+      ? this.querySelector(
+          `.video-cell[data-slot="${slot}"]`
+        )
+      : null;
+    const frame =
+      cell?.querySelector(".camera-frame") ?? null;
+    const image =
+      frame?.querySelector(
+        "hui-image.nvr-live-camera"
+      ) ?? null;
+
+    const hiddenSiblingCount = cell
+      ? [...this.querySelectorAll(".video-cell")]
+          .filter(candidate => {
+            return (
+              candidate !== cell &&
+              !candidate.classList.contains(
+                "hidden-slot"
+              )
+            );
+          })
+          .length
+      : 0;
+
+    return {
+      slot: Number.isInteger(slot) ? slot : null,
+      grid: this.getDiagnosticDimensions(grid),
+      cell: this.getDiagnosticDimensions(cell),
+      frame: this.getDiagnosticDimensions(frame),
+      image: this.getDiagnosticDimensions(image),
+      imageInlineWidth: image?.style.width || "",
+      imageInlineHeight: image?.style.height || "",
+      imageConnected: image?.isConnected ?? false,
+      hiddenSiblingCount,
+      phoneLayout:
+        shell?.classList.contains("phone-layout") ?? false,
+      sidebarCollapsed:
+        shell?.classList.contains(
+          "sidebar-collapsed"
+        ) ?? false,
+      gridMaximized:
+        grid?.classList.contains(
+          "camera-maximized"
+        ) ?? false
+    };
+  }
+
+
+  findAccessibleVideoElement(image) {
+    if (!NVR_MAXIMIZE_DIAGNOSTICS || !image) {
+      return null;
+    }
+
+    const roots = [];
+
+    if (image.shadowRoot) {
+      roots.push(image.shadowRoot);
+    }
+
+    while (roots.length > 0) {
+      const root = roots.shift();
+      const video = root.querySelector("video");
+
+      if (video) {
+        return video;
+      }
+
+      root.querySelectorAll("*").forEach(element => {
+        if (element.shadowRoot) {
+          roots.push(element.shadowRoot);
+        }
+      });
+    }
+
+    return null;
+  }
+
+
+  observeAccessibleMedia(image, slot) {
+    if (
+      !NVR_MAXIMIZE_DIAGNOSTICS ||
+      !image ||
+      this._diagnosticMediaChecked.has(image)
+    ) {
+      return;
+    }
+
+    this._diagnosticMediaChecked.add(image);
+
+    const video = this.findAccessibleVideoElement(image);
+
+    if (!video) {
+      this.logMaximizeDiagnostic(
+        "media-unavailable",
+        { slot }
+      );
+      return;
+    }
+
+    const logMediaState = eventName => {
+      this.logMaximizeDiagnostic(
+        `media-${eventName}`,
+        {
+          slot,
+          currentTime: Number(
+            video.currentTime.toFixed(3)
+          ),
+          readyState: video.readyState,
+          paused: video.paused
+        }
+      );
+    };
+
+    [
+      "waiting",
+      "stalled",
+      "playing",
+      "timeupdate"
+    ].forEach(eventName => {
+      video.addEventListener(
+        eventName,
+        () => logMediaState(eventName)
+      );
+    });
+
+    logMediaState("attached");
+  }
+
+
+  fitLiveCameras(diagnosticSource = "synchronous") {
     const CAMERA_RATIO =
       this._cameraAspectRatio;
+
+    this.recordNvrFlight("fit-start");
+
+    this.logMaximizeDiagnostic(
+      "fit-start",
+      {
+        source: diagnosticSource,
+        ...this.getMaximizeDiagnosticSnapshot()
+      }
+    );
 
 
     this
@@ -2403,6 +3143,37 @@ class NVRCard extends HTMLElement {
           return;
         }
 
+        const flightSlot =
+          NVR_MAXIMIZE_FLIGHT_RECORDER
+            ? Number(frame.parentElement?.dataset.slot)
+            : -1;
+        const flightOldWidth =
+          NVR_MAXIMIZE_FLIGHT_RECORDER
+            ? image.style.width
+            : "";
+        const flightOldHeight =
+          NVR_MAXIMIZE_FLIGHT_RECORDER
+            ? image.style.height
+            : "";
+
+        const diagnostic = NVR_MAXIMIZE_DIAGNOSTICS
+          ? {
+              slot: Number(
+                frame.closest(".video-cell")
+                  ?.dataset.slot
+              ),
+              oldWidth: image.style.width,
+              oldHeight: image.style.height
+            }
+          : null;
+
+        if (diagnostic) {
+          this.observeAccessibleMedia(
+            image,
+            diagnostic.slot
+          );
+        }
+
 
         const width =
           frame.clientWidth;
@@ -2416,6 +3187,16 @@ class NVRCard extends HTMLElement {
           width <= 0 ||
           height <= 0
         ) {
+          this.recordNvrFlight(
+            "fit-skip",
+            flightSlot,
+            frame.parentElement,
+            image,
+            width,
+            height,
+            flightOldWidth,
+            flightOldHeight
+          );
           return;
         }
 
@@ -2463,21 +3244,98 @@ class NVRCard extends HTMLElement {
         }
 
 
-        image.style.width =
-          `${Math.floor(
-            targetWidth
-          )}px`;
+        const maximizedFit =
+          this._maximizedPlayerFit;
+        const maximizeScale =
+          maximizedFit?.image === image &&
+          frame.parentElement?.classList.contains(
+            "maximized-camera"
+          )
+            ? Math.min(
+                targetWidth / maximizedFit.width,
+                targetHeight / maximizedFit.height
+              )
+            : null;
+
+        if (
+          Number.isFinite(maximizeScale) &&
+          maximizeScale > 0
+        ) {
+          image.style.transform =
+            `scale(${maximizeScale})`;
+          image.style.transformOrigin = "center";
+        } else {
+          image.style.width =
+            `${Math.floor(
+              targetWidth
+            )}px`;
 
 
-        image.style.height =
-          `${Math.floor(
-            targetHeight
-          )}px`;
+          image.style.height =
+            `${Math.floor(
+              targetHeight
+            )}px`;
+        }
+
+        this.recordNvrFlight(
+          "fit-image",
+          flightSlot,
+          frame.parentElement,
+          image,
+          width,
+          height,
+          flightOldWidth,
+          flightOldHeight,
+          image.style.width,
+          image.style.height
+        );
+
+        if (diagnostic) {
+          this.logMaximizeDiagnostic(
+            "fit-image",
+            {
+              source: diagnosticSource,
+              slot: Number.isInteger(diagnostic.slot)
+                ? diagnostic.slot
+                : null,
+              frame: {
+                width: Math.round(width),
+                height: Math.round(height)
+              },
+              image: this.getDiagnosticDimensions(image),
+              oldInlineWidth: diagnostic.oldWidth,
+              oldInlineHeight: diagnostic.oldHeight,
+              newInlineWidth: image.style.width,
+              newInlineHeight: image.style.height,
+              imageConnected: image.isConnected
+            }
+          );
+        }
       });
+
+    this.recordNvrFlight("fit-end");
+
+    this.logMaximizeDiagnostic(
+      "fit-end",
+      {
+        source: diagnosticSource,
+        ...this.getMaximizeDiagnosticSnapshot()
+      }
+    );
   }
 
 
   scheduleCameraFit() {
+    this.recordNvrFlight("fit-request");
+
+    this.logMaximizeDiagnostic(
+      "schedule-fit-request",
+      {
+        coalesced: this._cameraFitFrame !== null,
+        ...this.getMaximizeDiagnosticSnapshot()
+      }
+    );
+
     if (this._cameraFitFrame !== null) {
       return;
     }
@@ -2485,7 +3343,12 @@ class NVRCard extends HTMLElement {
     this._cameraFitFrame =
       requestAnimationFrame(() => {
         this._cameraFitFrame = null;
-        this.fitLiveCameras();
+        this.recordNvrFlight("fit-execution");
+        this.logMaximizeDiagnostic(
+          "schedule-fit-execution",
+          this.getMaximizeDiagnosticSnapshot()
+        );
+        this.fitLiveCameras("scheduled");
       });
   }
 
@@ -2515,16 +3378,63 @@ class NVRCard extends HTMLElement {
       return;
     }
 
+    this.recordNvrFlight(
+      "maximize-start",
+      slot,
+      cell
+    );
+
+    this.logMaximizeDiagnostic(
+      "maximize-handler-start",
+      this.getMaximizeDiagnosticSnapshot(slot)
+    );
+
     this.closeCameraContextMenu();
     this.setCameraDropTarget(null);
     this.setLayoutDropFeedback(false);
+
+    const image = cell.querySelector(
+      "hui-image.nvr-live-camera"
+    );
+    const fittedWidth = Number.parseFloat(
+      image?.style.width ?? ""
+    );
+    const fittedHeight = Number.parseFloat(
+      image?.style.height ?? ""
+    );
+
+    this._maximizedPlayerFit =
+      image &&
+      Number.isFinite(fittedWidth) &&
+      fittedWidth > 0 &&
+      Number.isFinite(fittedHeight) &&
+      fittedHeight > 0
+        ? {
+            image,
+            width: fittedWidth,
+            height: fittedHeight
+          }
+        : null;
 
     this._maximizedSlot = slot;
     grid.classList.add("camera-maximized");
     cell.classList.add("maximized-camera");
 
-    this.fitLiveCameras();
+    this.recordNvrFlight(
+      "maximize-classes-applied",
+      slot,
+      cell
+    );
+
+    if (image?.cameraView === "live") {
+      this.startMaximizeMediaSession(slot, image);
+    }
+
     this.scheduleCameraFit();
+    this.logMaximizeDiagnostic(
+      "maximize-handler-end",
+      this.getMaximizeDiagnosticSnapshot(slot)
+    );
   }
 
 
@@ -2582,7 +3492,9 @@ class NVRCard extends HTMLElement {
         "maximized-camera"
       );
 
-      this.fitLiveCameras();
+      this.fitLiveCameras(
+        "maximize-replacement-synchronous"
+      );
       this.scheduleCameraFit();
       return;
     }
@@ -2590,7 +3502,9 @@ class NVRCard extends HTMLElement {
     this._assignedCameras[slot] = cameraName;
     this.renderSlot(slot);
     this.updateCameraListState();
-    this.fitLiveCameras();
+    this.fitLiveCameras(
+      "maximize-replacement-synchronous"
+    );
     this.scheduleCameraFit();
   }
 
@@ -2599,6 +3513,26 @@ class NVRCard extends HTMLElement {
     if (this._maximizedSlot === null) {
       return;
     }
+
+    const maximizedSlot = this._maximizedSlot;
+
+    if (this._maximizedPlayerFit) {
+      this._maximizedPlayerFit.image.style.transform = "";
+      this._maximizedPlayerFit.image.style.transformOrigin = "";
+      this._maximizedPlayerFit = null;
+    }
+
+    this.recordNvrFlight(
+      "restore-start",
+      maximizedSlot
+    );
+
+    this.logMaximizeDiagnostic(
+      "restore-handler-start",
+      this.getMaximizeDiagnosticSnapshot(
+        maximizedSlot
+      )
+    );
 
     const grid =
       this.querySelector(".video-grid");
@@ -2615,11 +3549,22 @@ class NVRCard extends HTMLElement {
         cell.classList.remove(
           "maximized-camera"
         );
+        this.recordNvrFlight(
+          "restore-classes-removed",
+          Number(cell.dataset.slot),
+          cell
+        );
       });
 
     this._maximizedSlot = null;
     this.applyLayout();
     this.scheduleCameraFit();
+    this.logMaximizeDiagnostic(
+      "restore-handler-end",
+      this.getMaximizeDiagnosticSnapshot(
+        maximizedSlot
+      )
+    );
   }
 
 
@@ -3708,11 +4653,11 @@ class NVRCard extends HTMLElement {
 
     this
       .querySelectorAll(
-        "hui-image.nvr-live-camera"
+        "hui-image.nvr-live-camera, nvr-live-presentation.nvr-live-camera"
       )
-      .forEach(image => {
+      .forEach(presentation => {
 
-        image.hass =
+        presentation.hass =
           this._hass;
       });
   }
@@ -3731,6 +4676,13 @@ class NVRCard extends HTMLElement {
       "resize",
       this._viewportResizeHandler
     );
+
+    if (NVR_MAXIMIZE_FLIGHT_RECORDER) {
+      document.addEventListener(
+        "visibilitychange",
+        this._nvrVisibilityHandler
+      );
+    }
 
     if (window.visualViewport) {
       window.visualViewport.addEventListener(
@@ -3753,6 +4705,13 @@ class NVRCard extends HTMLElement {
       "resize",
       this._viewportResizeHandler
     );
+
+    if (NVR_MAXIMIZE_FLIGHT_RECORDER) {
+      document.removeEventListener(
+        "visibilitychange",
+        this._nvrVisibilityHandler
+      );
+    }
 
     if (window.visualViewport) {
       window.visualViewport.removeEventListener(
@@ -3823,7 +4782,15 @@ class NVRCard extends HTMLElement {
     }
 
     this._resizeObserver =
-      new ResizeObserver(() => {
+      new ResizeObserver(entries => {
+        this.recordNvrFlight("resize-observer");
+        this.logMaximizeDiagnostic(
+          "card-resize-observer",
+          {
+            entryCount: entries.length,
+            ...this.getMaximizeDiagnosticSnapshot()
+          }
+        );
         this.updateResponsiveShell();
         this.scheduleCameraFit();
       });

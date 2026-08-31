@@ -22,6 +22,9 @@ export function createTestHarness() {
 
   let nextFrameId = 1;
   const animationFrames = new Map();
+  let currentTime = 0;
+  let nextIntervalId = 1;
+  const intervals = new Map();
 
   class MockResizeObserver {
     constructor(callback) {
@@ -54,6 +57,40 @@ export function createTestHarness() {
     }
   }
 
+  class MockNvrLivePresentation extends window.HTMLElement {
+    constructor() {
+      super();
+      this.connectedCount = 0;
+      this.disconnectedCount = 0;
+      this.startCount = 0;
+    }
+
+    connectedCallback() {
+      this.connectedCount += 1;
+      if (this._hass && this._liveConfig && this.startCount === 0) {
+        this.startCount += 1;
+      }
+    }
+
+    disconnectedCallback() {
+      this.disconnectedCount += 1;
+    }
+
+    set hass(value) {
+      this._hass = value;
+      if (this.isConnected && this._liveConfig && this.startCount === 0) {
+        this.startCount += 1;
+      }
+    }
+
+    set liveConfig(value) {
+      this._liveConfig = value;
+      if (this.isConnected && this._hass && this.startCount === 0) {
+        this.startCount += 1;
+      }
+    }
+  }
+
   Object.defineProperty(window, "ResizeObserver", {
     configurable: true,
     value: MockResizeObserver
@@ -65,6 +102,31 @@ export function createTestHarness() {
       const frameId = nextFrameId++;
       animationFrames.set(frameId, callback);
       return frameId;
+    }
+  });
+
+  Object.defineProperty(window.performance, "now", {
+    configurable: true,
+    value: () => currentTime
+  });
+
+  Object.defineProperty(window, "setInterval", {
+    configurable: true,
+    value: (callback, delay) => {
+      const intervalId = nextIntervalId++;
+      intervals.set(intervalId, {
+        callback,
+        delay,
+        nextTime: currentTime + delay
+      });
+      return intervalId;
+    }
+  });
+
+  Object.defineProperty(window, "clearInterval", {
+    configurable: true,
+    value: intervalId => {
+      intervals.delete(intervalId);
     }
   });
 
@@ -86,6 +148,10 @@ export function createTestHarness() {
   });
 
   window.customElements.define("hui-image", MockHuiImage);
+  window.customElements.define(
+    "nvr-live-presentation",
+    MockNvrLivePresentation
+  );
   window.eval(cardSource);
 
   function flushAnimationFrames() {
@@ -97,6 +163,41 @@ export function createTestHarness() {
         callback(window.performance.now());
       });
     }
+  }
+
+  function advanceTime(milliseconds) {
+    const targetTime = currentTime + milliseconds;
+
+    while (true) {
+      const next = [...intervals.entries()]
+        .sort((left, right) => {
+          return left[1].nextTime - right[1].nextTime;
+        })[0];
+
+      if (!next || next[1].nextTime > targetTime) {
+        break;
+      }
+
+      const [intervalId, interval] = next;
+      currentTime = interval.nextTime;
+      interval.callback();
+
+      if (intervals.has(intervalId)) {
+        interval.nextTime += interval.delay;
+      }
+    }
+
+    currentTime = targetTime;
+  }
+
+  function setDocumentVisibility(state) {
+    Object.defineProperty(window.document, "visibilityState", {
+      configurable: true,
+      value: state
+    });
+    window.document.dispatchEvent(
+      new window.Event("visibilitychange")
+    );
   }
 
   function createHass(cameras = defaultCameras) {
@@ -192,6 +293,8 @@ export function createTestHarness() {
     createCard,
     createHass,
     flushAnimationFrames,
+    advanceTime,
+    setDocumentVisibility,
     setShellWidth,
     setCardRect,
     getPhysicalCells,
