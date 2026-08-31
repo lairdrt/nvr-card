@@ -27,6 +27,31 @@ function assertIdentityUnchanged(harness, card, cameraName, before) {
   return after;
 }
 
+function captureIdentities(harness, card, cameraNames) {
+  return new Map(
+    cameraNames.map(cameraName => [
+      cameraName,
+      harness.capturePlayerIdentity(card, cameraName)
+    ])
+  );
+}
+
+function assertIdentitiesUnchanged(
+  harness,
+  card,
+  cameraNames,
+  before
+) {
+  cameraNames.forEach(cameraName => {
+    assertIdentityUnchanged(
+      harness,
+      card,
+      cameraName,
+      before.get(cameraName)
+    );
+  });
+}
+
 test("initial render creates 16 persistent cells with unique logical slots", t => {
   const harness = setup(t);
 
@@ -289,4 +314,320 @@ test("maximize then restore preserves assignments, layout, players, and cells", 
       identityBefore.get(cameraName)
     );
   });
+});
+
+test("overflow cameras survive smaller layouts and reappear with identity intact", t => {
+  const harness = setup(t);
+  const cameras = [
+    { name: "Front", entity: "camera.front", active: true },
+    { name: "Garage", entity: "camera.garage", active: true },
+    { name: "Patio", entity: "camera.patio", active: true },
+    { name: "Hall", entity: "camera.hall", active: true },
+    { name: "Drive", entity: "camera.drive", active: true },
+    { name: "Yard", entity: "camera.yard", active: true }
+  ];
+  const cameraNames = cameras.map(camera => camera.name);
+  const card = harness.createCard({ cameras });
+
+  card.selectLayout("3x3");
+  cameraNames.forEach(cameraName => {
+    card.assignCamera(cameraName);
+  });
+  harness.flushAnimationFrames();
+
+  const before = captureIdentities(
+    harness,
+    card,
+    cameraNames
+  );
+
+  card.selectLayout("2x2");
+  harness.flushAnimationFrames();
+
+  assert.equal(card._layout, "2x2");
+  assert.deepEqual(assignments(card).slice(0, 6), cameraNames);
+  assert.equal(
+    harness.getLogicalCell(card, 4).classList.contains("hidden-slot"),
+    true
+  );
+  assert.equal(
+    harness.getLogicalCell(card, 5).classList.contains("hidden-slot"),
+    true
+  );
+  assertIdentitiesUnchanged(
+    harness,
+    card,
+    cameraNames,
+    before
+  );
+
+  card.selectLayout("3x3");
+  harness.flushAnimationFrames();
+
+  assert.equal(card._layout, "3x3");
+  assert.deepEqual(assignments(card).slice(0, 6), cameraNames);
+  assert.equal(
+    harness.getLogicalCell(card, 4).classList.contains("hidden-slot"),
+    false
+  );
+  assert.equal(
+    harness.getLogicalCell(card, 5).classList.contains("hidden-slot"),
+    false
+  );
+  assertIdentitiesUnchanged(
+    harness,
+    card,
+    cameraNames,
+    before
+  );
+});
+
+test("unassigned camera replacement keeps the maximized slot and unaffected players", t => {
+  const harness = setup(t);
+  const card = harness.createCard();
+
+  ["Front", "Garage", "Patio"].forEach(cameraName => {
+    card.assignCamera(cameraName);
+  });
+  harness.flushAnimationFrames();
+
+  const unaffectedNames = ["Front", "Patio"];
+  const unaffectedBefore = captureIdentities(
+    harness,
+    card,
+    unaffectedNames
+  );
+  const garageBefore =
+    harness.capturePlayerIdentity(card, "Garage");
+  const maximizedCell = harness.getLogicalCell(card, 1);
+
+  card.maximizeCameraSlot(1);
+  card.replaceMaximizedCamera("Hall");
+  harness.flushAnimationFrames();
+
+  assert.equal(card._maximizedSlot, 1);
+  assert.equal(card._assignedCameras[1], "Hall");
+  assert.strictEqual(harness.getLogicalCell(card, 1), maximizedCell);
+  assert.equal(maximizedCell.classList.contains("maximized-camera"), true);
+  assert.equal(
+    card.querySelector(".video-grid").classList.contains(
+      "camera-maximized"
+    ),
+    true
+  );
+  assert.equal(garageBefore.player.isConnected, false);
+  assert.equal(garageBefore.player.disconnectedCount, 1);
+  assert.equal(harness.getPlayer(card, "Garage"), null);
+  assert.ok(harness.getPlayer(card, "Hall"));
+  assertIdentitiesUnchanged(
+    harness,
+    card,
+    unaffectedNames,
+    unaffectedBefore
+  );
+
+  card.restoreMaximizedCamera();
+  harness.flushAnimationFrames();
+
+  assert.equal(card._maximizedSlot, null);
+  assert.equal(card._layout, "2x2");
+  assert.equal(card._assignedCameras[1], "Hall");
+  assert.strictEqual(
+    harness.getPlayer(card, "Hall").closest(".video-cell"),
+    maximizedCell
+  );
+  assertIdentitiesUnchanged(
+    harness,
+    card,
+    unaffectedNames,
+    unaffectedBefore
+  );
+});
+
+test("assigned camera replacement transfers maximize state and self replacement is a no-op", t => {
+  const harness = setup(t);
+  const card = harness.createCard();
+
+  ["Front", "Garage", "Patio", "Hall"].forEach(cameraName => {
+    card.assignCamera(cameraName);
+  });
+  harness.flushAnimationFrames();
+
+  const patioBefore =
+    harness.capturePlayerIdentity(card, "Patio");
+  const garageBefore =
+    harness.capturePlayerIdentity(card, "Garage");
+  const unaffectedNames = ["Front", "Hall"];
+  const unaffectedBefore = captureIdentities(
+    harness,
+    card,
+    unaffectedNames
+  );
+
+  card.maximizeCameraSlot(1);
+  card.replaceMaximizedCamera("Patio");
+  harness.flushAnimationFrames();
+
+  assert.deepEqual(assignments(card).slice(0, 4), [
+    "Front",
+    "Patio",
+    null,
+    "Hall"
+  ]);
+  assert.equal(card._maximizedSlot, 1);
+  assert.strictEqual(harness.getLogicalCell(card, 1), patioBefore.cell);
+  assert.strictEqual(harness.getPlayer(card, "Patio"), patioBefore.player);
+  assert.equal(patioBefore.cell.classList.contains("maximized-camera"), true);
+  assert.equal(garageBefore.player.isConnected, false);
+  assert.equal(garageBefore.player.disconnectedCount, 1);
+  assert.equal(harness.getPlayer(card, "Garage"), null);
+  assertIdentityUnchanged(harness, card, "Patio", patioBefore);
+  assertIdentitiesUnchanged(
+    harness,
+    card,
+    unaffectedNames,
+    unaffectedBefore
+  );
+
+  const assignmentsBeforeNoOp = assignments(card);
+  const patioBeforeNoOp =
+    harness.capturePlayerIdentity(card, "Patio");
+  const maximizedCellsBefore = [
+    ...card.querySelectorAll(".video-cell.maximized-camera")
+  ];
+
+  card.replaceMaximizedCamera("Patio");
+  harness.flushAnimationFrames();
+
+  assert.deepEqual(assignments(card), assignmentsBeforeNoOp);
+  assert.equal(card._maximizedSlot, 1);
+  assert.deepEqual(
+    [...card.querySelectorAll(".video-cell.maximized-camera")],
+    maximizedCellsBefore
+  );
+  assertIdentityUnchanged(
+    harness,
+    card,
+    "Patio",
+    patioBeforeNoOp
+  );
+  assertIdentitiesUnchanged(
+    harness,
+    card,
+    unaffectedNames,
+    unaffectedBefore
+  );
+});
+
+test("layout change while maximized restores first and then repacks", t => {
+  const harness = setup(t);
+  const card = harness.createCard();
+
+  ["Front", "Garage", "Patio", "Hall"].forEach(cameraName => {
+    card.assignCamera(cameraName);
+  });
+  harness.flushAnimationFrames();
+  card.removeCameraFromSlot(1);
+
+  const survivorNames = ["Front", "Patio", "Hall"];
+  const survivorBefore = captureIdentities(
+    harness,
+    card,
+    survivorNames
+  );
+
+  card.maximizeCameraSlot(2);
+  card.restoreMaximizedCamera();
+  card.selectLayout("3x3");
+  harness.flushAnimationFrames();
+
+  assert.equal(card._maximizedSlot, null);
+  assert.equal(
+    card.querySelector(".video-grid").classList.contains(
+      "camera-maximized"
+    ),
+    false
+  );
+  assert.equal(
+    card.querySelectorAll(".video-cell.maximized-camera").length,
+    0
+  );
+  assert.equal(card._layout, "3x3");
+  assert.deepEqual(assignments(card).slice(0, 4), [
+    "Front",
+    "Patio",
+    "Hall",
+    null
+  ]);
+
+  survivorNames.forEach((cameraName, logicalSlot) => {
+    const identity = assertIdentityUnchanged(
+      harness,
+      card,
+      cameraName,
+      survivorBefore.get(cameraName)
+    );
+    assert.strictEqual(
+      identity.cell,
+      harness.getLogicalCell(card, logicalSlot)
+    );
+  });
+});
+
+test("sidebar and 600px responsive transitions preserve every player and cell", t => {
+  const harness = setup(t);
+  const card = harness.createCard({ shellWidth: 601 });
+
+  ["Front", "Garage", "Patio"].forEach(cameraName => {
+    card.assignCamera(cameraName);
+  });
+  harness.flushAnimationFrames();
+
+  const cameraNames = ["Front", "Garage", "Patio"];
+  const before = captureIdentities(
+    harness,
+    card,
+    cameraNames
+  );
+  const shell = card.querySelector(".nvr-shell");
+  const sidebar = card.querySelector(".nvr-sidebar");
+  const toggle = card.querySelector(".sidebar-toggle");
+
+  assert.equal(shell.classList.contains("phone-layout"), false);
+  assert.equal(shell.classList.contains("sidebar-collapsed"), false);
+  assert.equal(toggle.getAttribute("aria-expanded"), "true");
+  assert.equal(sidebar.getAttribute("aria-hidden"), "false");
+
+  harness.setShellWidth(card, 600);
+  harness.flushAnimationFrames();
+
+  assert.equal(shell.classList.contains("phone-layout"), true);
+  assert.equal(shell.classList.contains("sidebar-collapsed"), true);
+  assert.equal(toggle.getAttribute("aria-expanded"), "false");
+  assert.equal(sidebar.getAttribute("aria-hidden"), "true");
+  assertIdentitiesUnchanged(harness, card, cameraNames, before);
+
+  harness.setShellWidth(card, 601);
+  harness.flushAnimationFrames();
+
+  assert.equal(shell.classList.contains("phone-layout"), false);
+  assert.equal(shell.classList.contains("sidebar-collapsed"), false);
+  assert.equal(toggle.getAttribute("aria-expanded"), "true");
+  assert.equal(sidebar.getAttribute("aria-hidden"), "false");
+
+  toggle.click();
+  harness.flushAnimationFrames();
+
+  assert.equal(shell.classList.contains("sidebar-collapsed"), true);
+  assert.equal(toggle.getAttribute("aria-expanded"), "false");
+  assert.equal(sidebar.getAttribute("aria-hidden"), "true");
+  assertIdentitiesUnchanged(harness, card, cameraNames, before);
+
+  toggle.click();
+  harness.flushAnimationFrames();
+
+  assert.equal(shell.classList.contains("sidebar-collapsed"), false);
+  assert.equal(toggle.getAttribute("aria-expanded"), "true");
+  assert.equal(sidebar.getAttribute("aria-hidden"), "false");
+  assertIdentitiesUnchanged(harness, card, cameraNames, before);
 });
