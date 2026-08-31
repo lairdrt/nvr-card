@@ -1,0 +1,11 @@
+{
+  "name": "nvr-card",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/nvr-card.test.js"
+  },
+  "devDependencies": {
+    "happy-dom": "^20.8.8"
+  }
+}
