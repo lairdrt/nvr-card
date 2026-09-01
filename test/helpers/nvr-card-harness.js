@@ -4,6 +4,9 @@ import { Window } from "happy-dom";
 const cardSource = readFileSync(
   new URL("../../nvr-card.js", import.meta.url),
   "utf8"
+).replace(
+  'import { FrigateProvider } from "./src/providers/frigate-provider.js";',
+  "const FrigateProvider = window.FrigateProvider;"
 );
 
 export const defaultCameras = [
@@ -25,6 +28,7 @@ export function createTestHarness() {
   let currentTime = 0;
   let nextIntervalId = 1;
   const intervals = new Map();
+  const providerOpenCalls = [];
 
   class MockResizeObserver {
     constructor(callback) {
@@ -91,6 +95,44 @@ export function createTestHarness() {
     }
   }
 
+  class MockProviderPlayer extends window.HTMLElement {
+    constructor() {
+      super();
+      this.connectedCount = 0;
+      this.disconnectedCount = 0;
+      this.closeCount = 0;
+      this.cameraView = "live";
+    }
+
+    connectedCallback() {
+      this.connectedCount += 1;
+    }
+
+    disconnectedCallback() {
+      this.disconnectedCount += 1;
+    }
+  }
+
+  class MockFrigateProvider {
+    open(camera, options) {
+      const element = window.document.createElement(
+        "nvr-go2rtc-video"
+      );
+      element.className =
+        "nvr-live-camera nvr-provider-live-camera";
+      element.dataset.entity = camera.entity;
+      providerOpenCalls.push({ camera, options, element });
+
+      return {
+        element,
+        close() {
+          element.closeCount += 1;
+          element.remove();
+        }
+      };
+    }
+  }
+
   Object.defineProperty(window, "ResizeObserver", {
     configurable: true,
     value: MockResizeObserver
@@ -152,6 +194,11 @@ export function createTestHarness() {
     "nvr-live-presentation",
     MockNvrLivePresentation
   );
+  window.customElements.define(
+    "nvr-go2rtc-video",
+    MockProviderPlayer
+  );
+  window.FrigateProvider = MockFrigateProvider;
   window.eval(cardSource);
 
   function flushAnimationFrames() {
@@ -270,7 +317,7 @@ export function createTestHarness() {
     }
 
     return card.querySelector(
-      `hui-image[data-entity="${camera.entity}"]`
+      `.nvr-live-camera[data-entity="${camera.entity}"]`
     );
   }
 
@@ -301,6 +348,7 @@ export function createTestHarness() {
     getLogicalCell,
     getPlayer,
     capturePlayerIdentity,
+    providerOpenCalls,
     close
   };
 }

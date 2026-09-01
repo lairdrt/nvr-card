@@ -2,9 +2,9 @@
  For Home Assisstant
 */
 
+import { FrigateProvider } from "./src/providers/frigate-provider.js";
+
 const NVR_BUILD = "__NVR_BUILD__";
-const NVR_STAGE2A_CAMERA_NAME = "garage";
-const NVR_STAGE2A_STREAM_ID = "garage";
 const NVR_MAXIMIZE_DIAGNOSTICS = false;
 const NVR_MAXIMIZE_FLIGHT_RECORDER = true;
 const NVR_DIAGNOSTIC_LIVE_SLOT_LIMIT = 4;
@@ -183,6 +183,8 @@ class NVRCard extends HTMLElement {
     this._maximizedPlayerFit = null;
     this._mediaDiagnosticStates = new WeakMap();
     this._activeMaximizeMediaSession = null;
+    this._frigateProvider = new FrigateProvider();
+    this._providerPresentations = new Map();
     this._nvrInstanceId =
       NVR_FLIGHT_RECORDER_STATE.nextInstanceId++;
     this._nvrVisibilityHandler = () => {
@@ -637,6 +639,7 @@ class NVRCard extends HTMLElement {
 
 
   render() {
+    this.closeAllProviderPresentations();
     this.closeCameraContextMenu();
     this._maximizedSlot = null;
     this._placementClickPending = false;
@@ -669,6 +672,9 @@ class NVRCard extends HTMLElement {
             </button>
 
             <div class="card-title">NVR Card</div>
+            <span class="build-identifier">
+              ${NVR_BUILD}
+            </span>
           </header>
 
           <aside class="camera-list nvr-sidebar">
@@ -773,23 +779,6 @@ class NVRCard extends HTMLElement {
               </div>
 
             </section>
-
-
-            <div class="sidebar-utility">
-
-              <button
-                type="button"
-                class="clear-button"
-              >
-                Clear Grid
-              </button>
-
-              <span class="build-identifier">
-                ${NVR_BUILD}
-              </span>
-
-            </div>
-
 
           </aside>
 
@@ -1149,21 +1138,6 @@ class NVRCard extends HTMLElement {
       }
 
 
-      .sidebar-utility {
-        flex: 0 0 auto;
-
-        display: flex;
-        align-items: center;
-
-        gap: 8px;
-
-        margin-top: 8px;
-        padding-top: 8px;
-
-        border-top: 1px solid #26313b;
-      }
-
-
       .sidebar-placeholder {
         min-height: 38px;
 
@@ -1375,31 +1349,6 @@ class NVRCard extends HTMLElement {
       }
 
 
-      .clear-button {
-        flex: 0 0 auto;
-
-        padding: 4px 6px;
-
-        background: #181818;
-
-        color: #bbb;
-
-        border: 1px solid #555;
-        border-radius: 3px;
-
-        font-size: 10px;
-
-        cursor: pointer;
-      }
-
-
-      .clear-button:hover {
-        background: #222;
-        color: #fff;
-        border-color: #888;
-      }
-
-
       /* ================================================
          VIDEO GRID
          ================================================ */
@@ -1515,6 +1464,22 @@ class NVRCard extends HTMLElement {
       }
 
 
+      .nvr-provider-live-camera {
+        display: block;
+
+        width: 100%;
+        height: 100%;
+
+        flex: 1 1 auto;
+
+        background: #000;
+
+        overflow: hidden;
+
+        pointer-events: none;
+      }
+
+
       .empty-cell-center {
         position: absolute;
 
@@ -1599,11 +1564,11 @@ class NVRCard extends HTMLElement {
       .build-identifier {
         flex: 0 0 auto;
 
-        margin-left: auto;
+        margin-left: 8px;
 
-        color: #666;
+        color: #808080;
 
-        font-size: 9px;
+        font-size: 11.25px;
 
         white-space: nowrap;
 
@@ -1699,7 +1664,6 @@ class NVRCard extends HTMLElement {
     this.attachSidebarToggleHandler();
     this.attachLayoutHandlers();
     this.attachLayoutDragHandlers();
-    this.attachClearHandler();
     this.attachSlotHandlers();
     this.attachCameraMaximizeHandlers();
     this.attachCameraContextMenuHandlers();
@@ -2065,6 +2029,7 @@ class NVRCard extends HTMLElement {
     this._assignedCameras[sourceSlot] = null;
     this._assignedCameras[targetSlot] = cameraName;
 
+    this.closeProviderPresentation(targetCell);
     targetCell.innerHTML = "";
 
     sourceCell.dataset.slot =
@@ -2261,6 +2226,8 @@ class NVRCard extends HTMLElement {
       return;
     }
 
+    this.closeProviderPresentation(cell);
+
 
     /*
      * Destroy ONLY this slot's contents.
@@ -2323,24 +2290,20 @@ class NVRCard extends HTMLElement {
         "camera-frame";
 
 
-      if (camera.name === NVR_STAGE2A_CAMERA_NAME) {
-        const presentation = document.createElement(
-          "nvr-live-presentation"
+      if (
+        camera.entity === "camera.garage" &&
+        this._hass
+      ) {
+        const presentation =
+          this._frigateProvider.open(camera, {
+            hass: this._hass
+          });
+
+        this._providerPresentations.set(
+          cell,
+          presentation
         );
-
-        presentation.className = "nvr-live-camera";
-        presentation.liveConfig = {
-          cameraId: camera.name,
-          variantId: "garage-stage2a",
-          role: "custom",
-          sourceId: NVR_STAGE2A_STREAM_ID
-        };
-
-        if (this._hass) {
-          presentation.hass = this._hass;
-        }
-
-        frame.appendChild(presentation);
+        frame.appendChild(presentation.element);
         cell.appendChild(frame);
         return;
       }
@@ -2440,6 +2403,27 @@ class NVRCard extends HTMLElement {
 
 
     cell.appendChild(number);
+  }
+
+
+  closeProviderPresentation(cell) {
+    const presentation =
+      this._providerPresentations.get(cell);
+
+    if (!presentation) {
+      return;
+    }
+
+    this._providerPresentations.delete(cell);
+    presentation.close();
+  }
+
+
+  closeAllProviderPresentations() {
+    this._providerPresentations.forEach(
+      presentation => presentation.close()
+    );
+    this._providerPresentations.clear();
   }
 
 
@@ -2611,9 +2595,11 @@ class NVRCard extends HTMLElement {
 
   getOpenMediaElements(image) {
     const elements = [image];
-    const roots = image.shadowRoot
-      ? [image.shadowRoot]
-      : [];
+    const roots = [image];
+
+    if (image.shadowRoot) {
+      roots.push(image.shadowRoot);
+    }
 
     while (roots.length > 0) {
       const root = roots.shift();
@@ -2864,7 +2850,7 @@ class NVRCard extends HTMLElement {
       cell => {
         const slot = Number(cell.dataset.slot);
         const image = cell.querySelector(
-          "hui-image.nvr-live-camera"
+          "hui-image.nvr-live-camera, .nvr-provider-live-camera"
         );
 
         if (!Number.isInteger(slot) || !image) {
@@ -3393,6 +3379,9 @@ class NVRCard extends HTMLElement {
     this.setCameraDropTarget(null);
     this.setLayoutDropFeedback(false);
 
+    const presentation = cell.querySelector(
+      "hui-image.nvr-live-camera, .nvr-provider-live-camera"
+    );
     const image = cell.querySelector(
       "hui-image.nvr-live-camera"
     );
@@ -3426,8 +3415,11 @@ class NVRCard extends HTMLElement {
       cell
     );
 
-    if (image?.cameraView === "live") {
-      this.startMaximizeMediaSession(slot, image);
+    if (
+      presentation?.classList.contains("nvr-provider-live-camera") ||
+      presentation?.cameraView === "live"
+    ) {
+      this.startMaximizeMediaSession(slot, presentation);
     }
 
     this.scheduleCameraFit();
@@ -4591,52 +4583,6 @@ class NVRCard extends HTMLElement {
     document.removeEventListener(
       "keydown",
       this._cameraContextKeyHandler
-    );
-  }
-
-
-  attachClearHandler() {
-    const button =
-      this.querySelector(
-        ".clear-button"
-      );
-
-
-    if (!button) {
-      return;
-    }
-
-
-    button.addEventListener(
-      "click",
-      () => {
-        if (this._maximizedSlot !== null) {
-          return;
-        }
-
-        this._assignedCameras
-          .forEach(
-            (cameraName, slot) => {
-
-              if (
-                cameraName !== null
-              ) {
-
-                this._assignedCameras[
-                  slot
-                ] = null;
-
-
-                this.renderSlot(
-                  slot
-                );
-              }
-            }
-          );
-
-
-        this.updateCameraListState();
-      }
     );
   }
 

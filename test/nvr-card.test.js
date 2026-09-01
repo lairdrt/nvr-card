@@ -147,6 +147,18 @@ test("initial render creates 16 persistent cells with unique logical slots", t =
   assert.deepEqual(slots, Array.from({ length: 16 }, (_, slot) => slot));
 });
 
+test("title keeps the build identifier adjacent and omits Clear Grid", t => {
+  const harness = setup(t);
+  const card = harness.createCard();
+  const title = card.querySelector(".card-title");
+  const build = card.querySelector(".build-identifier");
+
+  assert.equal(title?.textContent, "NVR Card");
+  assert.strictEqual(build?.previousElementSibling, title);
+  assert.strictEqual(build?.parentElement, title?.parentElement);
+  assert.equal(card.querySelector(".clear-button"), null);
+});
+
 test("initial camera assignment uses the first available visible slots", t => {
   const harness = setup(t);
   const card = harness.createCard();
@@ -1520,31 +1532,30 @@ test("maximize media-session history retains only the latest ten sessions", t =>
   assert.equal(sessions.at(-1).completionReason, "duration");
 });
 
-test("Stage 2A controls only garage and preserves its presentation through grid operations", t => {
+test("Garage provider preserves its opaque presentation through grid operations and hass updates", t => {
   const harness = setup(t);
   const card = harness.createCard({
     cameras: [
-      { name: "garage", entity: "camera.garage", active: true },
+      { name: "Garage", entity: "camera.garage", active: true },
       { name: "Other", entity: "camera.other", active: true }
     ]
   });
 
-  card.assignCamera("garage");
+  card.assignCamera("Garage");
   card.assignCamera("Other");
   harness.flushAnimationFrames();
 
-  const presentation = card.querySelector("nvr-live-presentation");
+  const presentation = card.querySelector("nvr-go2rtc-video");
   const physicalCell = presentation.closest(".video-cell");
   const otherPlayer = harness.getPlayer(card, "Other");
-  assert.equal(card.querySelectorAll("nvr-live-presentation").length, 1);
+  assert.equal(card.querySelectorAll("nvr-go2rtc-video").length, 1);
   assert.ok(otherPlayer);
-  assert.equal(presentation.startCount, 1);
   assert.equal(presentation.connectedCount, 1);
   assert.equal(presentation.disconnectedCount, 0);
 
   card.moveCameraBetweenSlots(0, 3);
   harness.flushAnimationFrames();
-  assert.strictEqual(card.querySelector("nvr-live-presentation"), presentation);
+  assert.strictEqual(card.querySelector("nvr-go2rtc-video"), presentation);
   assert.strictEqual(presentation.closest(".video-cell"), physicalCell);
   assert.strictEqual(harness.getLogicalCell(card, 3), physicalCell);
 
@@ -1557,10 +1568,23 @@ test("Stage 2A controls only garage and preserves its presentation through grid 
 
   card.repackAssignedCameras();
   harness.flushAnimationFrames();
-  assert.strictEqual(card.querySelector("nvr-live-presentation"), presentation);
+  assert.strictEqual(card.querySelector("nvr-go2rtc-video"), presentation);
   assert.strictEqual(presentation.closest(".video-cell"), physicalCell);
-  assert.equal(presentation.startCount, 1);
   assert.equal(presentation.connectedCount, 1);
   assert.equal(presentation.disconnectedCount, 0);
   assert.strictEqual(harness.getPlayer(card, "Other"), otherPlayer);
+
+  card.hass = harness.createHass([
+    { name: "Garage", entity: "camera.garage", active: true },
+    { name: "Other", entity: "camera.other", active: true }
+  ]);
+
+  assert.strictEqual(card.querySelector("nvr-go2rtc-video"), presentation);
+  assert.equal(harness.providerOpenCalls.length, 1);
+  assert.equal(presentation.closeCount, 0);
+
+  card.removeCameraFromSlot(Number(physicalCell.dataset.slot));
+
+  assert.equal(presentation.closeCount, 1);
+  assert.equal(card.querySelector("nvr-go2rtc-video"), null);
 });

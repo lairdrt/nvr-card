@@ -5,10 +5,14 @@ $HaConfigShare = "Z:"
 $SourceFile = Join-Path $PSScriptRoot "nvr-card.js"
 $LoaderSourceFile = Join-Path $PSScriptRoot "loader.js"
 $LiveSourceDirectory = Join-Path $PSScriptRoot "src\live"
+$ProviderSourceDirectory = Join-Path $PSScriptRoot "src\providers"
+$Go2RtcVendorSourceDirectory = Join-Path $PSScriptRoot "src\vendor\go2rtc"
 $HaWwwDirectory = Join-Path $HaConfigShare "www\nvr-card"
 $DestinationFile = Join-Path $HaWwwDirectory "nvr-card.js"
 $LoaderDestinationFile = Join-Path $HaWwwDirectory "loader.js"
 $LiveDestinationDirectory = Join-Path $HaWwwDirectory "src\live"
+$ProviderDestinationDirectory = Join-Path $HaWwwDirectory "src\providers"
+$Go2RtcVendorDestinationDirectory = Join-Path $HaWwwDirectory "src\vendor\go2rtc"
 
 Write-Host "Local source: $SourceFile"
 Write-Host "HA destination: $DestinationFile"
@@ -27,6 +31,16 @@ if (-not (Test-Path -LiteralPath $LoaderSourceFile -PathType Leaf)) {
 
 if (-not (Test-Path -LiteralPath $LiveSourceDirectory -PathType Container)) {
     Write-Error "Live source directory does not exist: $LiveSourceDirectory"
+    exit 1
+}
+
+if (-not (Test-Path -LiteralPath $ProviderSourceDirectory -PathType Container)) {
+    Write-Error "Provider source directory does not exist: $ProviderSourceDirectory"
+    exit 1
+}
+
+if (-not (Test-Path -LiteralPath $Go2RtcVendorSourceDirectory -PathType Container)) {
+    Write-Error "go2rtc vendor source directory does not exist: $Go2RtcVendorSourceDirectory"
     exit 1
 }
 
@@ -52,22 +66,38 @@ if ($LASTEXITCODE -ne 0) {
 }
 $ShortHash = ($ShortHash | Out-String).Trim()
 
-$GitStatus = & git -C $PSScriptRoot status --porcelain 2>&1
-if ($LASTEXITCODE -ne 0) {
-    Write-Error "Failed to determine the Git working tree status: $GitStatus"
-    exit 1
-}
-
-$BuildIdentifier = "NVR $ShortHash"
 $Placeholder = "__NVR_BUILD__"
 
 try {
     $SourceContent = Get-Content -LiteralPath $SourceFile -Raw -ErrorAction Stop
 
-    if ($GitStatus.Count -gt 0) {
-        $SourceHash = (Get-FileHash -LiteralPath $SourceFile -Algorithm SHA256 -ErrorAction Stop).Hash
-        $BuildIdentifier += "-$($SourceHash.Substring(0, 6).ToLowerInvariant())"
+    $DeployedSourceFiles = @(
+        Get-Item -LiteralPath $SourceFile -ErrorAction Stop
+        Get-Item -LiteralPath $LoaderSourceFile -ErrorAction Stop
+        Get-ChildItem -LiteralPath $LiveSourceDirectory -File -Filter "*.js" -ErrorAction Stop
+        Get-ChildItem -LiteralPath $ProviderSourceDirectory -File -Filter "*.js" -ErrorAction Stop
+        Get-ChildItem -LiteralPath $Go2RtcVendorSourceDirectory -File -ErrorAction Stop
+    ) | Sort-Object FullName
+
+    $SourceRoot = (Resolve-Path -LiteralPath $PSScriptRoot).Path.TrimEnd("\") + "\"
+    $ManifestLines = $DeployedSourceFiles | ForEach-Object {
+        $RelativePath = $_.FullName.Substring($SourceRoot.Length).Replace("\", "/")
+        $FileHash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+        "$RelativePath|$FileHash"
     }
+    $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    $ManifestBytes = $Utf8NoBom.GetBytes(($ManifestLines -join "`n"))
+    $Sha256 = [System.Security.Cryptography.SHA256]::Create()
+
+    try {
+        $ManifestHash = ([BitConverter]::ToString($Sha256.ComputeHash($ManifestBytes))).Replace("-", "").ToLowerInvariant()
+    }
+    finally {
+        $Sha256.Dispose()
+    }
+
+    $WorkingTreeHash = $ManifestHash.Substring(0, 6)
+    $BuildIdentifier = "NVR $ShortHash-$WorkingTreeHash"
 
     Write-Host "Deploying build: $BuildIdentifier"
 
@@ -77,12 +107,15 @@ try {
     }
 
     $DeployedContent = $SourceContent.Replace($Placeholder, $BuildIdentifier)
-    $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     $DeployedBytes = $Utf8NoBom.GetBytes($DeployedContent)
     [System.IO.File]::WriteAllBytes($DestinationFile, $DeployedBytes)
     Copy-Item -LiteralPath $LoaderSourceFile -Destination $LoaderDestinationFile -Force -ErrorAction Stop
     New-Item -ItemType Directory -Path $LiveDestinationDirectory -Force -ErrorAction Stop | Out-Null
     Copy-Item -Path (Join-Path $LiveSourceDirectory "*.js") -Destination $LiveDestinationDirectory -Force -ErrorAction Stop
+    New-Item -ItemType Directory -Path $ProviderDestinationDirectory -Force -ErrorAction Stop | Out-Null
+    Copy-Item -Path (Join-Path $ProviderSourceDirectory "*.js") -Destination $ProviderDestinationDirectory -Force -ErrorAction Stop
+    New-Item -ItemType Directory -Path $Go2RtcVendorDestinationDirectory -Force -ErrorAction Stop | Out-Null
+    Copy-Item -Path (Join-Path $Go2RtcVendorSourceDirectory "*") -Destination $Go2RtcVendorDestinationDirectory -Force -ErrorAction Stop
 }
 catch {
     Write-Error "Failed to deploy NVR card files: $($_.Exception.Message)"
@@ -101,6 +134,16 @@ if (-not (Test-Path -LiteralPath $LoaderDestinationFile -PathType Leaf)) {
 
 if (-not (Test-Path -LiteralPath (Join-Path $LiveDestinationDirectory "nvr-live-presentation.js") -PathType Leaf)) {
     Write-Error "Live presentation module was not deployed."
+    exit 1
+}
+
+if (-not (Test-Path -LiteralPath (Join-Path $ProviderDestinationDirectory "frigate-provider.js") -PathType Leaf)) {
+    Write-Error "Frigate provider module was not deployed."
+    exit 1
+}
+
+if (-not (Test-Path -LiteralPath (Join-Path $Go2RtcVendorDestinationDirectory "video-rtc.js") -PathType Leaf)) {
+    Write-Error "Vendored go2rtc VideoRTC module was not deployed."
     exit 1
 }
 
