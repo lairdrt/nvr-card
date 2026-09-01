@@ -785,3 +785,58 @@ test("MSE transport negotiates, appends in order, presents a real first frame, a
   assert.equal(fixture.frameCallbacks.size, 0);
   assert.equal(transport.queue.length, 0);
 });
+
+test("multiple MSE sessions isolate resources and one failure does not stop another", async () => {
+  const first = createMseFixture();
+  const firstTransport = new MseTransport(first.video, first.environment);
+  const firstSession = firstTransport.open("wss://ha.example/signed-first");
+  const firstSocket = MockWebSocket.instances[0];
+  const firstMediaSource = MockMediaSource.instances[0];
+
+  const second = createMseFixture();
+  const secondTransport = new MseTransport(second.video, second.environment);
+  const secondSession = secondTransport.open("wss://ha.example/signed-second");
+  const secondSocket = MockWebSocket.instances[0];
+  const secondMediaSource = MockMediaSource.instances[0];
+
+  assert.notStrictEqual(firstSocket, secondSocket);
+  assert.notStrictEqual(firstMediaSource, secondMediaSource);
+  assert.notStrictEqual(first.frameCallbacks, second.frameCallbacks);
+
+  for (const [socket, mediaSource] of [
+    [firstSocket, firstMediaSource],
+    [secondSocket, secondMediaSource]
+  ]) {
+    socket.open();
+    mediaSource.open();
+    socket.message(JSON.stringify({
+      type: "mse",
+      value: 'video/mp4; codecs="avc1.640029"'
+    }));
+  }
+
+  const firstBuffer = firstMediaSource.sourceBuffers[0];
+  const secondBuffer = secondMediaSource.sourceBuffers[0];
+  assert.notStrictEqual(firstBuffer, secondBuffer);
+  firstSocket.message(new ArrayBuffer(1));
+  secondSocket.message(new ArrayBuffer(2));
+  assert.equal(firstBuffer.appended[0].byteLength, 1);
+  assert.equal(secondBuffer.appended[0].byteLength, 2);
+
+  const firstFailure = assert.rejects(firstSession.firstFrame);
+  firstSocket.dispatch("error");
+  await firstFailure;
+  assert.equal(firstTransport.status, "failed");
+  assert.equal(secondTransport.status, "starting");
+
+  second.presentFrame();
+  await secondSession.firstFrame;
+  assert.equal(secondTransport.status, "healthy");
+
+  await firstSession.destroy();
+  assert.equal(firstSocket.closed, true);
+  assert.notEqual(secondSocket.closed, true);
+  assert.equal(secondBuffer.aborted, false);
+
+  await secondSession.destroy();
+});

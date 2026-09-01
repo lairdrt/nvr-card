@@ -269,9 +269,12 @@ export function createTestHarness() {
       return null;
     }
 
-    return card.querySelector(
-      `hui-image[data-entity="${camera.entity}"]`
-    );
+    return [...card.querySelectorAll("nvr-live-presentation")]
+      .find(presentation =>
+        presentation._liveConfig?.cameraId === cameraName
+      ) ?? card.querySelector(
+        `hui-image[data-entity="${camera.entity}"]`
+      );
   }
 
   function capturePlayerIdentity(card, cameraName) {

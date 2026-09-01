@@ -11,6 +11,14 @@ function setup(t) {
   return harness;
 }
 
+function createHassWithCameraNames(harness, cameras, cameraNames) {
+  const hass = harness.createHass(cameras);
+  Object.entries(cameraNames).forEach(([entity, cameraName]) => {
+    hass.states[entity].attributes.camera_name = cameraName;
+  });
+  return hass;
+}
+
 function assignments(card) {
   return Array.from(card._assignedCameras);
 }
@@ -1520,23 +1528,34 @@ test("maximize media-session history retains only the latest ten sessions", t =>
   assert.equal(sessions.at(-1).completionReason, "duration");
 });
 
-test("Stage 2A controls only garage and preserves its presentation through grid operations", t => {
+test("Stage 2B preserves the safely mapped presentation through grid operations", t => {
   const harness = setup(t);
+  const cameras = [
+    { name: "Garage Display", entity: "camera.garage", active: true },
+    { name: "Other", entity: "camera.other", active: true }
+  ];
   const card = harness.createCard({
-    cameras: [
-      { name: "garage", entity: "camera.garage", active: true },
-      { name: "Other", entity: "camera.other", active: true }
-    ]
+    cameras,
+    hass: createHassWithCameraNames(
+      harness,
+      cameras,
+      { "camera.garage": "garage" }
+    )
   });
 
-  card.assignCamera("garage");
+  card.assignCamera("Garage Display");
   card.assignCamera("Other");
   harness.flushAnimationFrames();
 
-  const presentation = card.querySelector("nvr-live-presentation");
+  const presentation = harness.getPlayer(card, "Garage Display");
   const physicalCell = presentation.closest(".video-cell");
   const otherPlayer = harness.getPlayer(card, "Other");
   assert.equal(card.querySelectorAll("nvr-live-presentation").length, 1);
+  assert.equal(presentation._liveConfig.sourceId, "garage");
+  assert.equal(
+    physicalCell.querySelector(".cell-camera-name").textContent,
+    "Garage Display"
+  );
   assert.ok(otherPlayer);
   assert.equal(presentation.startCount, 1);
   assert.equal(presentation.connectedCount, 1);
@@ -1544,7 +1563,7 @@ test("Stage 2A controls only garage and preserves its presentation through grid 
 
   card.moveCameraBetweenSlots(0, 3);
   harness.flushAnimationFrames();
-  assert.strictEqual(card.querySelector("nvr-live-presentation"), presentation);
+  assert.strictEqual(harness.getPlayer(card, "Garage Display"), presentation);
   assert.strictEqual(presentation.closest(".video-cell"), physicalCell);
   assert.strictEqual(harness.getLogicalCell(card, 3), physicalCell);
 
@@ -1557,10 +1576,190 @@ test("Stage 2A controls only garage and preserves its presentation through grid 
 
   card.repackAssignedCameras();
   harness.flushAnimationFrames();
-  assert.strictEqual(card.querySelector("nvr-live-presentation"), presentation);
+  assert.strictEqual(harness.getPlayer(card, "Garage Display"), presentation);
   assert.strictEqual(presentation.closest(".video-cell"), physicalCell);
   assert.equal(presentation.startCount, 1);
   assert.equal(presentation.connectedCount, 1);
   assert.equal(presentation.disconnectedCount, 0);
   assert.strictEqual(harness.getPlayer(card, "Other"), otherPlayer);
+});
+
+test("runtime camera_name controls Stage 2A routing and missing metadata falls back", t => {
+  const harness = setup(t);
+  const cameras = [
+    { name: "gArAgE Main Display", entity: "camera.garage", active: true },
+    { name: "Drive Up Friendly Name", entity: "camera.drive_up", active: true },
+    { name: "Missing Runtime ID", entity: "camera.unknown", active: true }
+  ];
+  const card = harness.createCard({
+    cameras,
+    hass: createHassWithCameraNames(harness, cameras, {
+      "camera.garage": "garage",
+      "camera.drive_up": "drive_up_main_exact"
+    })
+  });
+  cameras.forEach(camera => card.assignCamera(camera.name));
+  harness.flushAnimationFrames();
+
+  assert.equal(card.querySelectorAll("nvr-live-presentation").length, 2);
+  const presentations = [
+    ["gArAgE Main Display", "garage"],
+    ["Drive Up Friendly Name", "drive_up_main_exact"]
+  ].map(([name, sourceId]) => {
+    const presentation = harness.getPlayer(card, name);
+    assert.equal(presentation.localName, "nvr-live-presentation");
+    assert.equal(presentation._liveConfig.sourceId, sourceId);
+    assert.equal(presentation.connectedCount, 1);
+    assert.equal(presentation.disconnectedCount, 0);
+    return presentation;
+  });
+  assert.equal(new Set(presentations).size, 2);
+  const fallback = harness.getPlayer(card, "Missing Runtime ID");
+  assert.equal(fallback.localName, "hui-image");
+  assert.equal(fallback.dataset.entity, "camera.unknown");
+});
+
+test("later camera_name metadata promotes only the legacy assigned cell", t => {
+  const harness = setup(t);
+  const cameras = [
+    { name: "Garage Display", entity: "camera.garage", active: true }
+  ];
+  const initialHass = harness.createHass(cameras);
+  const card = harness.createCard({ cameras, hass: initialHass });
+
+  card.assignCamera("Garage Display");
+  harness.flushAnimationFrames();
+
+  const fallback = harness.getPlayer(card, "Garage Display");
+  const physicalCell = fallback.closest(".video-cell");
+  assert.equal(fallback.localName, "hui-image");
+
+  const liveHass = createHassWithCameraNames(
+    harness,
+    cameras,
+    { "camera.garage": "garage" }
+  );
+  card.hass = liveHass;
+  harness.flushAnimationFrames();
+
+  const presentation = harness.getPlayer(card, "Garage Display");
+  assert.equal(presentation.localName, "nvr-live-presentation");
+  assert.equal(presentation._liveConfig.sourceId, "garage");
+  assert.strictEqual(presentation.closest(".video-cell"), physicalCell);
+  assert.equal(presentation.connectedCount, 1);
+  assert.equal(presentation.disconnectedCount, 0);
+
+  card.hass = createHassWithCameraNames(
+    harness,
+    cameras,
+    { "camera.garage": "garage" }
+  );
+  harness.flushAnimationFrames();
+
+  assert.strictEqual(
+    harness.getPlayer(card, "Garage Display"),
+    presentation
+  );
+  assert.strictEqual(presentation.closest(".video-cell"), physicalCell);
+  assert.equal(presentation.connectedCount, 1);
+  assert.equal(presentation.disconnectedCount, 0);
+});
+
+test("Stage 2B camera-list drag assigns an unassigned camera to the viewing area", t => {
+  const harness = setup(t);
+  const cameras = [
+    { name: "garage", entity: "camera.garage", active: true },
+    { name: "Front Door", entity: "camera.front_door", active: true }
+  ];
+  const card = harness.createCard({
+    cameras,
+    hass: createHassWithCameraNames(
+      harness,
+      cameras,
+      { "camera.garage": "garage" }
+    )
+  });
+  const values = new Map();
+  const dataTransfer = {
+    types: [],
+    effectAllowed: "none",
+    dropEffect: "none",
+    setData(type, value) {
+      values.set(type, value);
+      if (!this.types.includes(type)) this.types.push(type);
+    },
+    getData(type) {
+      return values.get(type) ?? "";
+    }
+  };
+  const dispatchDrag = (target, type) => {
+    const event = new harness.window.Event(type, {
+      bubbles: true,
+      cancelable: true
+    });
+    Object.defineProperty(event, "dataTransfer", {
+      value: dataTransfer
+    });
+    target.dispatchEvent(event);
+    return event;
+  };
+
+  const cameraItem = card.querySelector(
+    '.camera-item[data-camera="garage"]'
+  );
+  const targetCell = harness.getLogicalCell(card, 1);
+  dispatchDrag(cameraItem, "dragstart");
+  const dragOver = dispatchDrag(targetCell, "dragover");
+  const drop = dispatchDrag(targetCell, "drop");
+  harness.flushAnimationFrames();
+
+  assert.equal(dragOver.defaultPrevented, true);
+  assert.equal(drop.defaultPrevented, true);
+  assert.equal(card._assignedCameras[1], "garage");
+  const presentation = harness.getPlayer(card, "garage");
+  assert.strictEqual(presentation.closest(".video-cell"), targetCell);
+  assert.equal(presentation._liveConfig.cameraId, "garage");
+  assert.equal(presentation._liveConfig.sourceId, "garage");
+  assert.equal(targetCell.querySelector(".cell-camera-name").textContent, "garage");
+});
+
+test("Stage 2B click-target assigns and fully renders a safely mapped camera", t => {
+  const harness = setup(t);
+  const cameras = [
+    { name: "garage", entity: "camera.garage", active: true }
+  ];
+  const card = harness.createCard({
+    cameras,
+    hass: createHassWithCameraNames(
+      harness,
+      cameras,
+      { "camera.garage": "garage" }
+    )
+  });
+  const cameraItem = card.querySelector(
+    '.camera-item[data-camera="garage"]'
+  );
+  const targetCell = harness.getLogicalCell(card, 2);
+
+  cameraItem.dispatchEvent(new harness.window.MouseEvent("click", {
+    bubbles: true
+  }));
+  assert.equal(card._selectedCamera, "garage");
+
+  targetCell.dispatchEvent(new harness.window.MouseEvent("click", {
+    bubbles: true,
+    detail: 1
+  }));
+  harness.flushAnimationFrames();
+
+  assert.equal(card._selectedCamera, null);
+  assert.equal(card._assignedCameras[2], "garage");
+  assert.equal(targetCell.querySelector(".empty-cell-center"), null);
+  assert.equal(targetCell.querySelector(".cell-camera-name").textContent, "garage");
+  const presentation = targetCell.querySelector("nvr-live-presentation");
+  assert.ok(presentation);
+  assert.equal(presentation._liveConfig.cameraId, "garage");
+  assert.equal(presentation._liveConfig.sourceId, "garage");
+  assert.equal(presentation.connectedCount, 1);
+  assert.equal(presentation.startCount, 1);
 });

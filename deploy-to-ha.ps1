@@ -52,22 +52,32 @@ if ($LASTEXITCODE -ne 0) {
 }
 $ShortHash = ($ShortHash | Out-String).Trim()
 
-$GitStatus = & git -C $PSScriptRoot status --porcelain 2>&1
-if ($LASTEXITCODE -ne 0) {
-    Write-Error "Failed to determine the Git working tree status: $GitStatus"
-    exit 1
-}
-
-$BuildIdentifier = "NVR $ShortHash"
 $Placeholder = "__NVR_BUILD__"
 
 try {
     $SourceContent = Get-Content -LiteralPath $SourceFile -Raw -ErrorAction Stop
+    $ProductionFiles = @($SourceFile, $LoaderSourceFile) + @(
+        Get-ChildItem -LiteralPath $LiveSourceDirectory -Filter "*.js" -File -ErrorAction Stop |
+            Sort-Object Name |
+            Select-Object -ExpandProperty FullName
+    )
+    $HashStream = New-Object System.IO.MemoryStream
+    $HashEncoding = New-Object System.Text.UTF8Encoding($false)
 
-    if ($GitStatus.Count -gt 0) {
-        $SourceHash = (Get-FileHash -LiteralPath $SourceFile -Algorithm SHA256 -ErrorAction Stop).Hash
-        $BuildIdentifier += "-$($SourceHash.Substring(0, 6).ToLowerInvariant())"
+    foreach ($ProductionFile in $ProductionFiles) {
+        $RelativePath = $ProductionFile.Substring($PSScriptRoot.Length).TrimStart([char[]]@('\', '/')).Replace('\', '/')
+        $PathBytes = $HashEncoding.GetBytes($RelativePath + [char]0)
+        $FileBytes = [System.IO.File]::ReadAllBytes($ProductionFile)
+        $HashStream.Write($PathBytes, 0, $PathBytes.Length)
+        $HashStream.Write($FileBytes, 0, $FileBytes.Length)
+        $HashStream.WriteByte(0)
     }
+
+    $ProductionHash = [System.Security.Cryptography.SHA256]::Create().ComputeHash(
+        $HashStream.ToArray()
+    )
+    $ProductionHashHex = [System.BitConverter]::ToString($ProductionHash).Replace('-', '').ToLowerInvariant()
+    $BuildIdentifier = "NVR $ShortHash-$ProductionHashHex"
 
     Write-Host "Deploying build: $BuildIdentifier"
 
