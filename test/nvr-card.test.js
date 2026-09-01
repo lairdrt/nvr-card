@@ -1547,8 +1547,10 @@ test("Garage provider preserves its opaque presentation through grid operations 
 
   const presentation = card.querySelector("nvr-go2rtc-video");
   const physicalCell = presentation.closest(".video-cell");
+  const title = physicalCell.querySelector(".cell-camera-name");
   const otherPlayer = harness.getPlayer(card, "Other");
   assert.equal(card.querySelectorAll("nvr-go2rtc-video").length, 1);
+  assert.equal(title?.textContent, "Garage");
   assert.ok(otherPlayer);
   assert.equal(presentation.connectedCount, 1);
   assert.equal(presentation.disconnectedCount, 0);
@@ -1557,6 +1559,10 @@ test("Garage provider preserves its opaque presentation through grid operations 
   harness.flushAnimationFrames();
   assert.strictEqual(card.querySelector("nvr-go2rtc-video"), presentation);
   assert.strictEqual(presentation.closest(".video-cell"), physicalCell);
+  assert.strictEqual(
+    physicalCell.querySelector(".cell-camera-name"),
+    title
+  );
   assert.strictEqual(harness.getLogicalCell(card, 3), physicalCell);
 
   card.maximizeCameraSlot(3);
@@ -1580,6 +1586,10 @@ test("Garage provider preserves its opaque presentation through grid operations 
   ]);
 
   assert.strictEqual(card.querySelector("nvr-go2rtc-video"), presentation);
+  assert.strictEqual(
+    physicalCell.querySelector(".cell-camera-name"),
+    title
+  );
   assert.equal(harness.providerOpenCalls.length, 1);
   assert.equal(presentation.closeCount, 0);
 

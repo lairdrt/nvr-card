@@ -2305,6 +2305,11 @@ class NVRCard extends HTMLElement {
         );
         frame.appendChild(presentation.element);
         cell.appendChild(frame);
+
+        const label = document.createElement("div");
+        label.className = "cell-camera-name";
+        label.textContent = cameraName;
+        cell.appendChild(label);
         return;
       }
 
