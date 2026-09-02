@@ -410,11 +410,23 @@ class NVRCard extends HTMLElement {
   setConfig(config) {
     const normalized =
       this.normalizeConfig(config);
+    const normalizedConfigKey =
+      JSON.stringify(normalized);
 
     this.config = config;
+
+    if (
+      this._normalizedConfigKey ===
+      normalizedConfigKey
+    ) {
+      return;
+    }
+
     this._cameras = normalized.cameras;
     this._cameraAspectRatio =
       normalized.cameraAspectRatio;
+    this._normalizedConfigKey =
+      normalizedConfigKey;
 
     this.render();
   }
@@ -2215,6 +2227,43 @@ class NVRCard extends HTMLElement {
   }
 
 
+  traceProviderCellLifecycle(event, cell, details = {}) {
+    const physicalCellIndex = Array.from(
+      this.querySelectorAll(".video-cell")
+    ).indexOf(cell);
+    const mappedPresentation =
+      this._providerPresentations.get(cell);
+
+    console.info("[NVR provider cell lifecycle]", {
+      event,
+      cardId: this._nvrInstanceId,
+      physicalCellId:
+        physicalCellIndex >= 0
+          ? `physical-cell-${physicalCellIndex}`
+          : null,
+      physicalCellIndex,
+      logicalSlot: Number(cell?.dataset.slot),
+      mapSize: this._providerPresentations.size,
+      mappedPresentationId:
+        mappedPresentation?.diagnostic?.presentationId ?? null,
+      mappedPlayerId:
+        mappedPresentation?.diagnostic?.playerId ?? null,
+      ...details
+    });
+  }
+
+
+  traceActiveProviderPresentationCount(reason) {
+    console.info("[NVR provider experiment]", {
+      reason,
+      experimentLimit:
+        this._frigateProvider.experimentLimit,
+      activeProviderPresentations:
+        this._providerPresentations.size
+    });
+  }
+
+
   renderSlot(slot) {
     const cell =
       this.querySelector(
@@ -2226,6 +2275,16 @@ class NVRCard extends HTMLElement {
       return;
     }
 
+    this.traceProviderCellLifecycle(
+      "render-slot-start",
+      cell,
+      {
+        requestedSlot: slot,
+        assignedCameraName:
+          this._assignedCameras[slot] ?? null
+      }
+    );
+
     this.closeProviderPresentation(cell);
 
 
@@ -2235,6 +2294,15 @@ class NVRCard extends HTMLElement {
      * Layout changes never call this function.
      */
     cell.innerHTML = "";
+
+    this.traceProviderCellLifecycle(
+      "render-slot-cleared",
+      cell,
+      {
+        requestedSlot: slot,
+        childCount: cell.childElementCount
+      }
+    );
 
 
     const cameraName =
@@ -2290,62 +2358,131 @@ class NVRCard extends HTMLElement {
         "camera-frame";
 
 
-      if (
-        camera.entity === "camera.garage" &&
-        this._hass
-      ) {
+      const providerExperimentCamera =
+        this._frigateProvider.supports(camera);
+      const providerStreamId =
+        this._hass?.states?.[camera.entity]
+          ?.attributes?.camera_name;
+      const isMappedProviderCamera =
+        typeof providerStreamId === "string" &&
+        providerStreamId.trim().length > 0;
+
+      if (this._hass && providerExperimentCamera) {
         const presentation =
           this._frigateProvider.open(camera, {
             hass: this._hass
           });
 
-        this._providerPresentations.set(
-          cell,
-          presentation
-        );
-        frame.appendChild(presentation.element);
+        if (presentation) {
+          this.traceProviderCellLifecycle(
+            "provider-open-returned",
+            cell,
+            {
+              requestedSlot: slot,
+              cameraEntity: camera.entity,
+              streamId:
+                presentation.diagnostic?.streamId ?? null,
+              presentationId:
+                presentation.diagnostic?.presentationId ?? null,
+              playerId:
+                presentation.diagnostic?.playerId ?? null,
+              elementIsConnected:
+                presentation.element.isConnected
+            }
+          );
+          this._providerPresentations.set(
+            cell,
+            presentation
+          );
+          this.traceActiveProviderPresentationCount(
+            "presentation-added"
+          );
+          this.traceProviderCellLifecycle(
+            "provider-presentation-mapped",
+            cell,
+            {
+              requestedSlot: slot,
+              cameraEntity: camera.entity,
+              streamId:
+                presentation.diagnostic?.streamId ?? null,
+              presentationId:
+                presentation.diagnostic?.presentationId ?? null,
+              playerId:
+                presentation.diagnostic?.playerId ?? null,
+              elementIsConnected:
+                presentation.element.isConnected
+            }
+          );
+          frame.appendChild(presentation.element);
+          cell.appendChild(frame);
+
+          const label = document.createElement("div");
+          label.className = "cell-camera-name";
+          label.textContent = cameraName;
+          cell.appendChild(label);
+          this.traceProviderCellLifecycle(
+            "render-slot-provider-complete",
+            cell,
+            {
+              requestedSlot: slot,
+              cameraEntity: camera.entity,
+              streamId:
+                presentation.diagnostic?.streamId ?? null,
+              presentationId:
+                presentation.diagnostic?.presentationId ?? null,
+              playerId:
+                presentation.diagnostic?.playerId ?? null,
+              elementIsConnected:
+                presentation.element.isConnected,
+              elementParentConnected:
+                presentation.element.parentElement?.isConnected ?? null
+            }
+          );
+          return;
+        }
+      }
+
+      if (
+        !providerExperimentCamera &&
+        isMappedProviderCamera
+      ) {
         cell.appendChild(frame);
+      } else {
 
-        const label = document.createElement("div");
-        label.className = "cell-camera-name";
-        label.textContent = cameraName;
-        cell.appendChild(label);
-        return;
+        const image =
+          document.createElement(
+            "hui-image"
+          );
+
+
+        image.className =
+          "nvr-live-camera";
+
+
+        image.dataset.entity =
+          camera.entity;
+
+
+        image.cameraImage =
+          camera.entity;
+
+
+        image.cameraView =
+          slot < NVR_DIAGNOSTIC_LIVE_SLOT_LIMIT
+            ? "live"
+            : "auto";
+
+
+        if (this._hass) {
+          image.hass =
+            this._hass;
+        }
+
+
+        frame.appendChild(image);
+
+        cell.appendChild(frame);
       }
-
-      const image =
-        document.createElement(
-          "hui-image"
-        );
-
-
-      image.className =
-        "nvr-live-camera";
-
-
-      image.dataset.entity =
-        camera.entity;
-
-
-      image.cameraImage =
-        camera.entity;
-
-
-      image.cameraView =
-        slot < NVR_DIAGNOSTIC_LIVE_SLOT_LIMIT
-          ? "live"
-          : "auto";
-
-
-      if (this._hass) {
-        image.hass =
-          this._hass;
-      }
-
-
-      frame.appendChild(image);
-
-      cell.appendChild(frame);
     }
 
 
@@ -2415,12 +2552,63 @@ class NVRCard extends HTMLElement {
     const presentation =
       this._providerPresentations.get(cell);
 
+    this.traceProviderCellLifecycle(
+      "close-provider-presentation-lookup",
+      cell,
+      {
+        found: Boolean(presentation),
+        presentationId:
+          presentation?.diagnostic?.presentationId ?? null,
+        playerId:
+          presentation?.diagnostic?.playerId ?? null,
+        cameraEntity:
+          presentation?.diagnostic?.cameraEntity ?? null,
+        streamId:
+          presentation?.diagnostic?.streamId ?? null,
+        elementIsConnected:
+          presentation?.element?.isConnected ?? null
+      }
+    );
+
     if (!presentation) {
       return;
     }
 
     this._providerPresentations.delete(cell);
+    this.traceActiveProviderPresentationCount(
+      "presentation-removed"
+    );
+    this.traceProviderCellLifecycle(
+      "close-provider-presentation-deleted",
+      cell,
+      {
+        presentationId:
+          presentation.diagnostic?.presentationId ?? null,
+        playerId:
+          presentation.diagnostic?.playerId ?? null,
+        cameraEntity:
+          presentation.diagnostic?.cameraEntity ?? null,
+        streamId:
+          presentation.diagnostic?.streamId ?? null,
+        elementIsConnected: presentation.element.isConnected
+      }
+    );
     presentation.close();
+    this.traceProviderCellLifecycle(
+      "close-provider-presentation-complete",
+      cell,
+      {
+        presentationId:
+          presentation.diagnostic?.presentationId ?? null,
+        playerId:
+          presentation.diagnostic?.playerId ?? null,
+        cameraEntity:
+          presentation.diagnostic?.cameraEntity ?? null,
+        streamId:
+          presentation.diagnostic?.streamId ?? null,
+        elementIsConnected: presentation.element.isConnected
+      }
+    );
   }
 
 
@@ -2429,6 +2617,9 @@ class NVRCard extends HTMLElement {
       presentation => presentation.close()
     );
     this._providerPresentations.clear();
+    this.traceActiveProviderPresentationCount(
+      "all-presentations-removed"
+    );
   }
 
 

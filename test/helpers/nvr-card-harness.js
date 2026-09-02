@@ -114,13 +114,42 @@ export function createTestHarness() {
   }
 
   class MockFrigateProvider {
+    get experimentLimit() {
+      return 11;
+    }
+
+    supports(camera) {
+      return new Set([
+        "camera.garage",
+        "camera.front_door",
+        "camera.front_entry",
+        "camera.drive_up",
+        "camera.drive_down",
+        "camera.side_gate",
+        "camera.ac",
+        "camera.patio",
+        "camera.backyard",
+        "camera.fireplace",
+        "camera.patio_roof"
+      ]).has(camera?.entity);
+    }
+
     open(camera, options) {
+      const streamId =
+        options.hass.states[camera.entity]
+          ?.attributes?.camera_name;
+
+      if (!streamId) {
+        return null;
+      }
+
       const element = window.document.createElement(
         "nvr-go2rtc-video"
       );
       element.className =
         "nvr-live-camera nvr-provider-live-camera";
       element.dataset.entity = camera.entity;
+      element.dataset.stream = streamId;
       providerOpenCalls.push({ camera, options, element });
 
       return {

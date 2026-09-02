@@ -159,6 +159,73 @@ test("title keeps the build identifier adjacent and omits Clear Grid", t => {
   assert.equal(card.querySelector(".clear-button"), null);
 });
 
+test("equivalent setConfig preserves active provider players while changed config rebuilds", t => {
+  const harness = setup(t);
+  const cameras = [
+    { name: "Garage", entity: "camera.garage", active: true },
+    { name: "Front Door", entity: "camera.front_door", active: true }
+  ];
+  const hass = {
+    states: {
+      "camera.garage": {
+        state: "streaming",
+        attributes: { camera_name: "garage" }
+      },
+      "camera.front_door": {
+        state: "streaming",
+        attributes: { camera_name: "front_door" }
+      }
+    }
+  };
+  const card = harness.window.document.createElement("nvr-card");
+  harness.window.document.body.appendChild(card);
+  const originalRender = card.render.bind(card);
+  let renderCount = 0;
+  card.render = () => {
+    renderCount += 1;
+    return originalRender();
+  };
+
+  card.setConfig({
+    cameras: cameras.map(camera => ({ ...camera }))
+  });
+  assert.equal(renderCount, 1);
+  assert.equal(harness.getPhysicalCells(card).length, 16);
+
+  card.hass = hass;
+  card.assignCamera("Garage");
+  card.assignCamera("Front Door");
+  const garagePlayer = harness.getPlayer(card, "Garage");
+  const frontDoorPlayer = harness.getPlayer(card, "Front Door");
+  const cells = harness.getPhysicalCells(card);
+
+  card.setConfig({
+    cameras: cameras.map(camera => ({ ...camera }))
+  });
+
+  assert.equal(renderCount, 1);
+  assert.strictEqual(harness.getPlayer(card, "Garage"), garagePlayer);
+  assert.strictEqual(
+    harness.getPlayer(card, "Front Door"),
+    frontDoorPlayer
+  );
+  assert.equal(garagePlayer.closeCount, 0);
+  assert.equal(frontDoorPlayer.closeCount, 0);
+  assert.equal(card._providerPresentations.size, 2);
+  assert.deepEqual(harness.getPhysicalCells(card), cells);
+
+  card.setConfig({
+    cameras: cameras.map(camera => ({ ...camera })),
+    camera_aspect_ratio: "4:3"
+  });
+
+  assert.equal(renderCount, 2);
+  assert.equal(garagePlayer.closeCount, 1);
+  assert.equal(frontDoorPlayer.closeCount, 1);
+  assert.equal(card._providerPresentations.size, 0);
+  assert.notStrictEqual(harness.getPhysicalCells(card)[0], cells[0]);
+});
+
 test("initial camera assignment uses the first available visible slots", t => {
   const harness = setup(t);
   const card = harness.createCard();
@@ -1532,26 +1599,80 @@ test("maximize media-session history retains only the latest ten sessions", t =>
   assert.equal(sessions.at(-1).completionReason, "duration");
 });
 
-test("Garage provider preserves its opaque presentation through grid operations and hass updates", t => {
+test("limited WebRTC experiment preserves included players and leaves excluded cameras inert", t => {
   const harness = setup(t);
+  const cameras = [
+    { name: "Garage", entity: "camera.garage", active: true },
+    { name: "Front Door", entity: "camera.front_door", active: true },
+    { name: "Drive Up", entity: "camera.drive_up", active: true }
+  ];
+  const excludedCamera = {
+    name: "Not Configured",
+    entity: "camera.not_configured",
+    active: true
+  };
+  const createHass = () => ({
+    states: {
+      "camera.garage": {
+        state: "streaming",
+        attributes: { camera_name: "garage" }
+      },
+      "camera.front_door": {
+        state: "streaming",
+        attributes: { camera_name: "front_door" }
+      },
+      "camera.drive_up": {
+        state: "streaming",
+        attributes: { camera_name: "drive_up" }
+      },
+      "camera.not_configured": {
+        state: "streaming",
+        attributes: { camera_name: "not_configured" }
+      }
+    }
+  });
   const card = harness.createCard({
-    cameras: [
-      { name: "Garage", entity: "camera.garage", active: true },
-      { name: "Other", entity: "camera.other", active: true }
-    ]
+    cameras: [...cameras, excludedCamera],
+    hass: createHass()
   });
 
   card.assignCamera("Garage");
-  card.assignCamera("Other");
+  card.assignCamera("Front Door");
+  card.assignCamera("Drive Up");
+  card.assignCamera("Not Configured");
   harness.flushAnimationFrames();
 
   const presentation = card.querySelector("nvr-go2rtc-video");
   const physicalCell = presentation.closest(".video-cell");
   const title = physicalCell.querySelector(".cell-camera-name");
-  const otherPlayer = harness.getPlayer(card, "Other");
-  assert.equal(card.querySelectorAll("nvr-go2rtc-video").length, 1);
+  const playerIdentities = new Map(
+    cameras.map(camera => [
+      camera.name,
+      harness.getPlayer(card, camera.name)
+    ])
+  );
+  assert.equal(card.querySelectorAll("nvr-go2rtc-video").length, 3);
+  assert.equal(card._providerPresentations.size, 3);
+  assert.equal(harness.getPlayer(card, "Not Configured"), null);
+  assert.equal(
+    card.querySelector('[data-entity="camera.not_configured"]'),
+    null
+  );
+  assert.deepEqual(
+    cameras.map(camera =>
+      harness.getPlayer(card, camera.name).dataset.stream
+    ),
+    ["garage", "front_door", "drive_up"]
+  );
+  cameras.forEach(camera => {
+    const player = playerIdentities.get(camera.name);
+    assert.equal(
+      player.closest(".video-cell")
+        .querySelector(".cell-camera-name")?.textContent,
+      camera.name
+    );
+  });
   assert.equal(title?.textContent, "Garage");
-  assert.ok(otherPlayer);
   assert.equal(presentation.connectedCount, 1);
   assert.equal(presentation.disconnectedCount, 0);
 
@@ -1578,23 +1699,34 @@ test("Garage provider preserves its opaque presentation through grid operations 
   assert.strictEqual(presentation.closest(".video-cell"), physicalCell);
   assert.equal(presentation.connectedCount, 1);
   assert.equal(presentation.disconnectedCount, 0);
-  assert.strictEqual(harness.getPlayer(card, "Other"), otherPlayer);
+  cameras.forEach(camera => {
+    assert.strictEqual(
+      harness.getPlayer(card, camera.name),
+      playerIdentities.get(camera.name)
+    );
+  });
 
-  card.hass = harness.createHass([
-    { name: "Garage", entity: "camera.garage", active: true },
-    { name: "Other", entity: "camera.other", active: true }
-  ]);
+  card.hass = createHass();
 
+  assert.equal(card._providerPresentations.size, 3);
   assert.strictEqual(card.querySelector("nvr-go2rtc-video"), presentation);
   assert.strictEqual(
     physicalCell.querySelector(".cell-camera-name"),
     title
   );
-  assert.equal(harness.providerOpenCalls.length, 1);
+  assert.equal(harness.providerOpenCalls.length, 3);
   assert.equal(presentation.closeCount, 0);
 
   card.removeCameraFromSlot(Number(physicalCell.dataset.slot));
 
   assert.equal(presentation.closeCount, 1);
-  assert.equal(card.querySelector("nvr-go2rtc-video"), null);
+  assert.equal(harness.getPlayer(card, "Garage"), null);
+  assert.strictEqual(
+    harness.getPlayer(card, "Front Door"),
+    playerIdentities.get("Front Door")
+  );
+  assert.strictEqual(
+    harness.getPlayer(card, "Drive Up"),
+    playerIdentities.get("Drive Up")
+  );
 });

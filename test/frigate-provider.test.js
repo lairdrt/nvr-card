@@ -15,7 +15,11 @@ Object.assign(globalThis, {
   window
 });
 
-const { FrigateProvider } = await import(
+const {
+  EXPERIMENT_ACTIVE_CAMERA_LIMIT,
+  EXPERIMENT_CAMERA_ENTITIES,
+  FrigateProvider
+} = await import(
   "../src/providers/frigate-provider.js"
 );
 
@@ -46,6 +50,11 @@ test("FrigateProvider renews signing for each serialized VideoRTC connection", a
   globalThis.WebSocket = MockWebSocket;
 
   const hass = {
+    states: {
+      "camera.garage": {
+        attributes: { camera_name: "garage" }
+      }
+    },
     callWS(message) {
       calls.push(message);
       return Promise.resolve({
@@ -137,6 +146,11 @@ test("FrigateProvider close invalidates a pending signed reconnect", async () =>
       { name: "Garage", entity: "camera.garage" },
       {
         hass: {
+          states: {
+            "camera.garage": {
+              attributes: { camera_name: "garage" }
+            }
+          },
           callWS(message) {
             calls.push(message);
             return signing;
@@ -162,6 +176,121 @@ test("FrigateProvider close invalidates a pending signed reconnect", async () =>
   } finally {
     globalThis.WebSocket = originalWebSocket;
   }
+});
+
+test("FrigateProvider applies the ordered experiment camera limit", () => {
+  const signRequests = [];
+  const hass = {
+    states: {
+      "camera.garage": {
+        attributes: { camera_name: "garage" }
+      },
+      "camera.front_door": {
+        attributes: { camera_name: "front_door" }
+      },
+      "camera.drive_up": {
+        attributes: { camera_name: "drive_up" }
+      }
+    },
+    callWS(message) {
+      signRequests.push(message);
+      return new Promise(() => {});
+    }
+  };
+  const provider = new FrigateProvider();
+  const cameras = [
+    { name: "Garage", entity: "camera.garage" },
+    { name: "Front Door", entity: "camera.front_door" },
+    { name: "Drive Up", entity: "camera.drive_up" }
+  ];
+  assert.equal(EXPERIMENT_ACTIVE_CAMERA_LIMIT, 11);
+  assert.deepEqual(EXPERIMENT_CAMERA_ENTITIES.slice(0, 3), [
+    "camera.garage",
+    "camera.front_door",
+    "camera.front_entry"
+  ]);
+  const orderedCameras = EXPERIMENT_CAMERA_ENTITIES.map(entity => ({
+    name: entity,
+    entity
+  }));
+  assert.deepEqual(
+    orderedCameras.slice(0, 3).map(camera =>
+      new FrigateProvider(2).supports(camera)
+    ),
+    [true, true, false]
+  );
+  assert.deepEqual(
+    orderedCameras.slice(0, 3).map(camera =>
+      new FrigateProvider(3).supports(camera)
+    ),
+    [true, true, true]
+  );
+  assert.equal(
+    orderedCameras.every(camera =>
+      new FrigateProvider(
+        EXPERIMENT_CAMERA_ENTITIES.length
+      ).supports(camera)
+    ),
+    true
+  );
+  assert.equal(
+    provider.supports(
+      { entity: "camera.not_configured" },
+      EXPERIMENT_CAMERA_ENTITIES.length
+    ),
+    false
+  );
+  const experimentHass = {
+    states: Object.fromEntries(
+      EXPERIMENT_CAMERA_ENTITIES.map(entity => [
+        entity,
+        {
+          attributes: {
+            camera_name: entity.slice("camera.".length)
+          }
+        }
+      ])
+    )
+  };
+  for (const expectedCount of [2, 3, EXPERIMENT_CAMERA_ENTITIES.length]) {
+    const limitedProvider = new FrigateProvider(expectedCount);
+    const limitedHandles = orderedCameras.map(camera =>
+      limitedProvider.open(camera, { hass: experimentHass })
+    );
+    assert.equal(
+      limitedHandles.filter(Boolean).length,
+      expectedCount
+    );
+    limitedHandles.filter(Boolean).forEach(handle => handle.close());
+  }
+  const opened = cameras.map(camera =>
+    provider.open(camera, { hass })
+  );
+
+  assert.deepEqual(
+    opened.map(handle => handle.element.dataset.stream),
+    ["garage", "front_door", "drive_up"]
+  );
+  opened.forEach(handle => {
+    assert.equal(handle.element.mode, "webrtc");
+    assert.equal(handle.element.visibilityCheck, false);
+    window.document.body.appendChild(handle.element);
+  });
+  assert.deepEqual(
+    signRequests.map(request => request.path),
+    [
+      "/api/frigate/go2rtc/ws/api/ws?src=garage",
+      "/api/frigate/go2rtc/ws/api/ws?src=front_door",
+      "/api/frigate/go2rtc/ws/api/ws?src=drive_up"
+    ]
+  );
+  assert.equal(
+    signRequests.every(request => request.expires === 30),
+    true
+  );
+  opened.forEach(handle => {
+    handle.close();
+  });
 });
 
 test("nvr-card leaves authentication and playback internals behind the provider", () => {
