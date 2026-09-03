@@ -29,6 +29,49 @@ export function createTestHarness({
   let nextIntervalId = 1;
   const intervals = new Map();
   const providerOpenCalls = [];
+  const userStateBackend = new Map();
+  const userStateCalls = [];
+
+  class ImmediateResult {
+    constructor(value, error = null) {
+      this.value = value;
+      this.error = error;
+    }
+
+    then(onFulfilled, onRejected) {
+      try {
+        if (this.error) {
+          return onRejected
+            ? ImmediateResult.from(onRejected(this.error))
+            : this;
+        }
+        return ImmediateResult.from(onFulfilled(this.value));
+      } catch (error) {
+        return new ImmediateResult(undefined, error);
+      }
+    }
+
+    catch(onRejected) {
+      return this.error
+        ? this.then(undefined, onRejected)
+        : this;
+    }
+
+    finally(onFinally) {
+      try {
+        onFinally();
+        return this;
+      } catch (error) {
+        return new ImmediateResult(undefined, error);
+      }
+    }
+
+    static from(value) {
+      return value instanceof ImmediateResult
+        ? value
+        : new ImmediateResult(value);
+    }
+  }
 
   class MockResizeObserver {
     constructor(callback) {
@@ -301,7 +344,37 @@ export function createTestHarness({
       }
     });
 
-    return { states };
+    return {
+      states,
+      callWS(message) {
+        userStateCalls.push(
+          JSON.parse(JSON.stringify(message))
+        );
+
+        if (message.type === "frontend/get_user_data") {
+          return new ImmediateResult({
+            value: userStateBackend.has(message.key)
+              ? JSON.parse(JSON.stringify(
+                  userStateBackend.get(message.key)
+                ))
+              : null
+          });
+        }
+
+        if (message.type === "frontend/set_user_data") {
+          userStateBackend.set(
+            message.key,
+            JSON.parse(JSON.stringify(message.value))
+          );
+          return new ImmediateResult(null);
+        }
+
+        return new ImmediateResult(
+          undefined,
+          new Error(`Unexpected WebSocket type: ${message.type}`)
+        );
+      }
+    };
   }
 
   function createCard({
@@ -398,6 +471,8 @@ export function createTestHarness({
     getPlayer,
     capturePlayerIdentity,
     providerOpenCalls,
+    userStateBackend,
+    userStateCalls,
     close
   };
 }

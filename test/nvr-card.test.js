@@ -15,6 +15,12 @@ function assignments(card) {
   return Array.from(card._assignedCameras);
 }
 
+function storedWorkspace(harness, card) {
+  return harness.userStateBackend.get(
+    card.getWorkspacePersistenceKey()
+  );
+}
+
 function assertIdentityUnchanged(harness, card, cameraName, before) {
   const after =
     harness.capturePlayerIdentity(card, cameraName);
@@ -208,14 +214,6 @@ test("card lifecycle diagnostics distinguish instances and config paths without 
   assert.ok(lifecycle.some(entry => {
     return (
       entry.runtimeInstanceId === firstConstructor.runtimeInstanceId &&
-      entry.event === "persistence-restore" &&
-      entry.attempted === true &&
-      entry.result === "not-found"
-    );
-  }));
-  assert.ok(lifecycle.some(entry => {
-    return (
-      entry.runtimeInstanceId === firstConstructor.runtimeInstanceId &&
       entry.event === "set-config-equivalent-no-op"
     );
   }));
@@ -262,11 +260,7 @@ test("view state restores layout, exact holes, moves, removals, maximize, and la
   card.removeCameraFromSlot(1);
   card.maximizeCameraSlot(5);
 
-  const stored = JSON.parse(
-    harness.window.localStorage.getItem(
-      card.getViewStatePersistenceKey()
-    )
-  );
+  const stored = storedWorkspace(harness, card).viewState;
 
   assert.deepEqual(stored, {
     version: 1,
@@ -444,6 +438,9 @@ test("view-state normalization adapts shorter and longer data to current capacit
     ],
     maximizedSlot: 4
   }));
+  harness.userStateBackend.delete(
+    shorter.getWorkspacePersistenceKey()
+  );
 
   const longer = harness.createCard({ logicalCapacity: 4 });
 
@@ -525,6 +522,9 @@ test("replacement constructor cannot overwrite persisted state before restore", 
   replacement.setConfig({
     cameras: oldCard.config.cameras.map(camera => ({ ...camera }))
   });
+  replacement.hass = harness.createHass(
+    oldCard.config.cameras
+  );
 
   assert.equal(replacement._layout, "3x3");
   assert.equal(replacement._assignedCameras[4], "Garage");
@@ -534,36 +534,36 @@ test("replacement constructor cannot overwrite persisted state before restore", 
   );
 });
 
-test("card view-state logic accepts a replaceable persistence adapter", t => {
+test("card workspace logic accepts a replaceable HA user-state adapter", t => {
   const harness = setup(t);
   const loads = [];
   const saves = [];
   const store = {
     load(key) {
       loads.push(key);
-      if (key.includes(":saved-views:")) {
-        return {
-          result: "not-found",
-          value: null
-        };
-      }
-      return {
+      return Promise.resolve({
         result: "loaded",
         value: {
           version: 1,
-          layout: "3x3",
-          assignedCameras: [
-            null, null, "camera.hall",
-            null, null, null, null, null,
-            null, null, null, null, null, null, null, null
-          ],
-          maximizedSlot: null
+          viewState: {
+            version: 1,
+            layout: "3x3",
+            assignedCameras: [
+              null, null, "camera.hall",
+              null, null, null, null, null,
+              null, null, null, null, null, null, null, null
+            ],
+            maximizedSlot: null
+          },
+          savedViews: { version: 1, views: [] },
+          preferences: {},
+          customLayouts: {}
         }
-      };
+      });
     },
     save(key, state) {
       saves.push({ key, state });
-      return "saved";
+      return Promise.resolve();
     }
   };
   const card = harness.window.document.createElement("nvr-card");
@@ -573,48 +573,264 @@ test("card view-state logic accepts a replaceable persistence adapter", t => {
     { name: "Hall", entity: "camera.hall", active: true }
   ];
 
-  card._viewStateStore = store;
+  card._userStateStore = store;
   harness.window.document.body.appendChild(card);
   card.setConfig({ cameras });
+  card.hass = harness.createHass(cameras);
 
-  assert.equal(loads.length, 2);
-  assert.equal(card._layout, "3x3");
-  assert.equal(card._assignedCameras[2], "Hall");
-  assert.equal(
-    harness.getLogicalCell(card, 2)
-      .querySelector(".cell-camera-name")?.textContent,
-    "Hall"
-  );
+  return card._workspaceHydration.then(() => {
+    assert.equal(loads.length, 1);
+    assert.equal(card._layout, "3x3");
+    assert.equal(card._assignedCameras[2], "Hall");
+    assert.equal(
+      harness.getLogicalCell(card, 2)
+        .querySelector(".cell-camera-name")?.textContent,
+      "Hall"
+    );
 
-  card.removeCameraFromSlot(2);
+    card.removeCameraFromSlot(2);
+    const savedView = card.saveCurrentViewAs("Adapter View");
+    assert.equal(savedView.id, "view-1");
+    assert.equal(saves.length, 2);
+    assert.equal(saves[0].key, loads[0]);
+    assert.deepEqual(Array.from(
+      saves[1].state.savedViews.views,
+      view => view.name
+    ), ["Adapter View"]);
+  });
+});
 
-  assert.equal(saves.length, 1);
-  assert.equal(saves[0].key, loads[0]);
-  assert.deepEqual(JSON.parse(JSON.stringify(saves[0].state)), {
-    version: 1,
-    layout: "3x3",
-    assignedCameras: new Array(16).fill(null),
-    maximizedSlot: null
+test("HA user workspace uses stable frontend user-data messages without a user id", t => {
+  const harness = setup(t);
+  const card = harness.createCard();
+  const key = card.getWorkspacePersistenceKey();
+
+  assert.equal(key, "nvr-card:workspace:v1:%2F");
+  assert.equal(key.includes("anonymous"), false);
+  assert.equal(key.includes("user"), false);
+  assert.deepEqual(harness.userStateCalls[0], {
+    type: "frontend/get_user_data",
+    key
   });
 
-  const savedView = card.saveCurrentViewAs("Adapter View");
+  card.selectLayout("3x3");
+  const save = harness.userStateCalls.findLast(call => {
+    return call.type === "frontend/set_user_data";
+  });
+  assert.equal(save.type, "frontend/set_user_data");
+  assert.equal(save.key, key);
+  assert.deepEqual(Object.keys(save.value), [
+    "version", "viewState", "savedViews",
+    "preferences", "customLayouts"
+  ]);
+});
 
-  assert.equal(savedView.id, "view-1");
-  assert.equal(saves.length, 2);
-  assert.ok(saves[1].key.includes(":saved-views:"));
-  assert.deepEqual(JSON.parse(JSON.stringify(saves[1].state)), {
+test("save diagnostics read back without mutating workspace or exposing prohibited data", t => {
+  const harness = setup(t);
+  const diagnostics = [];
+  const originalInfo = harness.window.console.info;
+
+  harness.window.console.info = (prefix, details) => {
+    if (prefix === "[NVR user state]") {
+      diagnostics.push(details);
+    }
+  };
+  t.after(() => {
+    harness.window.console.info = originalInfo;
+  });
+
+  const card = harness.createCard();
+  card.assignCameraToSlot("Front", 0);
+  const stateAfterSave = JSON.stringify(card.captureWorkspace());
+  const calls = harness.userStateCalls.slice(-2);
+
+  assert.deepEqual(calls.map(call => call.type), [
+    "frontend/set_user_data",
+    "frontend/get_user_data"
+  ]);
+  assert.equal(JSON.stringify(card.captureWorkspace()), stateAfterSave);
+
+  const events = diagnostics.map(entry => entry.event);
+  assert.ok(events.includes("workspace-save-request"));
+  assert.ok(events.includes("workspace-save-response"));
+  assert.ok(events.includes("workspace-save-verify"));
+  assert.ok(events.includes("workspace-hydration-interpretation"));
+  assert.ok(events.includes("workspace-hydration-applied"));
+
+  diagnostics.forEach(entry => {
+    if (entry.event.startsWith("workspace-load") ||
+        entry.event.startsWith("workspace-save")) {
+      assert.equal(entry.workspaceKey, card.getWorkspacePersistenceKey());
+    }
+  });
+  const serialized = JSON.stringify(diagnostics).toLowerCase();
+  ["auth_token", "access_token", "cookie", "headers", "signed_url",
+    "stream_url"].forEach(prohibited => {
+    assert.equal(serialized.includes(prohibited), false);
+  });
+});
+
+test("valid remote workspace is authoritative over legacy local storage", t => {
+  const harness = setup(t);
+  const seed = harness.window.document.createElement("nvr-card");
+  const workspaceKey = seed.getWorkspacePersistenceKey();
+  const legacyKey = seed.getViewStatePersistenceKey();
+
+  harness.window.localStorage.setItem(legacyKey, JSON.stringify({
+    version: 1,
+    layout: "4x4",
+    assignedCameras: ["camera.front"],
+    maximizedSlot: null
+  }));
+  harness.userStateBackend.set(workspaceKey, {
+    version: 1,
+    viewState: {
+      version: 1,
+      layout: "3x3",
+      assignedCameras: [null, "camera.garage"],
+      maximizedSlot: null
+    },
+    savedViews: { version: 1, views: [] },
+    preferences: {},
+    customLayouts: {}
+  });
+
+  const card = harness.createCard();
+  assert.equal(card._layout, "3x3");
+  assert.equal(card._assignedCameras[0], null);
+  assert.equal(card._assignedCameras[1], "Garage");
+  assert.equal(harness.userStateCalls.filter(call => {
+    return call.type === "frontend/set_user_data";
+  }).length, 0);
+});
+
+test("legacy LAST VIEW and Saved Views migrate once into one workspace", t => {
+  const harness = setup(t);
+  const seed = harness.window.document.createElement("nvr-card");
+  const viewKey = seed.getViewStatePersistenceKey();
+  const savedKey = seed.getSavedViewsPersistenceKey();
+  const legacyView = {
+    version: 1,
+    layout: "3x3",
+    assignedCameras: ["camera.front", null, "camera.missing", "camera.front"],
+    maximizedSlot: 2
+  };
+  const legacySaved = {
     version: 1,
     views: [{
       id: "view-1",
-      name: "Adapter View",
-      state: {
-        version: 1,
-        layout: "3x3",
-        assignedCameras: new Array(16).fill(null),
-        maximizedSlot: null
-      }
+      name: "Legacy",
+      state: legacyView
     }]
+  };
+  harness.window.localStorage.setItem(viewKey, JSON.stringify(legacyView));
+  harness.window.localStorage.setItem(savedKey, JSON.stringify(legacySaved));
+
+  const card = harness.createCard();
+  const workspace = storedWorkspace(harness, card);
+  assert.equal(card._layout, "3x3");
+  assert.deepEqual(assignments(card).slice(0, 4), [
+    "Front", null, null, null
+  ]);
+  assert.equal(card._maximizedSlot, null);
+  assert.deepEqual(Array.from(card._savedViews, view => view.name), ["Legacy"]);
+  assert.equal(workspace.version, 1);
+  assert.equal(workspace.savedViews.views.length, 1);
+  assert.equal(harness.userStateCalls.filter(call => {
+    return call.type === "frontend/set_user_data";
+  }).length, 1);
+  assert.notEqual(harness.window.localStorage.getItem(viewKey), null);
+  assert.notEqual(harness.window.localStorage.getItem(savedKey), null);
+});
+
+test("partial and malformed legacy migration use safe section defaults", t => {
+  const harness = setup(t);
+  const seed = harness.window.document.createElement("nvr-card");
+  harness.window.localStorage.setItem(
+    seed.getSavedViewsPersistenceKey(),
+    JSON.stringify({
+      version: 1,
+      views: [{
+        id: "view-2",
+        name: "Saved Only",
+        state: {
+          version: 1,
+          layout: "2x2",
+          assignedCameras: [],
+          maximizedSlot: null
+        }
+      }]
+    })
+  );
+  harness.window.localStorage.setItem(
+    seed.getViewStatePersistenceKey(),
+    "{malformed"
+  );
+
+  const card = harness.createCard();
+  assert.equal(card._layout, "2x2");
+  assert.deepEqual(assignments(card), new Array(16).fill(null));
+  assert.deepEqual(Array.from(card._savedViews, view => view.name), [
+    "Saved Only"
+  ]);
+  assert.equal(storedWorkspace(harness, card).savedViews.views.length, 1);
+});
+
+test("two independent cards restore the same HA-user workspace without local storage", t => {
+  const harness = setup(t);
+  const first = harness.createCard();
+  first.selectLayout("3x3");
+  first.assignCameraToSlot("Hall", 5);
+  first.maximizeCameraSlot(5);
+  first.saveCurrentViewAs("Shared");
+
+  harness.window.localStorage.clear();
+  const second = harness.createCard();
+  assert.equal(second._layout, "3x3");
+  assert.equal(second._assignedCameras[5], "Hall");
+  assert.equal(second._maximizedSlot, 5);
+  assert.deepEqual(Array.from(second._savedViews, view => view.name), [
+    "Shared"
+  ]);
+});
+
+test("malformed remote workspace leaves current runtime state safe", t => {
+  const harness = setup(t);
+  const card = harness.window.document.createElement("nvr-card");
+  harness.userStateBackend.set(
+    card.getWorkspacePersistenceKey(),
+    { version: 99, viewState: null }
+  );
+  harness.window.document.body.appendChild(card);
+  card.setConfig({ cameras: [] });
+  card.hass = harness.createHass([]);
+
+  assert.equal(card._layout, "2x2");
+  assert.deepEqual(assignments(card), new Array(16).fill(null));
+  assert.deepEqual(
+    harness.userStateBackend.get(card.getWorkspacePersistenceKey()),
+    { version: 99, viewState: null }
+  );
+});
+
+test("equivalent setConfig neither rehydrates nor prematurely saves defaults", t => {
+  const harness = setup(t);
+  const card = harness.createCard();
+  const callsAfterHydration = harness.userStateCalls.length;
+  const cells = harness.getPhysicalCells(card);
+
+  card.setConfig({
+    cameras: card.config.cameras.map(camera => ({ ...camera }))
   });
+
+  assert.equal(harness.userStateCalls.length, callsAfterHydration);
+  assert.deepEqual(harness.getPhysicalCells(card), cells);
+  assert.equal(harness.userStateCalls.filter(call => {
+    return call.type === "frontend/get_user_data";
+  }).length, 1);
+  assert.equal(harness.userStateCalls.filter(call => {
+    return call.type === "frontend/set_user_data";
+  }).length, 0);
 });
 
 test("named views preserve independent exact snapshots and load into LAST VIEW", t => {
@@ -652,11 +868,8 @@ test("named views preserve independent exact snapshots and load into LAST VIEW",
     "camera.garage_garage_camera_lorex_mediaprofile_channel1_mainstream"
   );
 
-  const lastViewAfterLoad = JSON.parse(
-    harness.window.localStorage.getItem(
-      card.getViewStatePersistenceKey()
-    )
-  );
+  const lastViewAfterLoad =
+    storedWorkspace(harness, card).viewState;
   assert.deepEqual(
     lastViewAfterLoad,
     JSON.parse(JSON.stringify(frontYard.state))
@@ -673,11 +886,8 @@ test("named views preserve independent exact snapshots and load into LAST VIEW",
     ["Front Yard", "Wide Grid"]
   );
 
-  const savedCollection = JSON.parse(
-    harness.window.localStorage.getItem(
-      replacement.getSavedViewsPersistenceKey()
-    )
-  );
+  const savedCollection =
+    storedWorkspace(harness, replacement).savedViews;
   assert.deepEqual(
     savedCollection.views.map(view => view.id),
     ["view-1", "view-2"]
@@ -708,21 +918,17 @@ test("named views preserve independent exact snapshots and load into LAST VIEW",
     "camera.hall"
   );
 
-  const lastViewBeforeDelete =
-    harness.window.localStorage.getItem(
-      replacement.getViewStatePersistenceKey()
-    );
+  const lastViewBeforeDelete = JSON.stringify(
+    storedWorkspace(harness, replacement).viewState
+  );
   assert.equal(replacement.deleteSavedView(frontYard.id), true);
   assert.deepEqual(
     Array.from(replacement._savedViews, view => view.id),
     [wideGrid.id]
   );
-  assert.equal(
-    harness.window.localStorage.getItem(
-      replacement.getViewStatePersistenceKey()
-    ),
-    lastViewBeforeDelete
-  );
+  assert.equal(JSON.stringify(
+    storedWorkspace(harness, replacement).viewState
+  ), lastViewBeforeDelete);
 });
 
 test("saved-view names reject empty and case-insensitive duplicates", t => {
@@ -2643,8 +2849,10 @@ test("ONVIF registry discovery pairs profiles only by authoritative registry ide
     return mapping.frigateEntity === "camera.front_door";
   });
 
-  assert.equal(calls.length, 1);
-  assert.equal(calls[0].type, "config/entity_registry/list");
+  const registryCalls = calls.filter(message => {
+    return message.type === "config/entity_registry/list";
+  });
+  assert.equal(registryCalls.length, 1);
   assert.equal(garage.mainEntity, "camera.garage_onvif_main");
   assert.equal(garage.confidence, "authoritative");
   assert.equal(frontDoor.mainEntity, null);

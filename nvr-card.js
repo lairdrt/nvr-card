@@ -126,7 +126,129 @@ class LocalStorageNvrViewStateStore {
   }
 }
 
-const NVR_VIEW_STATE_STORE =
+class HomeAssistantUserStateStore {
+  constructor(getHass) {
+    this._getHass = getHass;
+  }
+
+  load(key) {
+    const hass = this._getHass();
+
+    if (!hass || typeof hass.callWS !== "function") {
+      return Promise.reject(
+        new Error("Home Assistant WebSocket API is unavailable.")
+      );
+    }
+
+    console.info("[NVR user state]", {
+      event: "workspace-load-request",
+      workspaceKey: key
+    });
+
+    return hass.callWS({
+      type: "frontend/get_user_data",
+      key
+    }).then(response => {
+      const value =
+        response &&
+        typeof response === "object" &&
+        Object.prototype.hasOwnProperty.call(response, "value")
+          ? response.value
+          : response;
+
+      console.info("[NVR user state]", {
+        event: "workspace-load-response",
+        workspaceKey: key,
+        responseType: Array.isArray(response)
+          ? "array"
+          : response === null
+            ? "null"
+            : typeof response,
+        responseKeys:
+          response && typeof response === "object"
+            ? Object.keys(response)
+            : [],
+        response,
+        interpretedWorkspacePresent:
+          value !== null && value !== undefined
+      });
+
+      return value === null || value === undefined
+        ? { result: "not-found", value: null }
+        : { result: "loaded", value };
+    });
+  }
+
+  save(key, value) {
+    const hass = this._getHass();
+
+    if (!hass || typeof hass.callWS !== "function") {
+      return Promise.reject(
+        new Error("Home Assistant WebSocket API is unavailable.")
+      );
+    }
+
+    console.info("[NVR user state]", {
+      event: "workspace-save-request",
+      workspaceKey: key,
+      workspace: value
+    });
+
+    return hass.callWS({
+      type: "frontend/set_user_data",
+      key,
+      value
+    }).then(response => {
+      console.info("[NVR user state]", {
+        event: "workspace-save-response",
+        workspaceKey: key,
+        responseType: Array.isArray(response)
+          ? "array"
+          : response === null
+            ? "null"
+            : typeof response,
+        response
+      });
+
+      return hass.callWS({
+        type: "frontend/get_user_data",
+        key
+      }).then(verifyResponse => {
+        const interpretedValue =
+          verifyResponse &&
+          typeof verifyResponse === "object" &&
+          Object.prototype.hasOwnProperty.call(
+            verifyResponse,
+            "value"
+          )
+            ? verifyResponse.value
+            : verifyResponse;
+
+        console.info("[NVR user state]", {
+          event: "workspace-save-verify",
+          workspaceKey: key,
+          responseType: Array.isArray(verifyResponse)
+            ? "array"
+            : verifyResponse === null
+              ? "null"
+              : typeof verifyResponse,
+          responseKeys:
+            verifyResponse && typeof verifyResponse === "object"
+              ? Object.keys(verifyResponse)
+              : [],
+          response: verifyResponse,
+          interpretedWorkspacePresent:
+            interpretedValue !== null &&
+            interpretedValue !== undefined
+        });
+
+        return response;
+      });
+    });
+  }
+}
+
+const NVR_LEGACY_VIEW_STATE_STORE =
   new LocalStorageNvrViewStateStore();
 
 window.dumpNvrFlightRecorder = () => {
@@ -275,13 +397,19 @@ class NVRCard extends HTMLElement {
     this._activeMaximizeMediaSession = null;
     this._frigateProvider = new FrigateProvider();
     this._providerPresentations = new Map();
-    this._viewStateStore = NVR_VIEW_STATE_STORE;
-    this._viewStatePersistenceKey = null;
-    this._viewStateRestoreAttempted = false;
+    this._legacyViewStateStore = NVR_LEGACY_VIEW_STATE_STORE;
+    this._userStateStore = new HomeAssistantUserStateStore(
+      () => this._hass
+    );
+    this._workspace = null;
+    this._workspacePersistenceKey = null;
+    this._workspaceHydration = null;
+    this._workspaceHydrated = false;
+    this._workspaceGeneration = 0;
+    this._workspaceRevision = 0;
     this._restoringViewState = false;
     this._pendingLiveTransition = null;
     this._savedViews = [];
-    this._savedViewsPersistenceKey = null;
     this._savedViewsLoaded = false;
     this._savedViewsMessage = "";
     this._nvrInstanceId =
@@ -585,6 +713,17 @@ class NVRCard extends HTMLElement {
   }
 
 
+  getWorkspacePersistenceKey() {
+    const locationPath =
+      window.location?.pathname || "/";
+
+    return (
+      "nvr-card:workspace:v1:" +
+      encodeURIComponent(locationPath)
+    );
+  }
+
+
   getSavedViewsPersistenceKey() {
     const locationPath =
       window.location?.pathname || "/";
@@ -772,52 +911,8 @@ class NVRCard extends HTMLElement {
   }
 
 
-  loadSavedViews() {
-    this._savedViewsLoaded = true;
-    this._savedViewsPersistenceKey =
-      this.getSavedViewsPersistenceKey();
-
-    const loaded = this._viewStateStore.load(
-      this._savedViewsPersistenceKey
-    );
-    const persistenceKeyHash =
-      this.getLifecycleConfigKey(
-        this._savedViewsPersistenceKey
-      );
-
-    if (loaded.result !== "loaded") {
-      this._savedViews = [];
-      this.logCardLifecycle("saved-views-restore", {
-        attempted: true,
-        result: loaded.result,
-        persistenceKeyHash,
-        savedViewCount: 0
-      });
-      return;
-    }
-
-    const normalized =
-      this.normalizeSavedViewsCollection(loaded.value);
-
-    this._savedViews = normalized.views;
-    this.logCardLifecycle("saved-views-restore", {
-      attempted: true,
-      result: normalized.result,
-      persistenceKeyHash,
-      savedViewCount: this._savedViews.length
-    });
-  }
-
-
-  saveSavedViews(reason) {
-    if (
-      !this._savedViewsLoaded ||
-      !this._savedViewsPersistenceKey
-    ) {
-      return;
-    }
-
-    const collection = {
+  captureSavedViewsCollection() {
+    return {
       version: 1,
       views: this._savedViews.map(view => ({
         id: view.id,
@@ -829,99 +924,327 @@ class NVRCard extends HTMLElement {
             view.state.assignedCameras
           )
             ? [...view.state.assignedCameras]
-            : view.state.assignedCameras,
+            : [],
           maximizedSlot: view.state.maximizedSlot
         }
       }))
     };
-    const result = this._viewStateStore.save(
-      this._savedViewsPersistenceKey,
-      collection
+  }
+
+
+  captureWorkspace() {
+    return {
+      version: 1,
+      viewState: this.captureViewState(),
+      savedViews: this.captureSavedViewsCollection(),
+      preferences: {
+        ...(this._workspace?.preferences ?? {})
+      },
+      customLayouts: {
+        ...(this._workspace?.customLayouts ?? {})
+      }
+    };
+  }
+
+
+  normalizeWorkspace(value) {
+    if (
+      !value ||
+      typeof value !== "object" ||
+      Array.isArray(value) ||
+      value.version !== 1 ||
+      !value.viewState ||
+      !value.savedViews
+    ) {
+      return { result: "invalid", workspace: null };
+    }
+
+    const viewState = this.normalizeViewState(value.viewState);
+    const savedViews =
+      this.normalizeSavedViewsCollection(value.savedViews);
+
+    if (
+      viewState.result === "invalid" ||
+      savedViews.result === "invalid"
+    ) {
+      return { result: "invalid", workspace: null };
+    }
+
+    return {
+      result:
+        viewState.result === "partial" ||
+        savedViews.result === "partial"
+          ? "partial"
+          : "restored",
+      workspace: {
+        version: 1,
+        viewState: viewState.state,
+        savedViews: {
+          version: 1,
+          views: savedViews.views
+        },
+        preferences:
+          value.preferences &&
+          typeof value.preferences === "object" &&
+          !Array.isArray(value.preferences)
+            ? { ...value.preferences }
+            : {},
+        customLayouts:
+          value.customLayouts &&
+          typeof value.customLayouts === "object" &&
+          !Array.isArray(value.customLayouts)
+            ? { ...value.customLayouts }
+            : {}
+      }
+    };
+  }
+
+
+  logUserState(event, details = {}) {
+    console.info("[NVR user state]", { event, ...details });
+  }
+
+
+  hydrateWorkspace() {
+    if (
+      this._workspaceHydration ||
+      this._workspaceHydrated ||
+      !this._normalizedConfigKey ||
+      !this._hass
+    ) {
+      return this._workspaceHydration;
+    }
+
+    const generation = ++this._workspaceGeneration;
+    const startingRevision = this._workspaceRevision;
+    const key = this.getWorkspacePersistenceKey();
+    this._workspacePersistenceKey = key;
+    this.logUserState("workspace-load-start", {
+      workspaceKey: key
+    });
+
+    const hydration = this._userStateStore.load(key).then(loaded => {
+      if (generation !== this._workspaceGeneration) {
+        return;
+      }
+
+      if (loaded.result === "loaded") {
+        const normalized = this.normalizeWorkspace(loaded.value);
+
+        this.logUserState(
+          "workspace-hydration-interpretation",
+          {
+            workspaceKey: key,
+            rawWorkspacePresent: true,
+            normalizedWorkspaceValid:
+              normalized.result !== "invalid",
+            source: "ha-remote"
+          }
+        );
+
+        if (normalized.result === "invalid") {
+          throw new Error("Invalid HA user workspace.");
+        }
+
+        if (startingRevision !== this._workspaceRevision) {
+          this._workspaceHydrated = true;
+          this._workspace = this.captureWorkspace();
+          this.saveWorkspace("state-changed-during-hydration");
+          return;
+        }
+
+        this.applyHydratedWorkspace(normalized.workspace);
+        this._workspaceHydrated = true;
+        this.logUserState("workspace-load-success", {
+          workspaceKey: key,
+          result: normalized.result
+        });
+        return;
+      }
+
+      this.logUserState("workspace-load-missing", {
+        workspaceKey: key
+      });
+      return this.migrateLegacyWorkspace(generation);
+    }).catch(error => {
+      if (generation !== this._workspaceGeneration) {
+        return;
+      }
+
+      this._workspaceHydrated = true;
+      this._workspace = this.captureWorkspace();
+      console.warn("[NVR user state]", {
+        event: "workspace-load-failed",
+        workspaceKey: key,
+        message: error?.message || "Unknown error"
+      });
+    }).finally(() => {
+      if (generation === this._workspaceGeneration) {
+        this._workspaceHydration = null;
+      }
+    });
+
+    this._workspaceHydration = hydration;
+    return hydration;
+  }
+
+
+  migrateLegacyWorkspace(generation) {
+    this.logUserState("workspace-migration-start");
+    const legacyView = this._legacyViewStateStore.load(
+      this.getViewStatePersistenceKey()
+    );
+    const legacySavedViews = this._legacyViewStateStore.load(
+      this.getSavedViewsPersistenceKey()
+    );
+    const normalizedView = legacyView.result === "loaded"
+      ? this.normalizeViewState(legacyView.value)
+      : null;
+    const normalizedSaved = legacySavedViews.result === "loaded"
+      ? this.normalizeSavedViewsCollection(legacySavedViews.value)
+      : null;
+    const hasLegacyView =
+      normalizedView && normalizedView.result !== "invalid";
+    const hasLegacySaved =
+      normalizedSaved && normalizedSaved.result !== "invalid";
+    const workspace = {
+      version: 1,
+      viewState: hasLegacyView
+        ? normalizedView.state
+        : this.captureViewState(),
+      savedViews: {
+        version: 1,
+        views: hasLegacySaved ? normalizedSaved.views : []
+      },
+      preferences: {},
+      customLayouts: {}
+    };
+
+    this.logUserState(
+      "workspace-hydration-interpretation",
+      {
+        workspaceKey: this._workspacePersistenceKey,
+        rawWorkspacePresent: false,
+        normalizedWorkspaceValid: true,
+        source:
+          hasLegacyView || hasLegacySaved
+            ? "legacy-migration"
+            : "default"
+      }
     );
 
-    this.logCardLifecycle("saved-views-save", {
-      reason,
-      result,
-      persistenceKeyHash:
-        this.getLifecycleConfigKey(
-          this._savedViewsPersistenceKey
-        ),
-      savedViewCount: this._savedViews.length
+    this.applyHydratedWorkspace(workspace);
+    this._workspaceHydrated = true;
+
+    if (!hasLegacyView && !hasLegacySaved) {
+      return;
+    }
+
+    return this._userStateStore.save(
+      this._workspacePersistenceKey,
+      this.captureWorkspace()
+    ).then(() => {
+      if (generation === this._workspaceGeneration) {
+        this.logUserState("workspace-migration-success");
+      }
+    }).catch(error => {
+      console.warn("[NVR user state]", {
+        event: "workspace-save-failed",
+        workspaceKey: this._workspacePersistenceKey,
+        message: error?.message || "Unknown error"
+      });
     });
   }
 
 
-  loadViewState() {
-    this._viewStateRestoreAttempted = true;
-    this._viewStatePersistenceKey =
-      this.getViewStatePersistenceKey();
+  applyHydratedWorkspace(workspace) {
+    const state = workspace.viewState;
+    const previousAssignments = [...this._assignedCameras];
+    this._workspace = workspace;
 
-    const loaded = this._viewStateStore.load(
-      this._viewStatePersistenceKey
-    );
-    const persistenceKeyHash =
-      this.getLifecycleConfigKey(
-        this._viewStatePersistenceKey
-      );
+    this._restoringViewState = true;
+    try {
+      if (this._maximizedSlot !== null) {
+        this.restoreMaximizedCamera();
+      }
 
-    if (loaded.result !== "loaded") {
-      this.logCardLifecycle("persistence-restore", {
-        attempted: true,
-        result: loaded.result,
-        persistenceKeyHash
+      this._layout = state.layout;
+      this._assignedCameras = state.assignedCameras;
+      this._savedViews = workspace.savedViews.views;
+      this._savedViewsLoaded = true;
+      this.applyLayout();
+
+      this._assignedCameras.forEach((cameraName, slot) => {
+        if (cameraName !== previousAssignments[slot]) {
+          this.renderSlot(slot);
+        }
       });
-      return null;
+
+      this.updateSelectedButton();
+      this.updateCameraListState();
+      this.renderSavedViewsList();
+
+      if (state.maximizedSlot !== null) {
+        this.maximizeCameraSlot(state.maximizedSlot);
+      } else {
+        this.scheduleCameraFit();
+      }
+    } finally {
+      this._restoringViewState = false;
     }
 
-    const normalized =
-      this.normalizeViewState(loaded.value);
-
-    this._layout = normalized.state.layout;
-    this._assignedCameras =
-      normalized.state.assignedCameras;
-
-    this.logCardLifecycle("persistence-restore", {
-      attempted: true,
-      result: normalized.result,
-      persistenceKeyHash,
-      layout: normalized.state.layout,
+    this._workspace = this.captureWorkspace();
+    this.logUserState("workspace-hydration-applied", {
+      workspaceKey: this._workspacePersistenceKey,
+      layout: this._layout,
       assignedCameraCount:
-        normalized.state.assignedCameras.filter(Boolean).length,
-      maximizedSlot: normalized.state.maximizedSlot
+        this._assignedCameras.filter(Boolean).length,
+      savedViewCount: this._savedViews.length,
+      maximizedSlot: this._maximizedSlot
     });
+  }
 
-    return normalized.result === "invalid"
-      ? null
-      : normalized.state;
+
+  saveSavedViews(reason) {
+    this.saveWorkspace(reason);
   }
 
 
   saveViewState(reason) {
+    this.saveWorkspace(reason);
+  }
+
+
+  saveWorkspace(reason) {
+    if (!this._restoringViewState) {
+      this._workspaceRevision += 1;
+    }
+
     if (
       this._restoringViewState ||
-      !this._viewStateRestoreAttempted ||
-      !this._viewStatePersistenceKey
+      !this._workspaceHydrated ||
+      !this._workspacePersistenceKey
     ) {
       return;
     }
 
-    const state = this.captureViewState();
-    const result = this._viewStateStore.save(
-      this._viewStatePersistenceKey,
-      state
-    );
-
-    this.logCardLifecycle("persistence-save", {
-      reason,
-      result,
-      persistenceKeyHash:
-        this.getLifecycleConfigKey(
-          this._viewStatePersistenceKey
-        ),
-      layout: state.layout,
-      assignedCameraCount:
-        state.assignedCameras.filter(Boolean).length,
-      maximizedSlot: state.maximizedSlot
+    const workspace = this.captureWorkspace();
+    this._workspace = workspace;
+    this._userStateStore.save(
+      this._workspacePersistenceKey,
+      workspace
+    ).then(() => {
+      this.logUserState("workspace-save-success", {
+        workspaceKey: this._workspacePersistenceKey,
+        reason
+      });
+    }).catch(error => {
+      console.warn("[NVR user state]", {
+        event: "workspace-save-failed",
+        workspaceKey: this._workspacePersistenceKey,
+        reason,
+        message: error?.message || "Unknown error"
+      });
     });
   }
 
@@ -1189,20 +1512,8 @@ class NVRCard extends HTMLElement {
     this._normalizedConfigKey =
       normalizedConfigKey;
 
-    const restoredState =
-      this._viewStateRestoreAttempted
-        ? null
-        : this.loadViewState();
-
-    if (!this._savedViewsLoaded) {
-      this.loadSavedViews();
-    }
-
     this.render(reason);
-
-    if (restoredState) {
-      this.reconcileRestoredViewState(restoredState);
-    }
+    this.hydrateWorkspace();
   }
 
 
@@ -1386,6 +1697,7 @@ class NVRCard extends HTMLElement {
     this._hass = hass;
     this.updateLiveStreams();
     this.updateCameraStatuses();
+    this.hydrateWorkspace();
   }
 
 
