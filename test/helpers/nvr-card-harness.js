@@ -14,7 +14,8 @@ export const defaultCameras = [
 ];
 
 export function createTestHarness({
-  useHaHuiImageExperiment = true
+  useHaHuiImageExperiment = true,
+  liveTransitionDiagnostics = false
 } = {}) {
   const window = new Window({
     url: "http://localhost/",
@@ -235,6 +236,10 @@ export function createTestHarness({
     .replace(
       "const USE_HA_HUI_IMAGE_EXPERIMENT = true;",
       `const USE_HA_HUI_IMAGE_EXPERIMENT = ${useHaHuiImageExperiment};`
+    )
+    .replace(
+      "const NVR_LIVE_TRANSITION_DIAGNOSTICS = true;",
+      `const NVR_LIVE_TRANSITION_DIAGNOSTICS = ${liveTransitionDiagnostics};`
     );
   window.eval(cardSource);
 

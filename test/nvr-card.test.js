@@ -343,7 +343,10 @@ test("restored maximize uses the normal hui-image maximize source path", t => {
   const restoredImage = harness.getPlayer(replacement, "Garage");
 
   assert.equal(replacement._maximizedSlot, 0);
-  assert.equal(restoredImage.cameraImage, "camera.garage");
+  assert.equal(
+    restoredImage.cameraImage,
+    "camera.garage_garage_camera_lorex_mediaprofile_channel1_mainstream"
+  );
   assert.strictEqual(
     harness.getLogicalCell(replacement, 0)
       .querySelector("hui-image.nvr-live-camera"),
@@ -646,7 +649,7 @@ test("named views preserve independent exact snapshots and load into LAST VIEW",
   assert.equal(card._maximizedSlot, 4);
   assert.equal(
     harness.getPlayer(card, "Garage").cameraImage,
-    "camera.garage"
+    "camera.garage_garage_camera_lorex_mediaprofile_channel1_mainstream"
   );
 
   const lastViewAfterLoad = JSON.parse(
@@ -2345,6 +2348,19 @@ test("HA hui-image experiment renders all 11 cameras without provider media or d
     ["camera.fireplace", "camera.lorex_mediaprofile_channel1_substream1_8"],
     ["camera.patio_roof", "camera.lorex_mediaprofile_channel1_substream1_7"]
   ]);
+  const mainstreamEntities = new Map([
+    ["camera.garage", "camera.garage_garage_camera_lorex_mediaprofile_channel1_mainstream"],
+    ["camera.front_door", "camera.frontyard_front_door_camera_lorex_mediaprofile_channel1_mainstream"],
+    ["camera.front_entry", "camera.frontyard_front_entry_camera_mediaprofile_channel1_mainstream"],
+    ["camera.drive_up", "camera.frontyard_drive_up_camera_lorex_mediaprofile_channel1_mainstream"],
+    ["camera.drive_down", "camera.frontyard_drive_down_camera_lorex_mediaprofile_channel1_mainstream"],
+    ["camera.side_gate", "camera.backyard_side_gate_camera_lorex_mediaprofile_channel1_mainstream"],
+    ["camera.ac", "camera.backyard_ac_camera_lorex_mediaprofile_channel1_mainstream"],
+    ["camera.patio", "camera.backyard_patio_camera_lorex_mediaprofile_channel1_mainstream"],
+    ["camera.backyard", "camera.backyard_backyard_camera_lorex_mediaprofile_channel1_mainstream"],
+    ["camera.fireplace", "camera.backyard_fireplace_camera_lorex_mediaprofile_channel1_mainstream"],
+    ["camera.patio_roof", "camera.backyard_patio_roof_camera_lorex_mediaprofile_channel1_mainstream"]
+  ]);
   const cameras = [...substreamEntities.keys()].map((entity, index) => ({
     name: `Camera ${index + 1}`,
     entity,
@@ -2404,6 +2420,25 @@ test("HA hui-image experiment renders all 11 cameras without provider media or d
 
   assertSingleHaPresentationPerCamera();
 
+  cameras.forEach(camera => {
+    const image = harness.getPlayer(card, camera.name);
+    const slot = card._assignedCameras.indexOf(camera.name);
+
+    card.maximizeCameraSlot(slot);
+    assert.strictEqual(harness.getPlayer(card, camera.name), image);
+    assert.equal(
+      image.cameraImage,
+      mainstreamEntities.get(camera.entity)
+    );
+    assert.notEqual(image.cameraImage, camera.entity);
+    card.restoreMaximizedCamera();
+    assert.strictEqual(harness.getPlayer(card, camera.name), image);
+    assert.equal(
+      image.cameraImage,
+      substreamEntities.get(camera.entity)
+    );
+  });
+
   const moved = identities.get("Camera 1");
   card.moveCameraBetweenSlots(0, 11);
   harness.flushAnimationFrames();
@@ -2413,7 +2448,10 @@ test("HA hui-image experiment renders all 11 cameras without provider media or d
   card.maximizeCameraSlot(11);
   harness.flushAnimationFrames();
   assert.strictEqual(harness.getPlayer(card, "Camera 1"), moved.player);
-  assert.equal(moved.player.cameraImage, "camera.garage");
+  assert.equal(
+    moved.player.cameraImage,
+    mainstreamEntities.get("camera.garage")
+  );
   card.restoreMaximizedCamera();
   harness.flushAnimationFrames();
   assert.strictEqual(harness.getPlayer(card, "Camera 1"), moved.player);
@@ -2431,6 +2469,200 @@ test("HA hui-image experiment renders all 11 cameras without provider media or d
     card,
     cameras.map(camera => camera.name),
     identities
+  );
+});
+
+test("live-transition diagnostics document the ONVIF Main maximize source without rebuilding", t => {
+  const harness = setup(t, {
+    liveTransitionDiagnostics: true
+  });
+  const card = harness.createCard({
+    cameras: [{
+      name: "Garage",
+      entity: "camera.garage",
+      active: true
+    }]
+  });
+
+  card.assignCamera("Garage");
+  const image = harness.getPlayer(card, "Garage");
+  const cell = image.closest(".video-cell");
+  const sidebar = card.querySelector(".nvr-sidebar");
+  const events = [];
+  const originalInfo = harness.window.console.info;
+
+  harness.window.console.info = (prefix, payload) => {
+    if (prefix === "[NVR live transition]") {
+      events.push(payload);
+    }
+  };
+  t.after(() => {
+    harness.window.console.info = originalInfo;
+  });
+
+  assert.equal(
+    card.classifyLivePresentationEntity(image.cameraImage),
+    "ONVIF_SUB1"
+  );
+  card.render = () => {
+    throw new Error("maximize diagnostics must not render");
+  };
+
+  card.maximizeCameraSlot(0);
+
+  assert.strictEqual(harness.getPlayer(card, "Garage"), image);
+  assert.strictEqual(image.closest(".video-cell"), cell);
+  assert.strictEqual(card.querySelector(".nvr-sidebar"), sidebar);
+  assert.equal(
+    image.cameraImage,
+    "camera.garage_garage_camera_lorex_mediaprofile_channel1_mainstream"
+  );
+  assert.equal(
+    card.classifyLivePresentationEntity(image.cameraImage),
+    "ONVIF_MAIN"
+  );
+  assert.deepEqual(
+    events.map(event => event.event),
+    [
+      "maximize-requested",
+      "source-selected",
+      "source-properties-changed",
+      "source-property-confirmed",
+      "media-signal-unavailable"
+    ]
+  );
+  events.forEach(event => {
+    assert.equal(event.camera, "Garage");
+    assert.equal(event.slot, 0);
+    assert.equal(
+      event.fromEntity,
+      "camera.lorex_mediaprofile_channel1_substream1_3"
+    );
+    assert.equal(
+      event.toEntity,
+      "camera.garage_garage_camera_lorex_mediaprofile_channel1_mainstream"
+    );
+    assert.equal(event.presentationState, "maximize");
+    assert.equal(event.fromSourceType, "ONVIF_SUB1");
+    assert.equal(event.toSourceType, "ONVIF_MAIN");
+    assert.equal(event.sourceType, "ONVIF_MAIN");
+    assert.equal(typeof event.timeMs, "number");
+    assert.equal(typeof event.elapsedMs, "number");
+  });
+
+  events.length = 0;
+  card.restoreMaximizedCamera();
+  assert.strictEqual(harness.getPlayer(card, "Garage"), image);
+  assert.equal(
+    image.cameraImage,
+    "camera.lorex_mediaprofile_channel1_substream1_3"
+  );
+  assert.equal(events[0].event, "restore-requested");
+  events.forEach(event => {
+    assert.equal(event.fromSourceType, "ONVIF_MAIN");
+    assert.equal(event.toSourceType, "ONVIF_SUB1");
+    assert.equal(event.sourceType, "ONVIF_SUB1");
+  });
+});
+
+test("ONVIF registry discovery pairs profiles only by authoritative registry identity", async t => {
+  const harness = setup(t);
+  const calls = [];
+  const registry = [
+    {
+      entity_id:
+        "camera.lorex_mediaprofile_channel1_substream1_3",
+      platform: "onvif",
+      device_id: "garage-device",
+      config_entry_id: "garage-entry",
+      original_name: "Garage MediaProfile_Channel1_SubStream1"
+    },
+    {
+      entity_id: "camera.garage_onvif_main",
+      platform: "onvif",
+      device_id: "garage-device",
+      config_entry_id: "garage-entry",
+      original_name: "Garage MediaProfile_Channel1_MainStream"
+    },
+    {
+      entity_id: "camera.front_door_similar_main",
+      platform: "onvif",
+      device_id: "unrelated-device",
+      config_entry_id: "unrelated-entry",
+      original_name: "Garage MediaProfile_Channel1_MainStream"
+    },
+    {
+      entity_id:
+        "camera.lorex_mediaprofile_channel1_substream1_9",
+      platform: "onvif",
+      device_id: "front-door-device",
+      config_entry_id: "front-door-entry",
+      original_name:
+        "Front Door MediaProfile_Channel1_SubStream1"
+    }
+  ];
+  const hass = {
+    states: {},
+    async callWS(message) {
+      calls.push(message);
+      return registry;
+    }
+  };
+  const card = harness.createCard({
+    cameras: [
+      { name: "Garage", entity: "camera.garage", active: true },
+      {
+        name: "Front Door",
+        entity: "camera.front_door",
+        active: true
+      }
+    ],
+    hass
+  });
+  card.assignCamera("Garage");
+  card.assignCamera("Front Door");
+  const imagesBefore = [
+    ...card.querySelectorAll("hui-image.nvr-live-camera")
+  ];
+  const sourcesBefore = imagesBefore.map(image => image.cameraImage);
+  const originalInfo = harness.window.console.info;
+
+  harness.window.console.info = () => {};
+  t.after(() => {
+    harness.window.console.info = originalInfo;
+  });
+  card.render = () => {
+    throw new Error("registry discovery must not render");
+  };
+
+  const mappings = await card.discoverOnvifProfileMappings();
+  const garage = mappings.find(mapping => {
+    return mapping.frigateEntity === "camera.garage";
+  });
+  const frontDoor = mappings.find(mapping => {
+    return mapping.frigateEntity === "camera.front_door";
+  });
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].type, "config/entity_registry/list");
+  assert.equal(garage.mainEntity, "camera.garage_onvif_main");
+  assert.equal(garage.confidence, "authoritative");
+  assert.equal(frontDoor.mainEntity, null);
+  assert.equal(frontDoor.confidence, "unresolved");
+  assert.equal(
+    mappings.some(mapping => {
+      return mapping.mainEntity ===
+        "camera.front_door_similar_main";
+    }),
+    false
+  );
+  const imagesAfter = [
+    ...card.querySelectorAll("hui-image.nvr-live-camera")
+  ];
+  assert.deepEqual(imagesAfter, imagesBefore);
+  assert.deepEqual(
+    imagesAfter.map(image => image.cameraImage),
+    sourcesBefore
   );
 });
 
