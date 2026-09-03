@@ -155,6 +155,11 @@ test("initial render creates 16 persistent cells with unique logical slots", t =
     4
   );
   assert.equal(card.querySelectorAll(".camera-frame").length, 0);
+  assert.deepEqual(Array.from(card._savedViews), []);
+  assert.equal(
+    card.querySelector(".saved-views-list")?.textContent.trim(),
+    "No saved views"
+  );
 });
 
 test("card lifecycle diagnostics distinguish instances and config paths without changing state", t => {
@@ -398,6 +403,80 @@ test("stale view state keeps valid slots, drops missing cameras, and clears inva
   );
 });
 
+test("view-state normalization adapts shorter and longer data to current capacity", t => {
+  const harness = setup(t);
+  const seed = harness.window.document.createElement("nvr-card");
+  const key = seed.getViewStatePersistenceKey();
+
+  harness.window.localStorage.setItem(key, JSON.stringify({
+    version: 1,
+    layout: "2x2",
+    assignedCameras: ["camera.front", null],
+    maximizedSlot: null
+  }));
+
+  const shorter = harness.createCard({ logicalCapacity: 4 });
+
+  assert.deepEqual(assignments(shorter), [
+    "Front", null, null, null
+  ]);
+  assert.equal(shorter.captureViewState().assignedCameras.length, 4);
+  assert.deepEqual(
+    Array.from(
+      shorter.saveCurrentViewAs("Four Slots")
+        .state.assignedCameras
+    ),
+    ["camera.front", null, null, null]
+  );
+
+  harness.window.localStorage.setItem(key, JSON.stringify({
+    version: 1,
+    layout: "2x2",
+    assignedCameras: [
+      "camera.front",
+      null,
+      "camera.garage",
+      "camera.hall",
+      "camera.patio"
+    ],
+    maximizedSlot: 4
+  }));
+
+  const longer = harness.createCard({ logicalCapacity: 4 });
+
+  assert.deepEqual(assignments(longer), [
+    "Front", null, "Garage", "Hall"
+  ]);
+  assert.equal(longer._maximizedSlot, null);
+});
+
+test("saved-view load reconciles only changed slots at current capacity", t => {
+  const harness = setup(t);
+  const card = harness.createCard({ logicalCapacity: 4 });
+
+  card.assignCameraToSlot("Front", 0);
+  card.assignCameraToSlot("Garage", 1);
+  const saved = card.saveCurrentViewAs("Four Slots");
+  const frontPlayer = harness.getPlayer(card, "Front");
+  const sidebar = card.querySelector(".nvr-sidebar");
+
+  card.removeCameraFromSlot(1);
+  card.assignCameraToSlot("Hall", 1);
+
+  const renderedSlots = [];
+  const renderSlot = card.renderSlot.bind(card);
+  card.renderSlot = slot => {
+    renderedSlots.push(slot);
+    renderSlot(slot);
+  };
+
+  assert.equal(card.loadSavedView(saved.id), true);
+  assert.deepEqual(renderedSlots, [1]);
+  assert.strictEqual(harness.getPlayer(card, "Front"), frontPlayer);
+  assert.strictEqual(card.querySelector(".nvr-sidebar"), sidebar);
+  assert.equal(card._assignedCameras.length, 4);
+});
+
 test("malformed persisted state falls back safely", t => {
   const harness = setup(t);
   const card = harness.window.document.createElement("nvr-card");
@@ -459,6 +538,12 @@ test("card view-state logic accepts a replaceable persistence adapter", t => {
   const store = {
     load(key) {
       loads.push(key);
+      if (key.includes(":saved-views:")) {
+        return {
+          result: "not-found",
+          value: null
+        };
+      }
       return {
         result: "loaded",
         value: {
@@ -489,7 +574,7 @@ test("card view-state logic accepts a replaceable persistence adapter", t => {
   harness.window.document.body.appendChild(card);
   card.setConfig({ cameras });
 
-  assert.equal(loads.length, 1);
+  assert.equal(loads.length, 2);
   assert.equal(card._layout, "3x3");
   assert.equal(card._assignedCameras[2], "Hall");
   assert.equal(
@@ -508,6 +593,274 @@ test("card view-state logic accepts a replaceable persistence adapter", t => {
     assignedCameras: new Array(16).fill(null),
     maximizedSlot: null
   });
+
+  const savedView = card.saveCurrentViewAs("Adapter View");
+
+  assert.equal(savedView.id, "view-1");
+  assert.equal(saves.length, 2);
+  assert.ok(saves[1].key.includes(":saved-views:"));
+  assert.deepEqual(JSON.parse(JSON.stringify(saves[1].state)), {
+    version: 1,
+    views: [{
+      id: "view-1",
+      name: "Adapter View",
+      state: {
+        version: 1,
+        layout: "3x3",
+        assignedCameras: new Array(16).fill(null),
+        maximizedSlot: null
+      }
+    }]
+  });
+});
+
+test("named views preserve independent exact snapshots and load into LAST VIEW", t => {
+  const harness = setup(t);
+  const card = harness.createCard();
+
+  card.selectLayout("3x3");
+  card.assignCameraToSlot("Front", 0);
+  card.assignCameraToSlot("Garage", 4);
+  card.maximizeCameraSlot(4);
+
+  const frontYard = card.saveCurrentViewAs("  Front Yard  ");
+  const frontYardSnapshot = JSON.stringify(frontYard.state);
+
+  card.restoreMaximizedCamera();
+  card.removeCameraFromSlot(0);
+  card.selectLayout("4x4");
+  card.assignCameraToSlot("Patio", 6);
+  const wideGrid = card.saveCurrentViewAs("Wide Grid");
+
+  assert.equal(frontYard.name, "Front Yard");
+  assert.equal(frontYard.id, "view-1");
+  assert.equal(wideGrid.id, "view-2");
+  assert.notDeepEqual(frontYard.state, wideGrid.state);
+  assert.equal(JSON.stringify(frontYard.state), frontYardSnapshot);
+
+  assert.equal(card.loadSavedView(frontYard.id), true);
+  assert.equal(card._layout, "3x3");
+  assert.equal(card._assignedCameras[0], "Front");
+  assert.equal(card._assignedCameras[4], "Garage");
+  assert.equal(card._assignedCameras[1], null);
+  assert.equal(card._maximizedSlot, 4);
+  assert.equal(
+    harness.getPlayer(card, "Garage").cameraImage,
+    "camera.garage"
+  );
+
+  const lastViewAfterLoad = JSON.parse(
+    harness.window.localStorage.getItem(
+      card.getViewStatePersistenceKey()
+    )
+  );
+  assert.deepEqual(
+    lastViewAfterLoad,
+    JSON.parse(JSON.stringify(frontYard.state))
+  );
+
+  const replacement = harness.createCard();
+
+  assert.equal(replacement._layout, "3x3");
+  assert.equal(replacement._assignedCameras[0], "Front");
+  assert.equal(replacement._assignedCameras[4], "Garage");
+  assert.equal(replacement._maximizedSlot, 4);
+  assert.deepEqual(
+    Array.from(replacement._savedViews, view => view.name),
+    ["Front Yard", "Wide Grid"]
+  );
+
+  const savedCollection = JSON.parse(
+    harness.window.localStorage.getItem(
+      replacement.getSavedViewsPersistenceKey()
+    )
+  );
+  assert.deepEqual(
+    savedCollection.views.map(view => view.id),
+    ["view-1", "view-2"]
+  );
+
+  const stableState = JSON.stringify(
+    replacement._savedViews[0].state
+  );
+  assert.equal(
+    replacement.renameSavedView(frontYard.id, "Entry Focus"),
+    true
+  );
+  assert.equal(replacement._savedViews[0].id, frontYard.id);
+  assert.equal(
+    JSON.stringify(replacement._savedViews[0].state),
+    stableState
+  );
+
+  replacement.loadSavedView(wideGrid.id);
+  replacement.assignCameraToSlot("Hall", 8);
+  assert.equal(replacement.overwriteSavedView(wideGrid.id), true);
+  assert.equal(
+    JSON.stringify(replacement._savedViews[0].state),
+    stableState
+  );
+  assert.equal(
+    replacement._savedViews[1].state.assignedCameras[8],
+    "camera.hall"
+  );
+
+  const lastViewBeforeDelete =
+    harness.window.localStorage.getItem(
+      replacement.getViewStatePersistenceKey()
+    );
+  assert.equal(replacement.deleteSavedView(frontYard.id), true);
+  assert.deepEqual(
+    Array.from(replacement._savedViews, view => view.id),
+    [wideGrid.id]
+  );
+  assert.equal(
+    harness.window.localStorage.getItem(
+      replacement.getViewStatePersistenceKey()
+    ),
+    lastViewBeforeDelete
+  );
+});
+
+test("saved-view names reject empty and case-insensitive duplicates", t => {
+  const harness = setup(t);
+  const card = harness.createCard();
+
+  assert.equal(card.saveCurrentViewAs("   "), null);
+  const first = card.saveCurrentViewAs("Front Yard");
+  assert.ok(first);
+  assert.equal(card.saveCurrentViewAs(" front yard "), null);
+  assert.equal(card._savedViews.length, 1);
+  assert.equal(card.renameSavedView(first.id, "   "), false);
+
+  const second = card.saveCurrentViewAs("Back Yard");
+  assert.ok(second);
+  assert.equal(
+    card.renameSavedView(second.id, "FRONT YARD"),
+    false
+  );
+  assert.equal(second.name, "Back Yard");
+});
+
+test("saved-view controls create and load through the existing VIEWS section", t => {
+  const harness = setup(t);
+  const card = harness.createCard();
+
+  card.selectLayout("3x3");
+  card.assignCameraToSlot("Garage", 4);
+  harness.window.prompt = () => "Garage View";
+  card.querySelector(".saved-view-save-current").click();
+
+  assert.equal(card._savedViews.length, 1);
+  assert.equal(
+    card.querySelector(".saved-view-load")?.textContent,
+    "Garage View"
+  );
+
+  card.selectLayout("2x2");
+  card.querySelector(".saved-view-load").click();
+
+  assert.equal(card._layout, "3x3");
+  assert.equal(card._assignedCameras[4], "Garage");
+});
+
+test("saved-view actions preserve the sidebar container", t => {
+  const harness = setup(t);
+  const card = harness.createCard();
+  const sidebar = card.querySelector(".nvr-sidebar");
+
+  harness.window.prompt = () => "Garage View";
+  card.querySelector(".saved-view-save-current").click();
+  assert.equal(card.querySelector(".nvr-sidebar"), sidebar);
+
+  harness.window.confirm = () => true;
+  card.querySelector(
+    '[data-saved-view-action="overwrite"]'
+  ).click();
+  assert.equal(card.querySelector(".nvr-sidebar"), sidebar);
+
+  harness.window.prompt = () => "Renamed View";
+  card.querySelector(
+    '[data-saved-view-action="rename"]'
+  ).click();
+  assert.equal(card.querySelector(".nvr-sidebar"), sidebar);
+
+  card.selectLayout("3x3");
+  card.querySelector(
+    '[data-saved-view-action="load"]'
+  ).click();
+  assert.equal(card.querySelector(".nvr-sidebar"), sidebar);
+
+  card.querySelector(
+    '[data-saved-view-action="delete"]'
+  ).click();
+  assert.equal(card.querySelector(".nvr-sidebar"), sidebar);
+});
+
+test("loading stale saved state preserves slots and clears invalid maximize", t => {
+  const harness = setup(t);
+  const seed = harness.window.document.createElement("nvr-card");
+  const key = seed.getSavedViewsPersistenceKey();
+
+  harness.window.localStorage.setItem(key, JSON.stringify({
+    version: 1,
+    views: [{
+      id: "view-7",
+      name: "Old View",
+      state: {
+        version: 1,
+        layout: "3x3",
+        assignedCameras: [
+          "camera.front", null, "camera.missing", null,
+          "camera.hall", null, null, null, null,
+          null, null, null, null, null, null, null
+        ],
+        maximizedSlot: 2
+      }
+    }]
+  }));
+
+  const card = harness.createCard();
+
+  assert.equal(card.loadSavedView("view-7"), true);
+  assert.equal(card._layout, "3x3");
+  assert.equal(card._assignedCameras[0], "Front");
+  assert.equal(card._assignedCameras[2], null);
+  assert.equal(card._assignedCameras[4], "Hall");
+  assert.equal(card._maximizedSlot, null);
+  assert.equal(
+    harness.getLogicalCell(card, 2)
+      .querySelector(".camera-frame"),
+    null
+  );
+  assert.equal(
+    harness.getLogicalCell(card, 4)
+      .querySelector(".cell-camera-name")?.textContent,
+    "Hall"
+  );
+});
+
+test("malformed saved-view storage does not affect LAST VIEW restoration", t => {
+  const harness = setup(t);
+  const oldCard = harness.createCard();
+
+  oldCard.selectLayout("3x3");
+  oldCard.assignCameraToSlot("Garage", 4);
+  harness.window.localStorage.setItem(
+    oldCard.getSavedViewsPersistenceKey(),
+    "{malformed"
+  );
+
+  const replacement = harness.createCard();
+
+  assert.equal(replacement._layout, "3x3");
+  assert.equal(replacement._assignedCameras[4], "Garage");
+  assert.deepEqual(Array.from(replacement._savedViews), []);
+  assert.equal(
+    replacement.querySelector(".saved-views-list")
+      ?.textContent.trim(),
+    "No saved views"
+  );
 });
 
 test("title keeps the build identifier adjacent and omits Clear Grid", t => {

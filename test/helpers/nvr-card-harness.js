@@ -302,9 +302,16 @@ export function createTestHarness({
   function createCard({
     cameras = defaultCameras,
     hass = createHass(cameras),
-    shellWidth = 1280
+    shellWidth = 1280,
+    logicalCapacity = null
   } = {}) {
     const card = window.document.createElement("nvr-card");
+
+    if (logicalCapacity !== null) {
+      card._assignedCameras =
+        new Array(logicalCapacity).fill(null);
+    }
+
     window.document.body.appendChild(card);
     card.setConfig({ cameras });
     card.hass = hass;

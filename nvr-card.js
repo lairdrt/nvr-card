@@ -6,6 +6,7 @@ import { FrigateProvider } from "./src/providers/frigate-provider.js";
 
 const NVR_BUILD = "__NVR_BUILD__";
 const USE_HA_HUI_IMAGE_EXPERIMENT = true;
+const NVR_GRID_SLOT_CAPACITY = 16;
 const HA_HUI_IMAGE_SUBSTREAM_ENTITIES = Object.freeze({
   "camera.garage":
     "camera.lorex_mediaprofile_channel1_substream1_3",
@@ -236,12 +237,11 @@ class NVRCard extends HTMLElement {
       16 / 9;
 
     /*
-     * Fixed 16-slot assignment array.
-     *
+     * Assignment capacity follows the current physical grid.
      * Layout switching does NOT recreate the slot DOM.
      */
     this._assignedCameras =
-      new Array(16).fill(null);
+      new Array(NVR_GRID_SLOT_CAPACITY).fill(null);
 
     this._resizeObserver = null;
     this._cameraFitFrame = null;
@@ -254,6 +254,10 @@ class NVRCard extends HTMLElement {
     this._viewStatePersistenceKey = null;
     this._viewStateRestoreAttempted = false;
     this._restoringViewState = false;
+    this._savedViews = [];
+    this._savedViewsPersistenceKey = null;
+    this._savedViewsLoaded = false;
+    this._savedViewsMessage = "";
     this._nvrInstanceId =
       NVR_FLIGHT_RECORDER_STATE.nextInstanceId++;
     this._nvrVisibilityHandler = () => {
@@ -309,7 +313,7 @@ class NVRCard extends HTMLElement {
         columns: "repeat(4, 1fr)",
         rows: "repeat(4, 1fr)",
         cells: Array.from(
-          { length: 16 },
+          { length: NVR_GRID_SLOT_CAPACITY },
           (_, i) => ({ slot: i })
         )
       },
@@ -555,6 +559,17 @@ class NVRCard extends HTMLElement {
   }
 
 
+  getSavedViewsPersistenceKey() {
+    const locationPath =
+      window.location?.pathname || "/";
+
+    return (
+      "nvr-card:saved-views:v1:anonymous:" +
+      encodeURIComponent(locationPath)
+    );
+  }
+
+
   captureViewState() {
     return {
       version: 1,
@@ -571,11 +586,17 @@ class NVRCard extends HTMLElement {
   }
 
 
+  getLogicalSlotCapacity() {
+    return this._assignedCameras.length;
+  }
+
+
   normalizeViewState(value) {
+    const slotCapacity = this.getLogicalSlotCapacity();
     const defaults = {
       version: 1,
       layout: "2x2",
-      assignedCameras: new Array(16).fill(null),
+      assignedCameras: new Array(slotCapacity).fill(null),
       maximizedSlot: null
     };
 
@@ -611,12 +632,12 @@ class NVRCard extends HTMLElement {
     if (!Array.isArray(value.assignedCameras)) {
       partial = true;
     } else {
-      if (value.assignedCameras.length !== 16) {
+      if (value.assignedCameras.length !== slotCapacity) {
         partial = true;
       }
 
       state.assignedCameras = Array.from(
-        { length: 16 },
+        { length: slotCapacity },
         (_, slot) => {
           const entity = value.assignedCameras[slot];
 
@@ -642,13 +663,15 @@ class NVRCard extends HTMLElement {
     if (value.maximizedSlot !== null) {
       const maximizedSlot = value.maximizedSlot;
       const visibleSlots = new Set(
-        this.layouts[state.layout].cells.map(cell => cell.slot)
+        this.layouts[state.layout].cells
+          .map(cell => cell.slot)
+          .filter(slot => slot < slotCapacity)
       );
 
       if (
         Number.isInteger(maximizedSlot) &&
         maximizedSlot >= 0 &&
-        maximizedSlot < 16 &&
+        maximizedSlot < slotCapacity &&
         state.assignedCameras[maximizedSlot] !== null &&
         visibleSlots.has(maximizedSlot)
       ) {
@@ -662,6 +685,143 @@ class NVRCard extends HTMLElement {
       result: partial ? "partial" : "restored",
       state
     };
+  }
+
+
+  normalizeSavedViewsCollection(value) {
+    if (
+      !value ||
+      typeof value !== "object" ||
+      Array.isArray(value) ||
+      value.version !== 1 ||
+      !Array.isArray(value.views)
+    ) {
+      return {
+        result: "invalid",
+        views: []
+      };
+    }
+
+    let partial = false;
+    const ids = new Set();
+    const names = new Set();
+    const views = [];
+
+    value.views.forEach(view => {
+      const name = typeof view?.name === "string"
+        ? view.name.trim()
+        : "";
+      const comparableName = name.toLocaleLowerCase();
+
+      if (
+        !view ||
+        typeof view !== "object" ||
+        Array.isArray(view) ||
+        typeof view.id !== "string" ||
+        view.id.length === 0 ||
+        name.length === 0 ||
+        !view.state ||
+        typeof view.state !== "object" ||
+        Array.isArray(view.state) ||
+        ids.has(view.id) ||
+        names.has(comparableName)
+      ) {
+        partial = true;
+        return;
+      }
+
+      ids.add(view.id);
+      names.add(comparableName);
+      views.push({
+        id: view.id,
+        name,
+        state: view.state
+      });
+    });
+
+    return {
+      result: partial ? "partial" : "restored",
+      views
+    };
+  }
+
+
+  loadSavedViews() {
+    this._savedViewsLoaded = true;
+    this._savedViewsPersistenceKey =
+      this.getSavedViewsPersistenceKey();
+
+    const loaded = this._viewStateStore.load(
+      this._savedViewsPersistenceKey
+    );
+    const persistenceKeyHash =
+      this.getLifecycleConfigKey(
+        this._savedViewsPersistenceKey
+      );
+
+    if (loaded.result !== "loaded") {
+      this._savedViews = [];
+      this.logCardLifecycle("saved-views-restore", {
+        attempted: true,
+        result: loaded.result,
+        persistenceKeyHash,
+        savedViewCount: 0
+      });
+      return;
+    }
+
+    const normalized =
+      this.normalizeSavedViewsCollection(loaded.value);
+
+    this._savedViews = normalized.views;
+    this.logCardLifecycle("saved-views-restore", {
+      attempted: true,
+      result: normalized.result,
+      persistenceKeyHash,
+      savedViewCount: this._savedViews.length
+    });
+  }
+
+
+  saveSavedViews(reason) {
+    if (
+      !this._savedViewsLoaded ||
+      !this._savedViewsPersistenceKey
+    ) {
+      return;
+    }
+
+    const collection = {
+      version: 1,
+      views: this._savedViews.map(view => ({
+        id: view.id,
+        name: view.name,
+        state: {
+          version: view.state.version,
+          layout: view.state.layout,
+          assignedCameras: Array.isArray(
+            view.state.assignedCameras
+          )
+            ? [...view.state.assignedCameras]
+            : view.state.assignedCameras,
+          maximizedSlot: view.state.maximizedSlot
+        }
+      }))
+    };
+    const result = this._viewStateStore.save(
+      this._savedViewsPersistenceKey,
+      collection
+    );
+
+    this.logCardLifecycle("saved-views-save", {
+      reason,
+      result,
+      persistenceKeyHash:
+        this.getLifecycleConfigKey(
+          this._savedViewsPersistenceKey
+        ),
+      savedViewCount: this._savedViews.length
+    });
   }
 
 
@@ -761,6 +921,206 @@ class NVRCard extends HTMLElement {
   }
 
 
+  normalizeSavedViewName(name) {
+    return typeof name === "string"
+      ? name.trim()
+      : "";
+  }
+
+
+  hasSavedViewName(name, excludedId = null) {
+    const comparableName = name.toLocaleLowerCase();
+
+    return this._savedViews.some(view => {
+      return (
+        view.id !== excludedId &&
+        view.name.toLocaleLowerCase() === comparableName
+      );
+    });
+  }
+
+
+  createSavedViewId() {
+    const highestId = this._savedViews.reduce(
+      (highest, view) => {
+        const match = /^view-(\d+)$/.exec(view.id);
+        return match
+          ? Math.max(highest, Number(match[1]))
+          : highest;
+      },
+      0
+    );
+
+    return `view-${highestId + 1}`;
+  }
+
+
+  setSavedViewsMessage(message) {
+    this._savedViewsMessage = message;
+    this.renderSavedViewsList();
+  }
+
+
+  saveCurrentViewAs(name) {
+    const normalizedName =
+      this.normalizeSavedViewName(name);
+
+    if (normalizedName.length === 0) {
+      this.setSavedViewsMessage("View name is required.");
+      return null;
+    }
+
+    if (this.hasSavedViewName(normalizedName)) {
+      this.setSavedViewsMessage(
+        "A saved view with that name already exists."
+      );
+      return null;
+    }
+
+    const view = {
+      id: this.createSavedViewId(),
+      name: normalizedName,
+      state: this.captureViewState()
+    };
+
+    this._savedViews.push(view);
+    this.saveSavedViews("create");
+    this.setSavedViewsMessage(`Saved ${normalizedName}.`);
+    return view;
+  }
+
+
+  overwriteSavedView(id) {
+    const index = this._savedViews.findIndex(
+      view => view.id === id
+    );
+
+    if (index === -1) {
+      return false;
+    }
+
+    this._savedViews[index] = {
+      ...this._savedViews[index],
+      state: this.captureViewState()
+    };
+    this.saveSavedViews("overwrite");
+    this.setSavedViewsMessage(
+      `Updated ${this._savedViews[index].name}.`
+    );
+    return true;
+  }
+
+
+  renameSavedView(id, name) {
+    const index = this._savedViews.findIndex(
+      view => view.id === id
+    );
+    const normalizedName =
+      this.normalizeSavedViewName(name);
+
+    if (index === -1) {
+      return false;
+    }
+
+    if (normalizedName.length === 0) {
+      this.setSavedViewsMessage("View name is required.");
+      return false;
+    }
+
+    if (
+      this.hasSavedViewName(
+        normalizedName,
+        this._savedViews[index].id
+      )
+    ) {
+      this.setSavedViewsMessage(
+        "A saved view with that name already exists."
+      );
+      return false;
+    }
+
+    this._savedViews[index] = {
+      ...this._savedViews[index],
+      name: normalizedName
+    };
+    this.saveSavedViews("rename");
+    this.setSavedViewsMessage(`Renamed to ${normalizedName}.`);
+    return true;
+  }
+
+
+  deleteSavedView(id) {
+    const index = this._savedViews.findIndex(
+      view => view.id === id
+    );
+
+    if (index === -1) {
+      return false;
+    }
+
+    const [removed] = this._savedViews.splice(index, 1);
+    this.saveSavedViews("delete");
+    this.setSavedViewsMessage(`Deleted ${removed.name}.`);
+    return true;
+  }
+
+
+  loadSavedView(id) {
+    const view = this._savedViews.find(
+      candidate => candidate.id === id
+    );
+
+    if (!view) {
+      return false;
+    }
+
+    const normalized = this.normalizeViewState(view.state);
+    const previousAssignments = [
+      ...this._assignedCameras
+    ];
+
+    this._restoringViewState = true;
+
+    try {
+      if (this._maximizedSlot !== null) {
+        this.restoreMaximizedCamera();
+      }
+
+      this._layout = normalized.state.layout;
+      this._assignedCameras =
+        normalized.state.assignedCameras;
+      this.applyLayout();
+
+      this._assignedCameras.forEach((cameraName, slot) => {
+        if (cameraName !== previousAssignments[slot]) {
+          this.renderSlot(slot);
+        }
+      });
+
+      this.updateSelectedButton();
+      this.updateCameraListState();
+
+      if (normalized.state.maximizedSlot !== null) {
+        this.maximizeCameraSlot(
+          normalized.state.maximizedSlot
+        );
+      } else {
+        this.scheduleCameraFit();
+      }
+    } finally {
+      this._restoringViewState = false;
+    }
+
+    this.saveViewState("load-saved-view");
+    this.setSavedViewsMessage(`Loaded ${view.name}.`);
+    this.logCardLifecycle("saved-view-loaded", {
+      savedViewId: view.id,
+      result: normalized.result
+    });
+    return true;
+  }
+
+
   setConfig(config) {
     this.logCardLifecycle("set-config-entry", {
       configPresent:
@@ -807,6 +1167,10 @@ class NVRCard extends HTMLElement {
       this._viewStateRestoreAttempted
         ? null
         : this.loadViewState();
+
+    if (!this._savedViewsLoaded) {
+      this.loadSavedViews();
+    }
 
     this.render(reason);
 
@@ -1173,13 +1537,26 @@ class NVRCard extends HTMLElement {
               </button>
 
               <div
-                class="sidebar-section-body sidebar-scroll-region"
+                class="sidebar-section-body saved-views-body sidebar-scroll-region"
                 ${this._sidebarSections.views ? "" : "hidden"}
               >
-                <div class="sidebar-placeholder">
-                  <ha-icon icon="mdi:view-dashboard-outline"></ha-icon>
-                  <span>No saved views</span>
+                <div class="saved-views-toolbar">
+                  <button
+                    type="button"
+                    class="saved-view-save-current"
+                    data-saved-view-action="create"
+                  >
+                    Save Current View
+                  </button>
                 </div>
+                <div class="saved-views-list">
+                  ${this.buildSavedViewsList()}
+                </div>
+                <div
+                  class="saved-views-message"
+                  role="status"
+                  aria-live="polite"
+                >${this.escapeHtml(this._savedViewsMessage)}</div>
               </div>
 
             </section>
@@ -1563,6 +1940,82 @@ class NVRCard extends HTMLElement {
       }
 
 
+      .saved-views-body {
+        padding: 6px 4px 2px 0;
+      }
+
+
+      .saved-views-toolbar {
+        padding: 0 4px 6px;
+      }
+
+
+      .saved-view-save-current,
+      .saved-view-load,
+      .saved-view-action {
+        border: 1px solid #3b5263;
+        border-radius: 3px;
+        background: #172029;
+        color: #c7d6df;
+        font: inherit;
+        cursor: pointer;
+      }
+
+
+      .saved-view-save-current {
+        width: 100%;
+        min-height: 30px;
+        padding: 4px 6px;
+      }
+
+
+      .saved-view-row {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) repeat(3, 26px);
+        gap: 3px;
+        padding: 3px 4px;
+      }
+
+
+      .saved-view-load {
+        min-width: 0;
+        min-height: 28px;
+        overflow: hidden;
+        padding: 4px 6px;
+        text-align: left;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+
+      .saved-view-action {
+        min-width: 26px;
+        min-height: 28px;
+        padding: 2px;
+      }
+
+
+      .saved-view-action ha-icon {
+        --mdc-icon-size: 18px;
+      }
+
+
+      .saved-view-save-current:hover,
+      .saved-view-load:hover,
+      .saved-view-action:hover {
+        background: #22313d;
+        color: #fff;
+      }
+
+
+      .saved-views-message {
+        min-height: 16px;
+        padding: 3px 6px;
+        color: #8ba0ad;
+        font-size: 11px;
+      }
+
+
       .sidebar-layout-body {
         padding-right: 6px;
       }
@@ -1791,7 +2244,7 @@ class NVRCard extends HTMLElement {
 
 
       /*
-       * All 16 slots permanently exist.
+       * All current grid slots permanently exist.
        * Layout changes only hide/reposition them.
        */
       .video-cell {
@@ -2065,6 +2518,7 @@ class NVRCard extends HTMLElement {
     this.attachCameraHandlers();
     this.attachCameraDragHandlers();
     this.attachSidebarHandlers();
+    this.attachSavedViewHandlers();
     this.attachSidebarToggleHandler();
     this.attachLayoutHandlers();
     this.attachLayoutDragHandlers();
@@ -2098,12 +2552,12 @@ class NVRCard extends HTMLElement {
 
 
   /* ================================================
-     BUILD PERMANENT 16-SLOT GRID
+     BUILD PERMANENT GRID SLOT POOL
      ================================================ */
 
   buildPersistentSlots() {
     return Array.from(
-      { length: 16 },
+      { length: NVR_GRID_SLOT_CAPACITY },
       (_, slot) => {
 
         return `
@@ -2199,6 +2653,83 @@ class NVRCard extends HTMLElement {
         `;
       })
       .join("");
+  }
+
+
+  escapeHtml(value) {
+    return String(value)
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#039;");
+  }
+
+
+  buildSavedViewsList() {
+    if (this._savedViews.length === 0) {
+      return `
+        <div class="sidebar-placeholder">
+          <ha-icon icon="mdi:view-dashboard-outline"></ha-icon>
+          <span>No saved views</span>
+        </div>
+      `;
+    }
+
+    return this._savedViews.map(view => {
+      const id = this.escapeHtml(view.id);
+      const name = this.escapeHtml(view.name);
+
+      return `
+        <div class="saved-view-row" data-saved-view-id="${id}">
+          <button
+            type="button"
+            class="saved-view-load"
+            data-saved-view-action="load"
+            data-saved-view-id="${id}"
+            title="Load ${name}"
+          >${name}</button>
+          <button
+            type="button"
+            class="saved-view-action"
+            data-saved-view-action="overwrite"
+            data-saved-view-id="${id}"
+            aria-label="Update ${name}"
+            title="Update from current view"
+          ><ha-icon icon="mdi:content-save"></ha-icon></button>
+          <button
+            type="button"
+            class="saved-view-action"
+            data-saved-view-action="rename"
+            data-saved-view-id="${id}"
+            aria-label="Rename ${name}"
+            title="Rename"
+          ><ha-icon icon="mdi:pencil"></ha-icon></button>
+          <button
+            type="button"
+            class="saved-view-action"
+            data-saved-view-action="delete"
+            data-saved-view-id="${id}"
+            aria-label="Delete ${name}"
+            title="Delete"
+          ><ha-icon icon="mdi:trash-can-outline"></ha-icon></button>
+        </div>
+      `;
+    }).join("");
+  }
+
+
+  renderSavedViewsList() {
+    const list = this.querySelector(".saved-views-list");
+    const message = this.querySelector(".saved-views-message");
+
+    if (list) {
+      list.innerHTML = this.buildSavedViewsList();
+    }
+
+    if (message) {
+      message.textContent = this._savedViewsMessage;
+    }
   }
 
 
@@ -4844,6 +5375,79 @@ class NVRCard extends HTMLElement {
     this.updateCameraListState();
     this.updateSelectedButton();
     this.saveViewState("select-layout");
+  }
+
+
+  attachSavedViewHandlers() {
+    const body = this.querySelector(".saved-views-body");
+
+    if (!body) {
+      return;
+    }
+
+    body.addEventListener("click", event => {
+      const button = event.target.closest(
+        "[data-saved-view-action]"
+      );
+
+      if (!button) {
+        return;
+      }
+
+      const action = button.dataset.savedViewAction;
+      const id = button.dataset.savedViewId;
+
+      if (action === "create") {
+        const name = window.prompt("Save current view as:");
+
+        if (name !== null) {
+          this.saveCurrentViewAs(name);
+        }
+        return;
+      }
+
+      const view = this._savedViews.find(candidate => {
+        return candidate.id === id;
+      });
+
+      if (!view) {
+        return;
+      }
+
+      if (action === "load") {
+        this.loadSavedView(id);
+        return;
+      }
+
+      if (action === "rename") {
+        const name = window.prompt(
+          "Rename saved view:",
+          view.name
+        );
+
+        if (name !== null) {
+          this.renameSavedView(id, name);
+        }
+        return;
+      }
+
+      if (
+        action === "overwrite" &&
+        window.confirm(
+          `Update ${view.name} from the current view?`
+        )
+      ) {
+        this.overwriteSavedView(id);
+        return;
+      }
+
+      if (
+        action === "delete" &&
+        window.confirm(`Delete ${view.name}?`)
+      ) {
+        this.deleteSavedView(id);
+      }
+    });
   }
 
 
