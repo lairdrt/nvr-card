@@ -5,6 +5,31 @@
 import { FrigateProvider } from "./src/providers/frigate-provider.js";
 
 const NVR_BUILD = "__NVR_BUILD__";
+const USE_HA_HUI_IMAGE_EXPERIMENT = true;
+const HA_HUI_IMAGE_SUBSTREAM_ENTITIES = Object.freeze({
+  "camera.garage":
+    "camera.lorex_mediaprofile_channel1_substream1_3",
+  "camera.front_door":
+    "camera.lorex_mediaprofile_channel1_substream1_9",
+  "camera.front_entry":
+    "camera.lorex_mediaprofile_channel1_substream1_1",
+  "camera.drive_up":
+    "camera.lorex_mediaprofile_channel1_substream1_10",
+  "camera.drive_down":
+    "camera.lorex_mediaprofile_channel1_substream1_4",
+  "camera.side_gate":
+    "camera.lorex_mediaprofile_channel1_substream1_11",
+  "camera.ac":
+    "camera.lorex_mediaprofile_channel1_substream1_6",
+  "camera.patio":
+    "camera.lorex_mediaprofile_channel1_substream1_5",
+  "camera.backyard":
+    "camera.lorex_mediaprofile_channel1_substream1_2",
+  "camera.fireplace":
+    "camera.lorex_mediaprofile_channel1_substream1_8",
+  "camera.patio_roof":
+    "camera.lorex_mediaprofile_channel1_substream1_7"
+});
 const NVR_MAXIMIZE_DIAGNOSTICS = false;
 const NVR_MAXIMIZE_FLIGHT_RECORDER = true;
 const NVR_DIAGNOSTIC_LIVE_SLOT_LIMIT = 4;
@@ -37,6 +62,46 @@ NVR_FLIGHT_RECORDER_STATE.nextMediaSessionId ??= 1;
 
 window[NVR_FLIGHT_RECORDER_STATE_KEY] =
   NVR_FLIGHT_RECORDER_STATE;
+
+class LocalStorageNvrViewStateStore {
+  load(key) {
+    try {
+      const serialized = window.localStorage.getItem(key);
+
+      if (serialized === null) {
+        return {
+          result: "not-found",
+          value: null
+        };
+      }
+
+      return {
+        result: "loaded",
+        value: JSON.parse(serialized)
+      };
+    } catch {
+      return {
+        result: "invalid",
+        value: null
+      };
+    }
+  }
+
+  save(key, state) {
+    try {
+      window.localStorage.setItem(
+        key,
+        JSON.stringify(state)
+      );
+      return "saved";
+    } catch {
+      return "error";
+    }
+  }
+}
+
+const NVR_VIEW_STATE_STORE =
+  new LocalStorageNvrViewStateStore();
 
 window.dumpNvrFlightRecorder = () => {
   if (!NVR_MAXIMIZE_FLIGHT_RECORDER) {
@@ -185,12 +250,27 @@ class NVRCard extends HTMLElement {
     this._activeMaximizeMediaSession = null;
     this._frigateProvider = new FrigateProvider();
     this._providerPresentations = new Map();
+    this._viewStateStore = NVR_VIEW_STATE_STORE;
+    this._viewStatePersistenceKey = null;
+    this._viewStateRestoreAttempted = false;
+    this._restoringViewState = false;
     this._nvrInstanceId =
       NVR_FLIGHT_RECORDER_STATE.nextInstanceId++;
     this._nvrVisibilityHandler = () => {
       this.recordNvrFlight("visibility-change");
       this.recordMaximizeMediaVisibility();
     };
+
+    this.logCardLifecycle("constructor", {
+      reason: "new-instance"
+    });
+    this.logCardLifecycle("layout-default-selected", {
+      reason: "constructor-default",
+      visibleCellCount: 4
+    });
+    this.logCardLifecycle("assignments-reset", {
+      reason: "constructor-initialization"
+    });
 
     this.layouts = {
       "1x1": {
@@ -407,11 +487,292 @@ class NVRCard extends HTMLElement {
   }
 
 
+  getLifecycleConfigKey(
+    normalizedConfigKey = this._normalizedConfigKey
+  ) {
+    if (typeof normalizedConfigKey !== "string") {
+      return null;
+    }
+
+    let hash = 2166136261;
+
+    for (let index = 0; index < normalizedConfigKey.length; index++) {
+      hash ^= normalizedConfigKey.charCodeAt(index);
+      hash = Math.imul(hash, 16777619);
+    }
+
+    return (hash >>> 0)
+      .toString(16)
+      .padStart(8, "0");
+  }
+
+
+  getLifecycleAssignedSlots() {
+    return this._assignedCameras.flatMap(
+      (cameraName, slot) => {
+        if (cameraName === null) {
+          return [];
+        }
+
+        const camera = this.getCameraByName(cameraName);
+
+        return [{
+          slot,
+          entity: camera?.entity ?? null
+        }];
+      }
+    );
+  }
+
+
+  logCardLifecycle(event, details = {}) {
+    const assignedSlots =
+      this.getLifecycleAssignedSlots();
+
+    console.info("[NVR card lifecycle]", {
+      runtimeInstanceId: `card-${this._nvrInstanceId}`,
+      event,
+      timestamp: new Date().toISOString(),
+      connected: this.isConnected,
+      configKey: this.getLifecycleConfigKey(),
+      layout: this._layout,
+      assignedCameraCount: assignedSlots.length,
+      assignedSlots,
+      maximizedSlot: this._maximizedSlot,
+      ...details
+    });
+  }
+
+
+  getViewStatePersistenceKey() {
+    const locationPath =
+      window.location?.pathname || "/";
+
+    return (
+      "nvr-card:view-state:v1:anonymous:" +
+      encodeURIComponent(locationPath)
+    );
+  }
+
+
+  captureViewState() {
+    return {
+      version: 1,
+      layout: this._layout,
+      assignedCameras: this._assignedCameras.map(
+        cameraName => {
+          return cameraName === null
+            ? null
+            : this.getCameraByName(cameraName)?.entity ?? null;
+        }
+      ),
+      maximizedSlot: this._maximizedSlot
+    };
+  }
+
+
+  normalizeViewState(value) {
+    const defaults = {
+      version: 1,
+      layout: "2x2",
+      assignedCameras: new Array(16).fill(null),
+      maximizedSlot: null
+    };
+
+    if (
+      !value ||
+      typeof value !== "object" ||
+      Array.isArray(value) ||
+      value.version !== 1
+    ) {
+      return {
+        result: "invalid",
+        state: defaults
+      };
+    }
+
+    let partial = false;
+    const state = { ...defaults };
+
+    if (
+      typeof value.layout === "string" &&
+      this.layouts[value.layout]
+    ) {
+      state.layout = value.layout;
+    } else {
+      partial = true;
+    }
+
+    const camerasByEntity = new Map(
+      this._cameras.map(camera => [camera.entity, camera.name])
+    );
+    const usedCameras = new Set();
+
+    if (!Array.isArray(value.assignedCameras)) {
+      partial = true;
+    } else {
+      if (value.assignedCameras.length !== 16) {
+        partial = true;
+      }
+
+      state.assignedCameras = Array.from(
+        { length: 16 },
+        (_, slot) => {
+          const entity = value.assignedCameras[slot];
+
+          if (entity === null || entity === undefined) {
+            return null;
+          }
+
+          if (
+            typeof entity !== "string" ||
+            !camerasByEntity.has(entity) ||
+            usedCameras.has(entity)
+          ) {
+            partial = true;
+            return null;
+          }
+
+          usedCameras.add(entity);
+          return camerasByEntity.get(entity);
+        }
+      );
+    }
+
+    if (value.maximizedSlot !== null) {
+      const maximizedSlot = value.maximizedSlot;
+      const visibleSlots = new Set(
+        this.layouts[state.layout].cells.map(cell => cell.slot)
+      );
+
+      if (
+        Number.isInteger(maximizedSlot) &&
+        maximizedSlot >= 0 &&
+        maximizedSlot < 16 &&
+        state.assignedCameras[maximizedSlot] !== null &&
+        visibleSlots.has(maximizedSlot)
+      ) {
+        state.maximizedSlot = maximizedSlot;
+      } else {
+        partial = true;
+      }
+    }
+
+    return {
+      result: partial ? "partial" : "restored",
+      state
+    };
+  }
+
+
+  loadViewState() {
+    this._viewStateRestoreAttempted = true;
+    this._viewStatePersistenceKey =
+      this.getViewStatePersistenceKey();
+
+    const loaded = this._viewStateStore.load(
+      this._viewStatePersistenceKey
+    );
+    const persistenceKeyHash =
+      this.getLifecycleConfigKey(
+        this._viewStatePersistenceKey
+      );
+
+    if (loaded.result !== "loaded") {
+      this.logCardLifecycle("persistence-restore", {
+        attempted: true,
+        result: loaded.result,
+        persistenceKeyHash
+      });
+      return null;
+    }
+
+    const normalized =
+      this.normalizeViewState(loaded.value);
+
+    this._layout = normalized.state.layout;
+    this._assignedCameras =
+      normalized.state.assignedCameras;
+
+    this.logCardLifecycle("persistence-restore", {
+      attempted: true,
+      result: normalized.result,
+      persistenceKeyHash,
+      layout: normalized.state.layout,
+      assignedCameraCount:
+        normalized.state.assignedCameras.filter(Boolean).length,
+      maximizedSlot: normalized.state.maximizedSlot
+    });
+
+    return normalized.result === "invalid"
+      ? null
+      : normalized.state;
+  }
+
+
+  saveViewState(reason) {
+    if (
+      this._restoringViewState ||
+      !this._viewStateRestoreAttempted ||
+      !this._viewStatePersistenceKey
+    ) {
+      return;
+    }
+
+    const state = this.captureViewState();
+    const result = this._viewStateStore.save(
+      this._viewStatePersistenceKey,
+      state
+    );
+
+    this.logCardLifecycle("persistence-save", {
+      reason,
+      result,
+      persistenceKeyHash:
+        this.getLifecycleConfigKey(
+          this._viewStatePersistenceKey
+        ),
+      layout: state.layout,
+      assignedCameraCount:
+        state.assignedCameras.filter(Boolean).length,
+      maximizedSlot: state.maximizedSlot
+    });
+  }
+
+
+  reconcileRestoredViewState(state) {
+    this._restoringViewState = true;
+
+    try {
+      state.assignedCameras.forEach((cameraName, slot) => {
+        if (cameraName !== null) {
+          this.renderSlot(slot);
+        }
+      });
+
+      this.updateCameraListState();
+
+      if (state.maximizedSlot !== null) {
+        this.maximizeCameraSlot(state.maximizedSlot);
+      }
+    } finally {
+      this._restoringViewState = false;
+    }
+  }
+
+
   setConfig(config) {
+    this.logCardLifecycle("set-config-entry", {
+      configPresent:
+        Boolean(config) && typeof config === "object"
+    });
+
     const normalized =
       this.normalizeConfig(config);
     const normalizedConfigKey =
       JSON.stringify(normalized);
+    const nextConfigKey =
+      this.getLifecycleConfigKey(normalizedConfigKey);
 
     this.config = config;
 
@@ -419,8 +780,22 @@ class NVRCard extends HTMLElement {
       this._normalizedConfigKey ===
       normalizedConfigKey
     ) {
+      this.logCardLifecycle("set-config-equivalent-no-op", {
+        nextConfigKey
+      });
       return;
     }
+
+    const reason = this._normalizedConfigKey === undefined
+      ? "initial-config"
+      : "normalized-config-changed";
+
+    this.logCardLifecycle("set-config-destructive-change", {
+      reason,
+      previousConfigKey:
+        this.getLifecycleConfigKey(),
+      nextConfigKey
+    });
 
     this._cameras = normalized.cameras;
     this._cameraAspectRatio =
@@ -428,7 +803,16 @@ class NVRCard extends HTMLElement {
     this._normalizedConfigKey =
       normalizedConfigKey;
 
-    this.render();
+    const restoredState =
+      this._viewStateRestoreAttempted
+        ? null
+        : this.loadViewState();
+
+    this.render(reason);
+
+    if (restoredState) {
+      this.reconcileRestoredViewState(restoredState);
+    }
   }
 
 
@@ -616,6 +1000,7 @@ class NVRCard extends HTMLElement {
 
 
   connectedCallback() {
+    this.logCardLifecycle("connected-callback");
     this.recordNvrFlight("card-connected");
     this.installViewportListeners();
 
@@ -630,6 +1015,7 @@ class NVRCard extends HTMLElement {
 
 
   disconnectedCallback() {
+    this.logCardLifecycle("disconnected-callback");
     this.recordNvrFlight("card-disconnected");
     this.completeMaximizeMediaSession("disconnected");
     this.closeCameraContextMenu();
@@ -650,7 +1036,13 @@ class NVRCard extends HTMLElement {
   }
 
 
-  render() {
+  render(reason = "direct-call") {
+    this.logCardLifecycle("render-entry", {
+      reason,
+      existingPhysicalCellCount:
+        this.querySelectorAll(".video-cell").length,
+      physicalCellsWillBeRecreated: true
+    });
     this.closeAllProviderPresentations();
     this.closeCameraContextMenu();
     this._maximizedSlot = null;
@@ -1693,6 +2085,15 @@ class NVRCard extends HTMLElement {
     this.updateResponsiveShell();
 
     this.installResizeObserver();
+    this.logCardLifecycle("render-complete", {
+      reason,
+      physicalCellCount:
+        this.querySelectorAll(".video-cell").length,
+      visibleCellCount:
+        this.querySelectorAll(
+          ".video-cell:not(.hidden-slot)"
+        ).length
+    });
   }
 
 
@@ -1933,6 +2334,13 @@ class NVRCard extends HTMLElement {
     this._assignedCameras[slot] =
       cameraName;
 
+    this.logCardLifecycle("assignment-changed", {
+      reason: "assign-camera",
+      slot,
+      entity:
+        this.getCameraByName(cameraName)?.entity ?? null
+    });
+
     /*
      * Only modify this slot.
      */
@@ -1940,6 +2348,7 @@ class NVRCard extends HTMLElement {
 
     this.updateCameraListState();
     this.scheduleCameraFit();
+    this.saveViewState("assign-camera");
   }
 
 
@@ -1987,6 +2396,14 @@ class NVRCard extends HTMLElement {
     this._assignedCameras[targetSlot] =
       cameraName;
 
+    this.logCardLifecycle("assignment-changed", {
+      reason: "assign-camera-to-slot",
+      sourceSlot:
+        sourceSlot === -1 ? null : sourceSlot,
+      targetSlot,
+      entity: camera.entity
+    });
+
     /*
      * Targeted placement never compacts other slots.
      * Re-render only the moved camera's source and
@@ -1999,6 +2416,7 @@ class NVRCard extends HTMLElement {
     this.renderSlot(targetSlot);
     this.updateCameraListState();
     this.scheduleCameraFit();
+    this.saveViewState("assign-camera-to-slot");
   }
 
 
@@ -2041,6 +2459,13 @@ class NVRCard extends HTMLElement {
     this._assignedCameras[sourceSlot] = null;
     this._assignedCameras[targetSlot] = cameraName;
 
+    this.logCardLifecycle("assignment-changed", {
+      reason: "move-camera-between-slots",
+      sourceSlot,
+      targetSlot,
+      entity: camera.entity
+    });
+
     this.closeProviderPresentation(targetCell);
     targetCell.innerHTML = "";
 
@@ -2067,6 +2492,7 @@ class NVRCard extends HTMLElement {
 
     this.updateCameraListState();
     this.scheduleCameraFit();
+    this.saveViewState("move-camera-between-slots");
   }
 
 
@@ -2089,7 +2515,17 @@ class NVRCard extends HTMLElement {
       return;
     }
 
+    const removedCamera = this.getCameraByName(
+      this._assignedCameras[slot]
+    );
+
     this._assignedCameras[slot] = null;
+
+    this.logCardLifecycle("assignment-changed", {
+      reason: "remove-camera-from-slot",
+      slot,
+      entity: removedCamera?.entity ?? null
+    });
 
     /*
      * Targeted removal intentionally leaves a hole.
@@ -2098,6 +2534,7 @@ class NVRCard extends HTMLElement {
     this.renderSlot(slot);
 
     this.updateCameraListState();
+    this.saveViewState("remove-camera-from-slot");
   }
 
 
@@ -2165,6 +2602,10 @@ class NVRCard extends HTMLElement {
      * camera subtree connected. Only logical slot
      * identities change during compaction.
      */
+    this.logCardLifecycle("assignments-repack-start", {
+      reason: "layout-selection",
+      temporaryArrayClear: true
+    });
     this._assignedCameras.fill(null);
 
     desiredMapping.forEach(entry => {
@@ -2210,6 +2651,10 @@ class NVRCard extends HTMLElement {
         String(logicalSlot + 1);
     });
 
+    this.logCardLifecycle("assignments-repack-complete", {
+      reason: "layout-selection"
+    });
+
   }
 
   
@@ -2219,7 +2664,18 @@ class NVRCard extends HTMLElement {
     const slot = Number(cell?.dataset.slot);
 
     if (image && Number.isInteger(slot)) {
+      const configuredEntity = image.dataset.entity;
+
+      image.cameraImage =
+        USE_HA_HUI_IMAGE_EXPERIMENT &&
+        slot !== this._maximizedSlot
+          ? HA_HUI_IMAGE_SUBSTREAM_ENTITIES[
+              configuredEntity
+            ] ?? configuredEntity
+          : configuredEntity;
+
       image.cameraView =
+        USE_HA_HUI_IMAGE_EXPERIMENT ||
         slot < NVR_DIAGNOSTIC_LIVE_SLOT_LIMIT
           ? "live"
           : "auto";
@@ -2358,6 +2814,43 @@ class NVRCard extends HTMLElement {
         "camera-frame";
 
 
+      if (USE_HA_HUI_IMAGE_EXPERIMENT) {
+        const image =
+          document.createElement(
+            "hui-image"
+          );
+
+
+        image.className =
+          "nvr-live-camera";
+
+
+        image.dataset.entity =
+          camera.entity;
+
+
+        image.cameraImage =
+          slot === this._maximizedSlot
+            ? camera.entity
+            : HA_HUI_IMAGE_SUBSTREAM_ENTITIES[
+                camera.entity
+              ] ?? camera.entity;
+
+
+        image.cameraView = "live";
+
+
+        if (this._hass) {
+          image.hass =
+            this._hass;
+        }
+
+
+        frame.appendChild(image);
+
+        cell.appendChild(frame);
+      } else {
+
       const providerExperimentCamera =
         this._frigateProvider.supports(camera);
       const providerStreamId =
@@ -2482,6 +2975,7 @@ class NVRCard extends HTMLElement {
         frame.appendChild(image);
 
         cell.appendChild(frame);
+      }
       }
     }
 
@@ -2805,8 +3299,9 @@ class NVRCard extends HTMLElement {
 
         if (element.shadowRoot) {
           roots.push(element.shadowRoot);
-        }
-      });
+      }
+    });
+
     }
 
     return elements;
@@ -3604,6 +4099,7 @@ class NVRCard extends HTMLElement {
     this._maximizedSlot = slot;
     grid.classList.add("camera-maximized");
     cell.classList.add("maximized-camera");
+    this.updateCameraViewForCell(cell);
 
     this.recordNvrFlight(
       "maximize-classes-applied",
@@ -3623,6 +4119,7 @@ class NVRCard extends HTMLElement {
       "maximize-handler-end",
       this.getMaximizeDiagnosticSnapshot(slot)
     );
+    this.saveViewState("maximize-camera");
   }
 
 
@@ -3688,12 +4185,18 @@ class NVRCard extends HTMLElement {
     }
 
     this._assignedCameras[slot] = cameraName;
+    this.logCardLifecycle("assignment-changed", {
+      reason: "replace-maximized-camera",
+      slot,
+      entity: camera.entity
+    });
     this.renderSlot(slot);
     this.updateCameraListState();
     this.fitLiveCameras(
       "maximize-replacement-synchronous"
     );
     this.scheduleCameraFit();
+    this.saveViewState("replace-maximized-camera");
   }
 
 
@@ -3745,6 +4248,11 @@ class NVRCard extends HTMLElement {
       });
 
     this._maximizedSlot = null;
+    this.updateCameraViewForCell(
+      this.querySelector(
+        `.video-cell[data-slot="${maximizedSlot}"]`
+      )
+    );
     this.applyLayout();
     this.scheduleCameraFit();
     this.logMaximizeDiagnostic(
@@ -3753,6 +4261,7 @@ class NVRCard extends HTMLElement {
         maximizedSlot
       )
     );
+    this.saveViewState("restore-maximized-camera");
   }
 
 
@@ -4314,10 +4823,18 @@ class NVRCard extends HTMLElement {
 
     this.closeCameraContextMenu();
     this.clearCameraTargetSelection();
+    const previousLayout = this._layout;
     this.repackAssignedCameras();
 
     this._layout = layoutKey;
     this._selectedLayout = null;
+
+    this.logCardLifecycle("layout-selected", {
+      reason: "user-selection",
+      previousLayout,
+      nextLayout: layoutKey,
+      visibleCellCount: this.layouts[layoutKey].cells.length
+    });
 
     /*
      * No grid rebuild.
@@ -4326,6 +4843,7 @@ class NVRCard extends HTMLElement {
     this.applyLayout();
     this.updateCameraListState();
     this.updateSelectedButton();
+    this.saveViewState("select-layout");
   }
 
 

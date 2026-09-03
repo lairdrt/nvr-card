@@ -5,8 +5,8 @@ import {
   createTestHarness
 } from "./helpers/nvr-card-harness.js";
 
-function setup(t) {
-  const harness = createTestHarness();
+function setup(t, options) {
+  const harness = createTestHarness(options);
   t.after(() => harness.close());
   return harness;
 }
@@ -145,6 +145,369 @@ test("initial render creates 16 persistent cells with unique logical slots", t =
   assert.equal(cells.length, 16);
   assert.equal(new Set(cells).size, 16);
   assert.deepEqual(slots, Array.from({ length: 16 }, (_, slot) => slot));
+  assert.equal(card._layout, "2x2");
+  assert.deepEqual(
+    Array.from(card._assignedCameras),
+    new Array(16).fill(null)
+  );
+  assert.equal(
+    cells.filter(cell => !cell.classList.contains("hidden-slot")).length,
+    4
+  );
+  assert.equal(card.querySelectorAll(".camera-frame").length, 0);
+});
+
+test("card lifecycle diagnostics distinguish instances and config paths without changing state", t => {
+  const harness = setup(t);
+  const lifecycle = [];
+  const originalInfo = harness.window.console.info;
+
+  harness.window.console.info = (prefix, details) => {
+    if (prefix === "[NVR card lifecycle]") {
+      lifecycle.push(details);
+    }
+  };
+  t.after(() => {
+    harness.window.console.info = originalInfo;
+  });
+
+  const card = harness.createCard();
+  const initialCells = harness.getPhysicalCells(card);
+  const equivalentConfig = {
+    cameras: card.config.cameras.map(camera => ({ ...camera }))
+  };
+
+  card.setConfig(equivalentConfig);
+
+  const secondCard = harness.createCard();
+  const firstConstructor = lifecycle.find(entry => {
+    return entry.event === "constructor";
+  });
+  const secondConstructor = lifecycle.filter(entry => {
+    return entry.event === "constructor";
+  })[1];
+
+  assert.match(firstConstructor.runtimeInstanceId, /^card-\d+$/);
+  assert.match(secondConstructor.runtimeInstanceId, /^card-\d+$/);
+  assert.notEqual(
+    firstConstructor.runtimeInstanceId,
+    secondConstructor.runtimeInstanceId
+  );
+  assert.ok(lifecycle.some(entry => {
+    return (
+      entry.runtimeInstanceId === firstConstructor.runtimeInstanceId &&
+      entry.event === "layout-default-selected" &&
+      entry.visibleCellCount === 4
+    );
+  }));
+  assert.ok(lifecycle.some(entry => {
+    return (
+      entry.runtimeInstanceId === firstConstructor.runtimeInstanceId &&
+      entry.event === "persistence-restore" &&
+      entry.attempted === true &&
+      entry.result === "not-found"
+    );
+  }));
+  assert.ok(lifecycle.some(entry => {
+    return (
+      entry.runtimeInstanceId === firstConstructor.runtimeInstanceId &&
+      entry.event === "set-config-equivalent-no-op"
+    );
+  }));
+  assert.deepEqual(harness.getPhysicalCells(card), initialCells);
+  assert.equal(card._layout, "2x2");
+  assert.deepEqual(
+    Array.from(card._assignedCameras),
+    new Array(16).fill(null)
+  );
+  assert.equal(secondCard._layout, "2x2");
+});
+
+test("changed config rebuilds an existing card as empty cells while retaining assignment state", t => {
+  const harness = setup(t);
+  const card = harness.createCard();
+
+  card.assignCamera("Garage");
+  const originalCell = harness.getLogicalCell(card, 0);
+
+  card.setConfig({
+    cameras: card.config.cameras.map(camera => ({ ...camera })),
+    camera_aspect_ratio: "4:3"
+  });
+
+  assert.equal(card._layout, "2x2");
+  assert.equal(card._assignedCameras[0], "Garage");
+  assert.notStrictEqual(harness.getLogicalCell(card, 0), originalCell);
+  assert.equal(
+    card.querySelectorAll(".video-cell:not(.hidden-slot)").length,
+    4
+  );
+  assert.equal(card.querySelectorAll(".camera-frame").length, 0);
+});
+
+test("view state restores layout, exact holes, moves, removals, maximize, and later unmaximize", t => {
+  const harness = setup(t);
+  const card = harness.createCard();
+
+  card.selectLayout("3x3");
+  card.assignCameraToSlot("Front", 0);
+  card.assignCameraToSlot("Garage", 1);
+  card.assignCameraToSlot("Hall", 2);
+  card.moveCameraBetweenSlots(2, 5);
+  card.removeCameraFromSlot(1);
+  card.maximizeCameraSlot(5);
+
+  const stored = JSON.parse(
+    harness.window.localStorage.getItem(
+      card.getViewStatePersistenceKey()
+    )
+  );
+
+  assert.deepEqual(stored, {
+    version: 1,
+    layout: "3x3",
+    assignedCameras: [
+      "camera.front",
+      null,
+      null,
+      null,
+      null,
+      "camera.hall",
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ],
+    maximizedSlot: 5
+  });
+
+  const replacement = harness.createCard();
+
+  assert.equal(replacement._layout, "3x3");
+  assert.deepEqual(Array.from(replacement._assignedCameras), [
+    "Front", null, null, null, null, "Hall",
+    null, null, null, null, null, null, null, null, null, null
+  ]);
+  assert.equal(replacement._maximizedSlot, 5);
+  assert.equal(
+    harness.getLogicalCell(replacement, 5)
+      .querySelector(".cell-camera-name")?.textContent,
+    "Hall"
+  );
+  assert.equal(
+    replacement.querySelectorAll(".camera-frame").length,
+    2
+  );
+  assert.ok(
+    harness.getLogicalCell(replacement, 5)
+      .classList.contains("maximized-camera")
+  );
+
+  replacement.restoreMaximizedCamera();
+  const afterRestore = harness.createCard();
+
+  assert.equal(afterRestore._maximizedSlot, null);
+  assert.equal(
+    afterRestore.querySelectorAll(".maximized-camera").length,
+    0
+  );
+  assert.deepEqual(
+    Array.from(afterRestore._assignedCameras),
+    Array.from(replacement._assignedCameras)
+  );
+});
+
+test("restored maximize uses the normal hui-image maximize source path", t => {
+  const harness = setup(t);
+  const card = harness.createCard();
+
+  card.assignCamera("Garage");
+  assert.equal(
+    harness.getPlayer(card, "Garage").cameraImage,
+    "camera.lorex_mediaprofile_channel1_substream1_3"
+  );
+  card.maximizeCameraSlot(0);
+
+  const replacement = harness.createCard();
+  const restoredImage = harness.getPlayer(replacement, "Garage");
+
+  assert.equal(replacement._maximizedSlot, 0);
+  assert.equal(restoredImage.cameraImage, "camera.garage");
+  assert.strictEqual(
+    harness.getLogicalCell(replacement, 0)
+      .querySelector("hui-image.nvr-live-camera"),
+    restoredImage
+  );
+});
+
+test("stale view state keeps valid slots, drops missing cameras, and clears invalid maximize", t => {
+  const harness = setup(t);
+  const card = harness.createCard();
+  const key = card.getViewStatePersistenceKey();
+
+  harness.window.localStorage.setItem(key, JSON.stringify({
+    version: 1,
+    layout: "3x3",
+    assignedCameras: [
+      "camera.front",
+      null,
+      "camera.garage",
+      null,
+      "camera.hall",
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ],
+    maximizedSlot: 2
+  }));
+
+  const replacement = harness.createCard({
+    cameras: card.config.cameras.filter(camera => {
+      return camera.entity !== "camera.garage";
+    })
+  });
+
+  assert.equal(replacement._layout, "3x3");
+  assert.equal(replacement._assignedCameras[0], "Front");
+  assert.equal(replacement._assignedCameras[2], null);
+  assert.equal(replacement._assignedCameras[4], "Hall");
+  assert.equal(replacement._maximizedSlot, null);
+  assert.equal(
+    harness.getLogicalCell(replacement, 4)
+      .querySelector(".cell-camera-name")?.textContent,
+    "Hall"
+  );
+  assert.equal(
+    harness.getLogicalCell(replacement, 2)
+      .querySelector(".camera-frame"),
+    null
+  );
+});
+
+test("malformed persisted state falls back safely", t => {
+  const harness = setup(t);
+  const card = harness.window.document.createElement("nvr-card");
+  const key = card.getViewStatePersistenceKey();
+
+  harness.window.localStorage.setItem(key, "{malformed");
+  harness.window.document.body.appendChild(card);
+
+  assert.doesNotThrow(() => {
+    card.setConfig({ cameras: [] });
+  });
+  assert.equal(card._layout, "2x2");
+  assert.deepEqual(
+    Array.from(card._assignedCameras),
+    new Array(16).fill(null)
+  );
+  assert.equal(card._maximizedSlot, null);
+});
+
+test("replacement constructor cannot overwrite persisted state before restore", t => {
+  const harness = setup(t);
+  const oldCard = harness.createCard();
+
+  oldCard.selectLayout("3x3");
+  oldCard.assignCameraToSlot("Garage", 4);
+  const key = oldCard.getViewStatePersistenceKey();
+  const beforeReplacement =
+    harness.window.localStorage.getItem(key);
+
+  const replacement =
+    harness.window.document.createElement("nvr-card");
+
+  assert.notEqual(
+    replacement._nvrInstanceId,
+    oldCard._nvrInstanceId
+  );
+  assert.equal(
+    harness.window.localStorage.getItem(key),
+    beforeReplacement
+  );
+
+  harness.window.document.body.appendChild(replacement);
+  replacement.setConfig({
+    cameras: oldCard.config.cameras.map(camera => ({ ...camera }))
+  });
+
+  assert.equal(replacement._layout, "3x3");
+  assert.equal(replacement._assignedCameras[4], "Garage");
+  assert.equal(
+    harness.window.localStorage.getItem(key),
+    beforeReplacement
+  );
+});
+
+test("card view-state logic accepts a replaceable persistence adapter", t => {
+  const harness = setup(t);
+  const loads = [];
+  const saves = [];
+  const store = {
+    load(key) {
+      loads.push(key);
+      return {
+        result: "loaded",
+        value: {
+          version: 1,
+          layout: "3x3",
+          assignedCameras: [
+            null, null, "camera.hall",
+            null, null, null, null, null,
+            null, null, null, null, null, null, null, null
+          ],
+          maximizedSlot: null
+        }
+      };
+    },
+    save(key, state) {
+      saves.push({ key, state });
+      return "saved";
+    }
+  };
+  const card = harness.window.document.createElement("nvr-card");
+  const cameras = [
+    { name: "Front", entity: "camera.front", active: true },
+    { name: "Garage", entity: "camera.garage", active: true },
+    { name: "Hall", entity: "camera.hall", active: true }
+  ];
+
+  card._viewStateStore = store;
+  harness.window.document.body.appendChild(card);
+  card.setConfig({ cameras });
+
+  assert.equal(loads.length, 1);
+  assert.equal(card._layout, "3x3");
+  assert.equal(card._assignedCameras[2], "Hall");
+  assert.equal(
+    harness.getLogicalCell(card, 2)
+      .querySelector(".cell-camera-name")?.textContent,
+    "Hall"
+  );
+
+  card.removeCameraFromSlot(2);
+
+  assert.equal(saves.length, 1);
+  assert.equal(saves[0].key, loads[0]);
+  assert.deepEqual(JSON.parse(JSON.stringify(saves[0].state)), {
+    version: 1,
+    layout: "3x3",
+    assignedCameras: new Array(16).fill(null),
+    maximizedSlot: null
+  });
 });
 
 test("title keeps the build identifier adjacent and omits Clear Grid", t => {
@@ -160,7 +523,9 @@ test("title keeps the build identifier adjacent and omits Clear Grid", t => {
 });
 
 test("equivalent setConfig preserves active provider players while changed config rebuilds", t => {
-  const harness = setup(t);
+  const harness = setup(t, {
+    useHaHuiImageExperiment: false
+  });
   const cameras = [
     { name: "Garage", entity: "camera.garage", active: true },
     { name: "Front Door", entity: "camera.front_door", active: true }
@@ -1082,7 +1447,9 @@ test("sidebar and 600px responsive transitions preserve every player and cell", 
 });
 
 test("3x3 diagnostic mode keeps exactly logical slots 0 through 3 live", t => {
-  const harness = setup(t);
+  const harness = setup(t, {
+    useHaHuiImageExperiment: false
+  });
   const cameras = Array.from({ length: 9 }, (_, index) => ({
     name: `Camera ${index}`,
     entity: `camera.test_${index}`,
@@ -1156,7 +1523,9 @@ test("3x3 diagnostic mode keeps exactly logical slots 0 through 3 live", t => {
 });
 
 test("layout repacking reapplies diagnostic live mode by logical slot", t => {
-  const harness = setup(t);
+  const harness = setup(t, {
+    useHaHuiImageExperiment: false
+  });
   const cameras = Array.from({ length: 9 }, (_, index) => ({
     name: `Camera ${index}`,
     entity: `camera.test_${index}`,
@@ -1327,7 +1696,9 @@ test("anonymous media snapshots classify transports and capture safe video state
 });
 
 test("3x3 media capture is one bounded anonymous record with logical slots", t => {
-  const harness = setup(t);
+  const harness = setup(t, {
+    useHaHuiImageExperiment: false
+  });
   const cameras = Array.from({ length: 9 }, (_, index) => ({
     name: `Camera ${index}`,
     entity: `camera.test_${index}`,
@@ -1446,7 +1817,14 @@ test("maximize sampler captures one selected video for a bounded eight seconds",
     });
   });
   [selectedImage, otherImage].forEach(image => {
-    ["cameraImage", "hass", "config", "state"].forEach(property => {
+    Object.defineProperty(image, "cameraImage", {
+      configurable: true,
+      get() {
+        throw new Error("cameraImage must not be read");
+      },
+      set() {}
+    });
+    ["hass", "config", "state"].forEach(property => {
       Object.defineProperty(image, property, {
         configurable: true,
         get() {
@@ -1599,8 +1977,137 @@ test("maximize media-session history retains only the latest ten sessions", t =>
   assert.equal(sessions.at(-1).completionReason, "duration");
 });
 
-test("limited WebRTC experiment preserves included players and leaves excluded cameras inert", t => {
+test("HA hui-image experiment renders all 11 cameras without provider media or duplicate presentations", t => {
   const harness = setup(t);
+  const substreamEntities = new Map([
+    ["camera.garage", "camera.lorex_mediaprofile_channel1_substream1_3"],
+    ["camera.front_door", "camera.lorex_mediaprofile_channel1_substream1_9"],
+    ["camera.front_entry", "camera.lorex_mediaprofile_channel1_substream1_1"],
+    ["camera.drive_up", "camera.lorex_mediaprofile_channel1_substream1_10"],
+    ["camera.drive_down", "camera.lorex_mediaprofile_channel1_substream1_4"],
+    ["camera.side_gate", "camera.lorex_mediaprofile_channel1_substream1_11"],
+    ["camera.ac", "camera.lorex_mediaprofile_channel1_substream1_6"],
+    ["camera.patio", "camera.lorex_mediaprofile_channel1_substream1_5"],
+    ["camera.backyard", "camera.lorex_mediaprofile_channel1_substream1_2"],
+    ["camera.fireplace", "camera.lorex_mediaprofile_channel1_substream1_8"],
+    ["camera.patio_roof", "camera.lorex_mediaprofile_channel1_substream1_7"]
+  ]);
+  const cameras = [...substreamEntities.keys()].map((entity, index) => ({
+    name: `Camera ${index + 1}`,
+    entity,
+    active: true
+  }));
+  const hass = {
+    states: Object.fromEntries(
+      cameras.map(camera => [
+        camera.entity,
+        {
+          state: "streaming",
+          attributes: {
+            camera_name: camera.entity.slice("camera.".length)
+          }
+        }
+      ])
+    )
+  };
+  const card = harness.createCard({ cameras, hass });
+
+  card.selectLayout("4x4");
+  cameras.forEach(camera => card.assignCamera(camera.name));
+  harness.flushAnimationFrames();
+
+  const identities = captureIdentities(
+    harness,
+    card,
+    cameras.map(camera => camera.name)
+  );
+  const assertSingleHaPresentationPerCamera = () => {
+    const images = [
+      ...card.querySelectorAll("hui-image.nvr-live-camera")
+    ];
+
+    assert.equal(images.length, 11);
+    assert.equal(card.querySelectorAll("nvr-go2rtc-video").length, 0);
+    assert.equal(card.querySelectorAll("nvr-live-presentation").length, 0);
+    assert.equal(card._providerPresentations.size, 0);
+    assert.equal(harness.providerOpenCalls.length, 0);
+    cameras.forEach(camera => {
+      const image = harness.getPlayer(card, camera.name);
+      assert.equal(image.localName, "hui-image");
+      assert.equal(
+        image.cameraImage,
+        substreamEntities.get(camera.entity)
+      );
+      assert.equal(image.cameraView, "live");
+      assert.equal(image.dataset.entity, camera.entity);
+      assert.strictEqual(image.hass, hass);
+      assert.equal(
+        image.closest(".video-cell")
+          .querySelector(".cell-camera-name")?.textContent,
+        camera.name
+      );
+    });
+  };
+
+  assertSingleHaPresentationPerCamera();
+
+  const moved = identities.get("Camera 1");
+  card.moveCameraBetweenSlots(0, 11);
+  harness.flushAnimationFrames();
+  assert.strictEqual(harness.getLogicalCell(card, 11), moved.cell);
+  assertSingleHaPresentationPerCamera();
+
+  card.maximizeCameraSlot(11);
+  harness.flushAnimationFrames();
+  assert.strictEqual(harness.getPlayer(card, "Camera 1"), moved.player);
+  assert.equal(moved.player.cameraImage, "camera.garage");
+  card.restoreMaximizedCamera();
+  harness.flushAnimationFrames();
+  assert.strictEqual(harness.getPlayer(card, "Camera 1"), moved.player);
+  assert.equal(
+    moved.player.cameraImage,
+    substreamEntities.get("camera.garage")
+  );
+  assertSingleHaPresentationPerCamera();
+
+  card.repackAssignedCameras();
+  harness.flushAnimationFrames();
+  assertSingleHaPresentationPerCamera();
+  assertIdentitiesUnchanged(
+    harness,
+    card,
+    cameras.map(camera => camera.name),
+    identities
+  );
+});
+
+test("HA hui-image experiment leaves an unmapped camera on its configured entity", t => {
+  const harness = setup(t);
+  const camera = {
+    name: "Unmapped",
+    entity: "camera.unmapped",
+    active: true
+  };
+  const card = harness.createCard({ cameras: [camera] });
+
+  card.assignCamera(camera.name);
+  harness.flushAnimationFrames();
+
+  const image = harness.getPlayer(card, camera.name);
+  assert.equal(image.cameraImage, camera.entity);
+
+  card.maximizeCameraSlot(0);
+  card.restoreMaximizedCamera();
+  harness.flushAnimationFrames();
+
+  assert.strictEqual(harness.getPlayer(card, camera.name), image);
+  assert.equal(image.cameraImage, camera.entity);
+});
+
+test("limited WebRTC experiment preserves included players and leaves excluded cameras inert", t => {
+  const harness = setup(t, {
+    useHaHuiImageExperiment: false
+  });
   const cameras = [
     { name: "Garage", entity: "camera.garage", active: true },
     { name: "Front Door", entity: "camera.front_door", active: true },

@@ -1,12 +1,9 @@
 import { readFileSync } from "node:fs";
 import { Window } from "happy-dom";
 
-const cardSource = readFileSync(
+const baseCardSource = readFileSync(
   new URL("../../nvr-card.js", import.meta.url),
   "utf8"
-).replace(
-  'import { FrigateProvider } from "./src/providers/frigate-provider.js";',
-  "const FrigateProvider = window.FrigateProvider;"
 );
 
 export const defaultCameras = [
@@ -16,7 +13,9 @@ export const defaultCameras = [
   { name: "Hall", entity: "camera.hall", active: true }
 ];
 
-export function createTestHarness() {
+export function createTestHarness({
+  useHaHuiImageExperiment = true
+} = {}) {
   const window = new Window({
     url: "http://localhost/",
     width: 1280,
@@ -228,6 +227,15 @@ export function createTestHarness() {
     MockProviderPlayer
   );
   window.FrigateProvider = MockFrigateProvider;
+  const cardSource = baseCardSource
+    .replace(
+      'import { FrigateProvider } from "./src/providers/frigate-provider.js";',
+      "const FrigateProvider = window.FrigateProvider;"
+    )
+    .replace(
+      "const USE_HA_HUI_IMAGE_EXPERIMENT = true;",
+      `const USE_HA_HUI_IMAGE_EXPERIMENT = ${useHaHuiImageExperiment};`
+    );
   window.eval(cardSource);
 
   function flushAnimationFrames() {
