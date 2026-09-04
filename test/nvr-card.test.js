@@ -168,14 +168,243 @@ test("initial render creates 16 persistent cells with unique logical slots", t =
   );
 });
 
-test("card lifecycle diagnostics distinguish instances and config paths without changing state", t => {
+test("reconnect diagnostic card IDs are unique and do not affect persistence keys", t => {
   const harness = setup(t);
-  const lifecycle = [];
+  const first = harness.createCard();
+  const second = harness.createCard();
+
+  assert.match(`card-${first._nvrInstanceId}`, /^card-\d+$/);
+  assert.notEqual(first._nvrInstanceId, second._nvrInstanceId);
+  assert.equal(
+    first.getWorkspacePersistenceKey(),
+    second.getWorkspacePersistenceKey()
+  );
+});
+
+test("setConfig reconnect diagnostic reports equivalent calls without changing identity", t => {
+  const harness = setup(t);
+  const card = harness.createCard();
+  const cells = harness.getPhysicalCells(card);
+  const logs = [];
+  const originalInfo = harness.window.console.info;
+  harness.window.console.info = (prefix, details) => {
+    if (prefix === "[NVR reconnect]") {
+      logs.push(details);
+    }
+  };
+  t.after(() => {
+    harness.window.console.info = originalInfo;
+  });
+
+  card.setConfig({
+    cameras: card.config.cameras.map(camera => ({ ...camera }))
+  });
+
+  const event = logs.find(entry => {
+    return entry.event === "set-config-called";
+  });
+  assert.equal(event.equivalent, true);
+  assert.equal(event.layout, "2x2");
+  assert.equal(event.assignedCameraCount, 0);
+  assert.deepEqual(harness.getPhysicalCells(card), cells);
+});
+
+test("card disconnect and reconnect diagnostics preserve state and hui-image identity", t => {
+  const harness = setup(t);
+  const reconnectEvents = [];
+  const originalInfo = harness.window.console.info;
+  harness.window.console.info = (prefix, details) => {
+    if (prefix === "[NVR reconnect]") {
+      reconnectEvents.push(details);
+    }
+  };
+  t.after(() => {
+    harness.window.console.info = originalInfo;
+  });
+  const card = harness.createCard();
+  card.selectLayout("3x3");
+  card.assignCameraToSlot("Garage", 4);
+  card.maximizeCameraSlot(4);
+  const image = harness.getPlayer(card, "Garage");
+  const assignmentsBefore = assignments(card);
+
+  card.remove();
+  harness.window.document.body.appendChild(card);
+
+  assert.equal(card._layout, "3x3");
+  assert.deepEqual(assignments(card), assignmentsBefore);
+  assert.equal(card._maximizedSlot, 4);
+  assert.strictEqual(harness.getPlayer(card, "Garage"), image);
+  assert.ok(reconnectEvents.some(entry => {
+    return entry.event === "card-disconnected";
+  }));
+  assert.ok(reconnectEvents.some(entry => {
+    return entry.event === "card-connected";
+  }));
+  assert.ok(reconnectEvents.some(entry => {
+    return entry.event === "reconnect-snapshot" &&
+      entry.reason === "card-disconnected";
+  }));
+});
+
+test("reconnect snapshot reports ownership and source without changing runtime state", t => {
+  const harness = setup(t);
+  const card = harness.createCard();
+  card.assignCamera("Garage");
+  const image = harness.getPlayer(card, "Garage");
+  const source = image.cameraImage;
+  const writesBefore = harness.userStateCalls.filter(call => {
+    return call.type === "frontend/set_user_data";
+  }).length;
+  let renderSlotCalls = 0;
+  const renderSlot = card.renderSlot.bind(card);
+  card.renderSlot = slot => {
+    renderSlotCalls += 1;
+    return renderSlot(slot);
+  };
+
+  const first = card.captureReconnectSnapshot("test-first");
+  const second = card.captureReconnectSnapshot("test-second");
+
+  assert.equal(first.cells.length, 1);
+  assert.deepEqual({
+    slot: first.cells[0].slot,
+    logicalCamera: first.cells[0].logicalCamera,
+    logicalEntity: first.cells[0].logicalEntity,
+    cellExists: first.cells[0].cellExists,
+    huiImageExists: first.cells[0].huiImageExists,
+    huiImageConnected: first.cells[0].huiImageConnected,
+    cameraImage: first.cells[0].cameraImage,
+    expected: first.cells[0].expectedLiveSourceEntity,
+    matches: first.cells[0].sourceMatchesExpected
+  }, {
+    slot: 0,
+    logicalCamera: "Garage",
+    logicalEntity: "camera.garage",
+    cellExists: true,
+    huiImageExists: true,
+    huiImageConnected: true,
+    cameraImage: source,
+    expected: source,
+    matches: true
+  });
+  assert.equal(
+    first.cells[0].sameHuiImageIdentityAsPrevious,
+    null
+  );
+  assert.equal(
+    second.cells[0].sameHuiImageIdentityAsPrevious,
+    true
+  );
+  assert.equal(renderSlotCalls, 0);
+  assert.strictEqual(harness.getPlayer(card, "Garage"), image);
+  assert.equal(image.cameraImage, source);
+  assert.equal(harness.userStateCalls.filter(call => {
+    return call.type === "frontend/set_user_data";
+  }).length, writesBefore);
+});
+
+test("changed hass connection identity is observed without rerender or rehydration", t => {
+  const harness = setup(t);
+  const card = harness.createCard();
+  card.assignCamera("Garage");
+  const image = harness.getPlayer(card, "Garage");
+  const source = image.cameraImage;
+  const logs = [];
+  const originalInfo = harness.window.console.info;
+  harness.window.console.info = (prefix, details) => {
+    if (prefix === "[NVR reconnect]") {
+      logs.push(details);
+    }
+  };
+  t.after(() => {
+    harness.window.console.info = originalInfo;
+  });
+  let renderSlotCalls = 0;
+  card.renderSlot = () => {
+    renderSlotCalls += 1;
+  };
+  const loadsBefore = harness.userStateCalls.filter(call => {
+    return call.type === "frontend/get_user_data";
+  }).length;
+  const nextHass = harness.createHass();
+  nextHass.connection = { connected: true };
+  nextHass.states[source] = {
+    state: "streaming",
+    attributes: {}
+  };
+
+  card.hass = nextHass;
+
+  const changed = logs.find(entry => {
+    return entry.event === "hass-reference-changed";
+  });
+  assert.equal(changed.hassChanged, true);
+  assert.equal(changed.connectionChanged, true);
+  assert.equal(changed.connectionConnected, true);
+  assert.equal(renderSlotCalls, 0);
+  assert.strictEqual(harness.getPlayer(card, "Garage"), image);
+  assert.equal(image.cameraImage, source);
+  assert.equal(harness.userStateCalls.filter(call => {
+    return call.type === "frontend/get_user_data";
+  }).length, loadsBefore);
+  const snapshot = logs.find(entry => {
+    return entry.event === "reconnect-snapshot" &&
+      entry.reason === "hass-reference-changed";
+  });
+  assert.equal(snapshot.cells[0].haStateEntityExists, true);
+  assert.equal(snapshot.cells[0].haState, "streaming");
+});
+
+test("public connection state changes emit lost and restored snapshots without timers", t => {
+  const harness = setup(t);
+  const connection = { connected: true };
+  const initialHass = harness.createHass();
+  initialHass.connection = connection;
+  const card = harness.createCard({ hass: initialHass });
+  card.assignCamera("Garage");
+  const image = harness.getPlayer(card, "Garage");
+  const logs = [];
+  const originalInfo = harness.window.console.info;
+  harness.window.console.info = (prefix, details) => {
+    if (prefix === "[NVR reconnect]") {
+      logs.push(details);
+    }
+  };
+  t.after(() => {
+    harness.window.console.info = originalInfo;
+  });
+
+  connection.connected = false;
+  const disconnectedHass = harness.createHass();
+  disconnectedHass.connection = connection;
+  card.hass = disconnectedHass;
+  connection.connected = true;
+  const restoredHass = harness.createHass();
+  restoredHass.connection = connection;
+  card.hass = restoredHass;
+
+  assert.ok(logs.some(entry => {
+    return entry.event === "ha-connection-lost";
+  }));
+  assert.ok(logs.some(entry => {
+    return entry.event === "ha-connection-restored";
+  }));
+  assert.ok(logs.some(entry => {
+    return entry.event === "reconnect-snapshot" &&
+      entry.reason === "connection-restored";
+  }));
+  assert.strictEqual(harness.getPlayer(card, "Garage"), image);
+});
+
+test("card lifecycle and equivalent config paths stay quiet without changing state", t => {
+  const harness = setup(t);
+  const lifecycleLogs = [];
   const originalInfo = harness.window.console.info;
 
   harness.window.console.info = (prefix, details) => {
     if (prefix === "[NVR card lifecycle]") {
-      lifecycle.push(details);
+      lifecycleLogs.push(details);
     }
   };
   t.after(() => {
@@ -191,32 +420,8 @@ test("card lifecycle diagnostics distinguish instances and config paths without 
   card.setConfig(equivalentConfig);
 
   const secondCard = harness.createCard();
-  const firstConstructor = lifecycle.find(entry => {
-    return entry.event === "constructor";
-  });
-  const secondConstructor = lifecycle.filter(entry => {
-    return entry.event === "constructor";
-  })[1];
-
-  assert.match(firstConstructor.runtimeInstanceId, /^card-\d+$/);
-  assert.match(secondConstructor.runtimeInstanceId, /^card-\d+$/);
-  assert.notEqual(
-    firstConstructor.runtimeInstanceId,
-    secondConstructor.runtimeInstanceId
-  );
-  assert.ok(lifecycle.some(entry => {
-    return (
-      entry.runtimeInstanceId === firstConstructor.runtimeInstanceId &&
-      entry.event === "layout-default-selected" &&
-      entry.visibleCellCount === 4
-    );
-  }));
-  assert.ok(lifecycle.some(entry => {
-    return (
-      entry.runtimeInstanceId === firstConstructor.runtimeInstanceId &&
-      entry.event === "set-config-equivalent-no-op"
-    );
-  }));
+  assert.notEqual(card._nvrInstanceId, secondCard._nvrInstanceId);
+  assert.deepEqual(lifecycleLogs, []);
   assert.deepEqual(harness.getPhysicalCells(card), initialCells);
   assert.equal(card._layout, "2x2");
   assert.deepEqual(
@@ -625,7 +830,7 @@ test("HA user workspace uses stable frontend user-data messages without a user i
   ]);
 });
 
-test("save diagnostics read back without mutating workspace or exposing prohibited data", t => {
+test("workspace save performs no diagnostic read-back and routine success stays quiet", t => {
   const harness = setup(t);
   const diagnostics = [];
   const originalInfo = harness.window.console.info;
@@ -642,32 +847,14 @@ test("save diagnostics read back without mutating workspace or exposing prohibit
   const card = harness.createCard();
   card.assignCameraToSlot("Front", 0);
   const stateAfterSave = JSON.stringify(card.captureWorkspace());
-  const calls = harness.userStateCalls.slice(-2);
+  const calls = harness.userStateCalls.slice(-1);
 
   assert.deepEqual(calls.map(call => call.type), [
-    "frontend/set_user_data",
-    "frontend/get_user_data"
+    "frontend/set_user_data"
   ]);
   assert.equal(JSON.stringify(card.captureWorkspace()), stateAfterSave);
 
-  const events = diagnostics.map(entry => entry.event);
-  assert.ok(events.includes("workspace-save-request"));
-  assert.ok(events.includes("workspace-save-response"));
-  assert.ok(events.includes("workspace-save-verify"));
-  assert.ok(events.includes("workspace-hydration-interpretation"));
-  assert.ok(events.includes("workspace-hydration-applied"));
-
-  diagnostics.forEach(entry => {
-    if (entry.event.startsWith("workspace-load") ||
-        entry.event.startsWith("workspace-save")) {
-      assert.equal(entry.workspaceKey, card.getWorkspacePersistenceKey());
-    }
-  });
-  const serialized = JSON.stringify(diagnostics).toLowerCase();
-  ["auth_token", "access_token", "cookie", "headers", "signed_url",
-    "stream_url"].forEach(prohibited => {
-    assert.equal(serialized.includes(prohibited), false);
-  });
+  assert.deepEqual(diagnostics, []);
 });
 
 test("valid remote workspace is authoritative over legacy local storage", t => {
@@ -796,6 +983,14 @@ test("two independent cards restore the same HA-user workspace without local sto
 
 test("malformed remote workspace leaves current runtime state safe", t => {
   const harness = setup(t);
+  const warnings = [];
+  const originalWarn = harness.window.console.warn;
+  harness.window.console.warn = (prefix, details) => {
+    warnings.push({ prefix, details });
+  };
+  t.after(() => {
+    harness.window.console.warn = originalWarn;
+  });
   const card = harness.window.document.createElement("nvr-card");
   harness.userStateBackend.set(
     card.getWorkspacePersistenceKey(),
@@ -810,6 +1005,39 @@ test("malformed remote workspace leaves current runtime state safe", t => {
   assert.deepEqual(
     harness.userStateBackend.get(card.getWorkspacePersistenceKey()),
     { version: 99, viewState: null }
+  );
+  assert.deepEqual(warnings.map(entry => entry.details.event), [
+    "workspace-load-failed"
+  ]);
+});
+
+test("workspace save failures remain concise and do not revert runtime state", async t => {
+  const harness = setup(t);
+  const card = harness.createCard();
+  const warnings = [];
+  const originalWarn = harness.window.console.warn;
+  harness.window.console.warn = (prefix, details) => {
+    warnings.push({ prefix, details });
+  };
+  t.after(() => {
+    harness.window.console.warn = originalWarn;
+  });
+  card._userStateStore = {
+    load: card._userStateStore.load.bind(card._userStateStore),
+    save: () => Promise.reject(new Error("diagnostic failure"))
+  };
+
+  card.selectLayout("3x3");
+  await Promise.resolve();
+  await Promise.resolve();
+
+  assert.equal(card._layout, "3x3");
+  assert.equal(warnings.length, 1);
+  assert.equal(warnings[0].prefix, "[NVR user state]");
+  assert.equal(warnings[0].details.event, "workspace-save-failed");
+  assert.equal(
+    warnings[0].details.workspaceKey,
+    card.getWorkspacePersistenceKey()
   );
 });
 
@@ -2678,10 +2906,8 @@ test("HA hui-image experiment renders all 11 cameras without provider media or d
   );
 });
 
-test("live-transition diagnostics document the ONVIF Main maximize source without rebuilding", t => {
-  const harness = setup(t, {
-    liveTransitionDiagnostics: true
-  });
+test("ONVIF source switching stays quiet and does not rebuild", t => {
+  const harness = setup(t);
   const card = harness.createCard({
     cameras: [{
       name: "Garage",
@@ -2694,12 +2920,12 @@ test("live-transition diagnostics document the ONVIF Main maximize source withou
   const image = harness.getPlayer(card, "Garage");
   const cell = image.closest(".video-cell");
   const sidebar = card.querySelector(".nvr-sidebar");
-  const events = [];
+  const transitionLogs = [];
   const originalInfo = harness.window.console.info;
 
   harness.window.console.info = (prefix, payload) => {
     if (prefix === "[NVR live transition]") {
-      events.push(payload);
+      transitionLogs.push(payload);
     }
   };
   t.after(() => {
@@ -2727,48 +2953,15 @@ test("live-transition diagnostics document the ONVIF Main maximize source withou
     card.classifyLivePresentationEntity(image.cameraImage),
     "ONVIF_MAIN"
   );
-  assert.deepEqual(
-    events.map(event => event.event),
-    [
-      "maximize-requested",
-      "source-selected",
-      "source-properties-changed",
-      "source-property-confirmed",
-      "media-signal-unavailable"
-    ]
-  );
-  events.forEach(event => {
-    assert.equal(event.camera, "Garage");
-    assert.equal(event.slot, 0);
-    assert.equal(
-      event.fromEntity,
-      "camera.lorex_mediaprofile_channel1_substream1_3"
-    );
-    assert.equal(
-      event.toEntity,
-      "camera.garage_garage_camera_lorex_mediaprofile_channel1_mainstream"
-    );
-    assert.equal(event.presentationState, "maximize");
-    assert.equal(event.fromSourceType, "ONVIF_SUB1");
-    assert.equal(event.toSourceType, "ONVIF_MAIN");
-    assert.equal(event.sourceType, "ONVIF_MAIN");
-    assert.equal(typeof event.timeMs, "number");
-    assert.equal(typeof event.elapsedMs, "number");
-  });
+  assert.deepEqual(transitionLogs, []);
 
-  events.length = 0;
   card.restoreMaximizedCamera();
   assert.strictEqual(harness.getPlayer(card, "Garage"), image);
   assert.equal(
     image.cameraImage,
     "camera.lorex_mediaprofile_channel1_substream1_3"
   );
-  assert.equal(events[0].event, "restore-requested");
-  events.forEach(event => {
-    assert.equal(event.fromSourceType, "ONVIF_MAIN");
-    assert.equal(event.toSourceType, "ONVIF_SUB1");
-    assert.equal(event.sourceType, "ONVIF_SUB1");
-  });
+  assert.deepEqual(transitionLogs, []);
 });
 
 test("ONVIF registry discovery pairs profiles only by authoritative registry identity", async t => {

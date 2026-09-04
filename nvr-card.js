@@ -6,7 +6,7 @@ import { FrigateProvider } from "./src/providers/frigate-provider.js";
 
 const NVR_BUILD = "__NVR_BUILD__";
 const USE_HA_HUI_IMAGE_EXPERIMENT = true;
-const NVR_LIVE_TRANSITION_DIAGNOSTICS = true;
+const NVR_LIVE_TRANSITION_DIAGNOSTICS = false;
 const NVR_GRID_SLOT_CAPACITY = 16;
 const HA_HUI_IMAGE_SUBSTREAM_ENTITIES = Object.freeze({
   "camera.garage":
@@ -140,11 +140,6 @@ class HomeAssistantUserStateStore {
       );
     }
 
-    console.info("[NVR user state]", {
-      event: "workspace-load-request",
-      workspaceKey: key
-    });
-
     return hass.callWS({
       type: "frontend/get_user_data",
       key
@@ -155,23 +150,6 @@ class HomeAssistantUserStateStore {
         Object.prototype.hasOwnProperty.call(response, "value")
           ? response.value
           : response;
-
-      console.info("[NVR user state]", {
-        event: "workspace-load-response",
-        workspaceKey: key,
-        responseType: Array.isArray(response)
-          ? "array"
-          : response === null
-            ? "null"
-            : typeof response,
-        responseKeys:
-          response && typeof response === "object"
-            ? Object.keys(response)
-            : [],
-        response,
-        interpretedWorkspacePresent:
-          value !== null && value !== undefined
-      });
 
       return value === null || value === undefined
         ? { result: "not-found", value: null }
@@ -188,62 +166,10 @@ class HomeAssistantUserStateStore {
       );
     }
 
-    console.info("[NVR user state]", {
-      event: "workspace-save-request",
-      workspaceKey: key,
-      workspace: value
-    });
-
     return hass.callWS({
       type: "frontend/set_user_data",
       key,
       value
-    }).then(response => {
-      console.info("[NVR user state]", {
-        event: "workspace-save-response",
-        workspaceKey: key,
-        responseType: Array.isArray(response)
-          ? "array"
-          : response === null
-            ? "null"
-            : typeof response,
-        response
-      });
-
-      return hass.callWS({
-        type: "frontend/get_user_data",
-        key
-      }).then(verifyResponse => {
-        const interpretedValue =
-          verifyResponse &&
-          typeof verifyResponse === "object" &&
-          Object.prototype.hasOwnProperty.call(
-            verifyResponse,
-            "value"
-          )
-            ? verifyResponse.value
-            : verifyResponse;
-
-        console.info("[NVR user state]", {
-          event: "workspace-save-verify",
-          workspaceKey: key,
-          responseType: Array.isArray(verifyResponse)
-            ? "array"
-            : verifyResponse === null
-              ? "null"
-              : typeof verifyResponse,
-          responseKeys:
-            verifyResponse && typeof verifyResponse === "object"
-              ? Object.keys(verifyResponse)
-              : [],
-          response: verifyResponse,
-          interpretedWorkspacePresent:
-            interpretedValue !== null &&
-            interpretedValue !== undefined
-        });
-
-        return response;
-      });
     });
   }
 }
@@ -412,6 +338,9 @@ class NVRCard extends HTMLElement {
     this._savedViews = [];
     this._savedViewsLoaded = false;
     this._savedViewsMessage = "";
+    this._reconnectNodeIdentity = new WeakMap();
+    this._lastObservedConnection = null;
+    this._lastObservedConnectionConnected = null;
     this._nvrInstanceId =
       NVR_FLIGHT_RECORDER_STATE.nextInstanceId++;
     this._nvrVisibilityHandler = () => {
@@ -684,21 +613,95 @@ class NVRCard extends HTMLElement {
 
 
   logCardLifecycle(event, details = {}) {
-    const assignedSlots =
-      this.getLifecycleAssignedSlots();
+    void event;
+    void details;
+  }
 
-    console.info("[NVR card lifecycle]", {
-      runtimeInstanceId: `card-${this._nvrInstanceId}`,
-      event,
+
+  getReconnectDiagnosticContext() {
+    return {
+      cardInstanceId: `card-${this._nvrInstanceId}`,
       timestamp: new Date().toISOString(),
-      connected: this.isConnected,
-      configKey: this.getLifecycleConfigKey(),
+      performanceTime: performance.now(),
       layout: this._layout,
-      assignedCameraCount: assignedSlots.length,
-      assignedSlots,
+      assignedCameraCount:
+        this._assignedCameras.filter(Boolean).length,
       maximizedSlot: this._maximizedSlot,
+      workspaceHydrated: this._workspaceHydrated,
+      hassPresent: Boolean(this._hass)
+    };
+  }
+
+
+  logReconnect(event, details = {}) {
+    console.info("[NVR reconnect]", {
+      event,
+      ...this.getReconnectDiagnosticContext(),
       ...details
     });
+  }
+
+
+  captureReconnectSnapshot(reason) {
+    const cells = this._assignedCameras.flatMap(
+      (cameraName, slot) => {
+        if (cameraName === null) {
+          return [];
+        }
+
+        const camera = this.getCameraByName(cameraName);
+        const cell = this.querySelector(
+          `.video-cell[data-slot="${slot}"]`
+        );
+        const image = cell?.querySelector(
+          "hui-image.nvr-live-camera"
+        ) ?? null;
+        const expectedEntity = camera
+          ? slot === this._maximizedSlot
+            ? HA_HUI_IMAGE_MAINSTREAM_ENTITIES[camera.entity] ??
+              camera.entity
+            : HA_HUI_IMAGE_SUBSTREAM_ENTITIES[camera.entity] ??
+              camera.entity
+          : null;
+        const rememberedImage = cell
+          ? this._reconnectNodeIdentity.get(cell)
+          : undefined;
+
+        if (cell && image) {
+          this._reconnectNodeIdentity.set(cell, image);
+        }
+
+        return [{
+          slot,
+          logicalCamera: cameraName,
+          logicalEntity: camera?.entity ?? null,
+          cellExists: Boolean(cell),
+          huiImageExists: Boolean(image),
+          huiImageConnected: image?.isConnected ?? false,
+          cameraImage: image?.cameraImage ?? null,
+          cameraView: image?.cameraView ?? null,
+          expectedLiveSourceEntity: expectedEntity,
+          sourceMatchesExpected:
+            Boolean(image) && image.cameraImage === expectedEntity,
+          haStateEntityExists:
+            Boolean(expectedEntity) &&
+            Boolean(this._hass?.states?.[expectedEntity]),
+          haState:
+            this._hass?.states?.[expectedEntity]?.state ?? null,
+          sameHuiImageIdentityAsPrevious:
+            rememberedImage === undefined
+              ? null
+              : rememberedImage === image
+        }];
+      }
+    );
+
+    const snapshot = {
+      reason,
+      cells
+    };
+    this.logReconnect("reconnect-snapshot", snapshot);
+    return snapshot;
   }
 
 
@@ -1001,7 +1004,8 @@ class NVRCard extends HTMLElement {
 
 
   logUserState(event, details = {}) {
-    console.info("[NVR user state]", { event, ...details });
+    void event;
+    void details;
   }
 
 
@@ -1482,13 +1486,16 @@ class NVRCard extends HTMLElement {
       JSON.stringify(normalized);
     const nextConfigKey =
       this.getLifecycleConfigKey(normalizedConfigKey);
+    const equivalent =
+      this._normalizedConfigKey === normalizedConfigKey;
+
+    this.logReconnect("set-config-called", {
+      equivalent
+    });
 
     this.config = config;
 
-    if (
-      this._normalizedConfigKey ===
-      normalizedConfigKey
-    ) {
+    if (equivalent) {
       this.logCardLifecycle("set-config-equivalent-no-op", {
         nextConfigKey
       });
@@ -1690,11 +1697,57 @@ class NVRCard extends HTMLElement {
 
 
   set hass(hass) {
-    if (hass === this._hass) {
+    const previousHass = this._hass;
+    const previousConnection = this._lastObservedConnection;
+    const previousConnected =
+      this._lastObservedConnectionConnected;
+    const nextConnection = hass?.connection ?? null;
+    const nextConnected =
+      typeof nextConnection?.connected === "boolean"
+        ? nextConnection.connected
+        : null;
+    const connectionChanged =
+      previousConnection !== nextConnection;
+    const connectionStateChanged =
+      previousConnected !== null &&
+      nextConnected !== null &&
+      previousConnected !== nextConnected;
+
+    this._lastObservedConnection = nextConnection;
+    this._lastObservedConnectionConnected = nextConnected;
+    this._hass = hass;
+
+    if (
+      previousHass &&
+      (connectionChanged || connectionStateChanged)
+    ) {
+      this.logReconnect("hass-reference-changed", {
+        hassChanged: previousHass !== hass,
+        connectionChanged,
+        connectionConnected: nextConnected
+      });
+      this.captureReconnectSnapshot(
+        "hass-reference-changed"
+      );
+
+      if (connectionStateChanged) {
+        const event = nextConnected
+          ? "ha-connection-restored"
+          : "ha-connection-lost";
+        this.logReconnect(event, { connectionChanged });
+
+        if (nextConnected) {
+          this.captureReconnectSnapshot(
+            "connection-restored"
+          );
+        }
+      }
+    }
+
+    if (hass === previousHass) {
       return;
     }
 
-    this._hass = hass;
     this.updateLiveStreams();
     this.updateCameraStatuses();
     this.hydrateWorkspace();
@@ -1702,6 +1755,8 @@ class NVRCard extends HTMLElement {
 
 
   connectedCallback() {
+    this.logReconnect("card-connected");
+    this.captureReconnectSnapshot("card-connected");
     this.logCardLifecycle("connected-callback");
     this.recordNvrFlight("card-connected");
     this.installViewportListeners();
@@ -1717,6 +1772,8 @@ class NVRCard extends HTMLElement {
 
 
   disconnectedCallback() {
+    this.logReconnect("card-disconnected");
+    this.captureReconnectSnapshot("card-disconnected");
     this.logCardLifecycle("disconnected-callback");
     this.recordNvrFlight("card-disconnected");
     this.completeMaximizeMediaSession("disconnected");
@@ -3618,11 +3675,6 @@ class NVRCard extends HTMLElement {
       registryEntities
     );
 
-    console.info("[NVR ONVIF profile discovery]", {
-      event: "registry-paired",
-      mappings
-    });
-
     return mappings;
   }
 
@@ -3632,29 +3684,8 @@ class NVRCard extends HTMLElement {
       return;
     }
 
-    const timeMs = performance.now();
-
-    console.info("[NVR live transition]", {
-      event,
-      timestamp: new Date().toISOString(),
-      timeMs,
-      elapsedMs: timeMs - transition.startTime,
-      camera: transition.camera,
-      slot: transition.slot,
-      fromEntity: transition.fromEntity,
-      toEntity: transition.toEntity,
-      presentationState: transition.presentationState,
-      sourceType: this.classifyLivePresentationEntity(
-        transition.toEntity
-      ),
-      fromSourceType: this.classifyLivePresentationEntity(
-        transition.fromEntity
-      ),
-      toSourceType: this.classifyLivePresentationEntity(
-        transition.toEntity
-      ),
-      ...details
-    });
+    void event;
+    void details;
   }
 
 
@@ -3794,39 +3825,14 @@ class NVRCard extends HTMLElement {
 
 
   traceProviderCellLifecycle(event, cell, details = {}) {
-    const physicalCellIndex = Array.from(
-      this.querySelectorAll(".video-cell")
-    ).indexOf(cell);
-    const mappedPresentation =
-      this._providerPresentations.get(cell);
-
-    console.info("[NVR provider cell lifecycle]", {
-      event,
-      cardId: this._nvrInstanceId,
-      physicalCellId:
-        physicalCellIndex >= 0
-          ? `physical-cell-${physicalCellIndex}`
-          : null,
-      physicalCellIndex,
-      logicalSlot: Number(cell?.dataset.slot),
-      mapSize: this._providerPresentations.size,
-      mappedPresentationId:
-        mappedPresentation?.diagnostic?.presentationId ?? null,
-      mappedPlayerId:
-        mappedPresentation?.diagnostic?.playerId ?? null,
-      ...details
-    });
+    void event;
+    void cell;
+    void details;
   }
 
 
   traceActiveProviderPresentationCount(reason) {
-    console.info("[NVR provider experiment]", {
-      reason,
-      experimentLimit:
-        this._frigateProvider.experimentLimit,
-      activeProviderPresentations:
-        this._providerPresentations.size
-    });
+    void reason;
   }
 
 
@@ -4732,19 +4738,8 @@ class NVRCard extends HTMLElement {
 
 
   logMaximizeDiagnostic(eventName, details = {}) {
-    if (!NVR_MAXIMIZE_DIAGNOSTICS) {
-      return;
-    }
-
-    console.debug(
-      "[NVR maximize diagnostic]",
-      {
-        timestamp: new Date().toISOString(),
-        timeMs: Number(performance.now().toFixed(1)),
-        event: eventName,
-        ...details
-      }
-    );
+    void eventName;
+    void details;
   }
 
 

@@ -20,10 +20,8 @@ let nextPresentationId = 1;
 let nextPlayerId = 1;
 
 function traceProviderLifecycle(event, details) {
-  console.info("[NVR provider lifecycle]", {
-    event,
-    ...details
-  });
+  void event;
+  void details;
 }
 
 class NvrGo2RtcVideo extends VideoRTC {
@@ -67,6 +65,13 @@ class NvrGo2RtcVideo extends VideoRTC {
   }
 
   disconnectedCallback() {
+    if (!this._nvrClosed) {
+      console.warn("[NVR live] provider player disconnected unexpectedly", {
+        cameraEntity: this._nvrCameraEntity ?? null,
+        presentationId: this._nvrPresentationId ?? null,
+        playerId: this._nvrPlayerId
+      });
+    }
     this.traceLifecycle("disconnected-callback-start");
     super.disconnectedCallback();
     this.traceLifecycle("disconnected-callback-end", {
@@ -129,11 +134,25 @@ class NvrGo2RtcVideo extends VideoRTC {
         });
 
         if (stale) {
+          console.warn("[NVR live] stale signed session ignored", {
+            cameraEntity: this._nvrCameraEntity ?? null,
+            presentationId: this._nvrPresentationId ?? null,
+            playerId: this._nvrPlayerId,
+            signAttempt
+          });
           return;
         }
 
         this.wsURL = toWebSocketUrl(result.path);
         const connectionStarted = super.onconnect();
+        if (connectionStarted === false) {
+          console.warn("[NVR live] provider connection did not start", {
+            cameraEntity: this._nvrCameraEntity ?? null,
+            presentationId: this._nvrPresentationId ?? null,
+            playerId: this._nvrPlayerId,
+            signAttempt
+          });
+        }
         this.traceLifecycle("upstream-onconnect-result", {
           signAttempt,
           connectionStarted
@@ -145,10 +164,14 @@ class NvrGo2RtcVideo extends VideoRTC {
           errorName: error?.name ?? null,
           errorMessage: error?.message ?? String(error)
         });
-        console.error(
-          "Failed to sign Frigate live stream path:",
-          error
-        );
+        console.error("[NVR live] provider signing failed", {
+          cameraEntity: this._nvrCameraEntity ?? null,
+          presentationId: this._nvrPresentationId ?? null,
+          playerId: this._nvrPlayerId,
+          signAttempt,
+          errorName: error?.name ?? null,
+          errorMessage: error?.message ?? String(error)
+        });
       })
       .finally(() => {
         if (this._nvrSigning === signing) {
@@ -214,6 +237,10 @@ export class FrigateProvider {
       typeof streamId !== "string" ||
       streamId.trim().length === 0
     ) {
+      console.warn("[NVR live] provider source unavailable", {
+        cameraEntity: camera?.entity ?? null,
+        reason: "missing-camera-name"
+      });
       traceProviderLifecycle("provider-open-skipped", {
         presentationId: null,
         playerId: null,
