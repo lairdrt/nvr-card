@@ -670,6 +670,56 @@ test("card disconnect and reconnect diagnostics preserve state and hui-image ide
   }));
 });
 
+test("live status positions default safely and update the existing stalled spinner without touching media", t => {
+  const harness = setup(t);
+  const card = harness.createCard();
+  card.assignCamera("Garage");
+  const image = harness.getPlayer(card, "Garage");
+  const video = addReachableVideo(harness, image);
+  const state = card._reconnectPresentationDiagnostics.get(image);
+  const indicator = state.statusElement;
+  const source = image.cameraImage;
+  const before = harness.capturePlayerIdentity(card, "Garage");
+  const config = card.config;
+  card.inspectReconnectPresentation(state);
+  presentFrame(video);
+  harness.advanceTime(10000);
+  assert.equal(indicator.hidden, false);
+
+  const assertPosition = expected => {
+    const [vertical, horizontal] = expected.split("-");
+    for (const side of ["top", "bottom", "left", "right"]) {
+      assert.equal(indicator.style[side],
+        side === vertical || side === horizontal ? "8px" : "auto");
+    }
+  };
+  assertPosition("bottom-left");
+  Object.defineProperty(image, "cameraImage", {
+    configurable: true,
+    get: () => source,
+    set: () => assert.fail("position must not write the camera source")
+  });
+  for (const [liveStatus, expected] of [
+    [{ position: "bottom-left" }, "bottom-left"],
+    [{ position: "bottom-right" }, "bottom-right"],
+    [{ position: "top-left" }, "top-left"],
+    [{ position: "top-right" }, "top-right"],
+    [{ position: "invalid" }, "bottom-left"],
+    [{}, "bottom-left"],
+    [undefined, "bottom-left"]
+  ]) {
+    card.setConfig({ ...config, live_status: liveStatus });
+    assertPosition(expected);
+    assertIdentityUnchanged(harness, card, "Garage", before);
+    assert.strictEqual(card._reconnectPresentationDiagnostics.get(image), state);
+    assert.strictEqual(state.video, video);
+    assert.strictEqual(state.statusElement, indicator);
+    assert.equal(card.querySelectorAll(".nvr-live-state-indicator").length, 1);
+    assert.equal(indicator.hidden, false);
+    assert.equal(image.cameraImage, source);
+  }
+});
+
 test("first frame starts liveness and healthy presentation has no spinner", t => {
   const harness = setup(t);
   const card = harness.createCard();

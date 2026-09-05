@@ -291,6 +291,7 @@ class NVRCard extends HTMLElement {
 
     this._sidebarCollapsed = null;
     this._viewportListenersInstalled = false;
+    this._liveStatusPosition = "bottom-left";
     this._autoDimConfig = AUTO_DIM_DEFAULTS;
     this._idleTimer = null;
     this._fadeTimer = null;
@@ -769,6 +770,7 @@ class NVRCard extends HTMLElement {
     if (!frame) return;
     const indicator = document.createElement("div");
     indicator.className = "nvr-live-state-indicator";
+    this.positionLiveStatusIndicator(indicator);
     indicator.hidden = true;
     indicator.setAttribute("aria-label", "Camera stream stalled");
     const icon = document.createElement("ha-icon");
@@ -784,6 +786,16 @@ class NVRCard extends HTMLElement {
     if (!state.active || !state.statusElement) return;
     state.statusElement.hidden = !stalled;
     state.visualState = stalled ? "stalled" : "live";
+  }
+
+
+  positionLiveStatusIndicator(indicator) {
+    const [vertical, horizontal] = this._liveStatusPosition.split("-");
+    for (const side of ["top", "bottom", "left", "right"]) {
+      indicator.style[side] = side === vertical || side === horizontal
+        ? "8px"
+        : "auto";
+    }
   }
 
 
@@ -1780,6 +1792,13 @@ class NVRCard extends HTMLElement {
 
     const normalized =
       this.normalizeConfig(config);
+    const position = config.live_status?.position;
+    this._liveStatusPosition = [
+      "bottom-left", "bottom-right", "top-left", "top-right"
+    ].includes(position) ? position : "bottom-left";
+    this._activeReconnectPresentationDiagnostics.forEach(state => {
+      if (state.statusElement) this.positionLiveStatusIndicator(state.statusElement);
+    });
     const autoDimDiagnosticKey = JSON.stringify(normalized.autoDim);
     if (this._autoDimDiagnosticConfigKey !== autoDimDiagnosticKey) {
       this._autoDimDiagnosticConfigKey = autoDimDiagnosticKey;
@@ -3465,8 +3484,6 @@ class NVRCard extends HTMLElement {
 
       .nvr-live-state-indicator {
         position: absolute;
-        right: 8px;
-        bottom: 8px;
         z-index: 6;
         width: 24px;
         height: 24px;
