@@ -380,6 +380,7 @@ class NVRCard extends HTMLElement {
     this._reconnectNodeIdentity = new WeakMap();
     this._reconnectPresentationIdentities = new WeakMap();
     this._reconnectPresentationDiagnostics = new WeakMap();
+    this._reconnectPresentationSources = new WeakMap();
     this._activeReconnectPresentationDiagnostics = new Set();
     this._nextReconnectPresentationId = 1;
     this._lastObservedConnection = null;
@@ -742,14 +743,15 @@ class NVRCard extends HTMLElement {
   cleanupReconnectPresentationDiagnostics(image) {
     const state = this._reconnectPresentationDiagnostics.get(image);
     if (!state) return;
+    state.active = false;
+    this.cleanupReconnectVideo(state);
     state.observers.forEach(observer => observer.disconnect());
     state.mediaListeners.forEach(({ target, event, listener }) => {
       target.removeEventListener(event, listener);
     });
-    if (state.frameCallback !== null && state.video?.cancelVideoFrameCallback) {
-      state.video.cancelVideoFrameCallback(state.frameCallback);
-    }
     if (state.silenceTimer !== null) clearTimeout(state.silenceTimer);
+    if (state.firstFrameTimer !== null) clearTimeout(state.firstFrameTimer);
+    state.firstFrameTimer = null;
     state.statusElement?.remove();
     state.active = false;
     this._activeReconnectPresentationDiagnostics.delete(state);
@@ -813,13 +815,19 @@ class NVRCard extends HTMLElement {
       this.setReconnectPresentationVisualState(state, false);
       this.logReconnect("frame-resumed", this.getReconnectPresentationDetails(state));
     }
+    this.armReconnectSilenceTimer(state);
+  }
+
+
+  armReconnectSilenceTimer(state) {
     if (state.silenceTimer !== null) clearTimeout(state.silenceTimer);
     state.silenceTimer = setTimeout(() => {
       state.silenceTimer = null;
       if (!state.active || document.visibilityState === "hidden" || state.lastFrameTime === null) return;
+      this.setReconnectPresentationVisualState(state, true);
+      if (state.stallLogged) return;
       state.stallLogged = true;
       state.stallStartedAt = performance.now();
-      this.setReconnectPresentationVisualState(state, true);
       this.logReconnect("frame-stall-detected", {
         ...this.getReconnectPresentationDetails(state),
         elapsedSinceLastFrameMs: Math.round(performance.now() - state.lastFrameTime),
@@ -838,14 +846,37 @@ class NVRCard extends HTMLElement {
       return;
     }
     state.lastFrameTime = performance.now();
+    this.armReconnectSilenceTimer(state);
+  }
+
+
+  cleanupReconnectVideo(state) {
+    state.videoGeneration += 1;
+    const video = state.video;
+    state.mediaListeners = state.mediaListeners.filter(entry => {
+      if (entry.target !== video) return true;
+      entry.target.removeEventListener(entry.event, entry.listener);
+      return false;
+    });
+    if (state.frameCallback !== null && video?.cancelVideoFrameCallback) {
+      video.cancelVideoFrameCallback(state.frameCallback);
+    }
+    state.frameCallback = null;
+    state.video = null;
   }
 
 
   observeReconnectVideo(state, video) {
-    if (!video || state.video === video) return;
+    if (!state.active || state.video === video) return;
+    this.cleanupReconnectVideo(state);
+    if (!video) return;
     state.video = video;
+    const generation = state.videoGeneration;
+    const isCurrent = () => state.active && state.video === video &&
+      state.videoGeneration === generation;
     ["waiting", "stalled", "error", "ended", "emptied", "playing"].forEach(event => {
       const listener = () => {
+        if (!isCurrent()) return;
         const error = video.error;
         this.logMedia("media-event", {
           ...this.getReconnectPresentationDetails(state),
@@ -859,7 +890,7 @@ class NVRCard extends HTMLElement {
     });
     if (typeof video.requestVideoFrameCallback === "function") {
       const nextFrame = () => {
-        if (!state.active || state.video !== video) return;
+        if (!isCurrent()) return;
         if (!state.firstFrameLogged) {
           state.firstFrameLogged = true;
           this.logReconnect("first-frame", this.getReconnectPresentationDetails(state));
@@ -871,7 +902,7 @@ class NVRCard extends HTMLElement {
     } else {
       ["loadeddata", "playing"].forEach(event => {
         const listener = () => {
-          if (state.firstFrameLogged) return;
+          if (!isCurrent() || state.firstFrameLogged) return;
           state.firstFrameLogged = true;
           this.logReconnect("first-frame", this.getReconnectPresentationDetails(state));
         };
@@ -886,20 +917,20 @@ class NVRCard extends HTMLElement {
     if (!state.active || !state.image.isConnected) return;
     const downstream = this.findReconnectDownstream(state.image);
     const observerConstructor = window.MutationObserver;
-    [state.image, state.image.shadowRoot].forEach(root => {
+    const observeRoot = root => {
       if (!root || state.observedRoots.has(root) || !observerConstructor) return;
       state.observedRoots.add(root);
       const observer = new observerConstructor(() => this.inspectReconnectPresentation(state));
       observer.observe(root, { childList: true, subtree: true });
       state.observers.push(observer);
-    });
-    state.image.shadowRoot?.querySelectorAll?.("*").forEach(element => {
-      if (!element.shadowRoot || state.observedRoots.has(element.shadowRoot) || !observerConstructor) return;
-      state.observedRoots.add(element.shadowRoot);
-      const observer = new observerConstructor(() => this.inspectReconnectPresentation(state));
-      observer.observe(element.shadowRoot, { childList: true, subtree: true });
-      state.observers.push(observer);
-    });
+    };
+    const visit = root => {
+      if (!root) return;
+      observeRoot(root);
+      root.querySelectorAll?.("*").forEach(element => visit(element.shadowRoot));
+    };
+    observeRoot(state.image);
+    visit(state.image.shadowRoot);
     if (downstream.player && !state.downstreamLogged) {
       state.downstreamLogged = true;
       this.logReconnect("downstream-player-found", this.getReconnectPresentationDetails(state));
@@ -909,6 +940,13 @@ class NVRCard extends HTMLElement {
 
 
   armReconnectPresentationDiagnostics(image, slot, logicalCamera, sourceEntity, created = true) {
+    this._reconnectPresentationSources.set(image, sourceEntity);
+    const previous = this._reconnectPresentationDiagnostics.get(image);
+    if (previous?.active && previous.cameraImage === sourceEntity) {
+      previous.slot = slot;
+      previous.logicalCamera = logicalCamera;
+      return;
+    }
     this.cleanupReconnectPresentationDiagnostics(image);
     const state = {
       image,
@@ -922,7 +960,9 @@ class NVRCard extends HTMLElement {
       observedRoots: new Set(),
       mediaListeners: [],
       video: null,
+      videoGeneration: 0,
       frameCallback: null,
+      firstFrameTimer: null,
       silenceTimer: null,
       lastFrameTime: null,
       frameCount: 0,
@@ -944,7 +984,8 @@ class NVRCard extends HTMLElement {
     this.logReconnect(created ? "presentation-created" : "presentation-source-changed", this.getReconnectPresentationDetails(state));
     if (image.isConnected) this.logReconnect("presentation-attached", this.getReconnectPresentationDetails(state));
     this.inspectReconnectPresentation(state);
-    setTimeout(() => {
+    state.firstFrameTimer = setTimeout(() => {
+      state.firstFrameTimer = null;
       if (state.active && !state.firstFrameLogged) {
         this.logReconnect("first-frame-timeout", this.getReconnectPresentationDetails(state));
       }
@@ -2167,6 +2208,14 @@ class NVRCard extends HTMLElement {
 
 
   connectedCallback() {
+    this.querySelectorAll("hui-image.nvr-live-camera").forEach(image => {
+      if (!this._reconnectPresentationSources.has(image)) return;
+      const slot = Number(image.closest(".video-cell")?.dataset.slot);
+      this.armReconnectPresentationDiagnostics(
+        image, slot, this._assignedCameras[slot],
+        this._reconnectPresentationSources.get(image), false
+      );
+    });
     this.logReconnect("card-connected");
     this.captureReconnectSnapshot("card-connected");
     this.logCardLifecycle("connected-callback");

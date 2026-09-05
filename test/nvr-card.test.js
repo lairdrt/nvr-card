@@ -720,6 +720,146 @@ test("live status positions default safely and update the existing stalled spinn
   }
 });
 
+function lifecyclePresentation(t) {
+  const harness = setup(t);
+  const card = harness.createCard();
+  card.assignCamera("Garage");
+  const image = harness.getPlayer(card, "Garage");
+  const video = addReachableVideo(harness, image);
+  const state = card._reconnectPresentationDiagnostics.get(image);
+  card.inspectReconnectPresentation(state);
+  Object.defineProperty(image, "cameraImage", {
+    configurable: true,
+    get: () => assert.fail("liveness must not read cameraImage"),
+    set: () => {}
+  });
+  return { harness, card, image, video, state };
+}
+
+test("liveness reattaches to the same owned presentation without source mutation", t => {
+  const { harness, card, image, video, state } = lifecyclePresentation(t);
+  // Existing reconnect snapshots intentionally inspect media; isolate that
+  // unrelated diagnostic so the new observer path retains its read guard.
+  card.captureReconnectSnapshot = () => {};
+  Object.defineProperty(image, "cameraImage", {
+    get: () => assert.fail("rearm must not read cameraImage"),
+    set: () => assert.fail("rearm must not write cameraImage")
+  });
+  const cell = image.closest(".video-cell");
+  card.remove();
+  assert.equal(state.active, false);
+  harness.window.document.body.appendChild(card);
+  const next = card._reconnectPresentationDiagnostics.get(image);
+  assert.notStrictEqual(next, state);
+  assert.strictEqual(harness.getPlayer(card, "Garage"), image);
+  assert.strictEqual(image.closest(".video-cell"), cell);
+  assert.strictEqual(next.video, video);
+  assert.equal(next.cameraImage, state.cameraImage);
+  presentFrame(video);
+  assert.equal(next.frameLivenessStarted, true);
+});
+
+test("visibility restoration gives a full silence window without requiring a new frame", t => {
+  const { harness, card, video, state } = lifecyclePresentation(t);
+  card.captureReconnectSnapshot = () => {};
+  presentFrame(video);
+  harness.advanceTime(9000);
+  harness.setDocumentVisibility("hidden");
+  harness.advanceTime(20000);
+  harness.setDocumentVisibility("visible");
+  harness.advanceTime(9999);
+  assert.equal(state.stallLogged, false);
+  harness.advanceTime(1);
+  assert.equal(state.stallLogged, true);
+  assert.equal(state.statusElement.hidden, false);
+  presentFrame(video);
+  assert.equal(state.stallLogged, false);
+  assert.equal(state.statusElement.hidden, true);
+});
+
+test("downstream replacement removes old listeners and invalidates callbacks", async t => {
+  const { harness, card, video, state } = lifecyclePresentation(t);
+  const staleFrame = video.frameCallback;
+  const staleListeners = state.mediaListeners.filter(entry => entry.target === video);
+  const removed = [];
+  const remove = video.removeEventListener.bind(video);
+  video.removeEventListener = (event, listener) => {
+    removed.push(listener);
+    remove(event, listener);
+  };
+  const cancelled = [];
+  video.cancelVideoFrameCallback = id => cancelled.push(id);
+  const replacement = harness.window.document.createElement("video");
+  replacement.requestVideoFrameCallback = callback => {
+    replacement.frameCallback = callback;
+    return 2;
+  };
+  const events = [];
+  card.logMedia = (...args) => events.push(args);
+  video.replaceWith(replacement);
+  await new Promise(resolve => harness.window.queueMicrotask(resolve));
+  assert.strictEqual(state.video, replacement);
+  assert.deepEqual(cancelled, [1]);
+  for (const entry of staleListeners) assert.ok(removed.includes(entry.listener));
+  staleFrame();
+  staleListeners.forEach(entry => entry.listener());
+  assert.equal(state.frameCount, 0);
+  assert.deepEqual(events, []);
+  presentFrame(replacement);
+  replacement.dispatchEvent(new harness.window.Event("playing"));
+  assert.equal(state.frameCount, 1);
+  assert.equal(events.length, 1);
+});
+
+test("presentation cleanup explicitly cancels the first-frame timer", t => {
+  const { harness, card, image, state } = lifecyclePresentation(t);
+  const timer = state.firstFrameTimer;
+  const cleared = [];
+  const clear = harness.window.clearTimeout;
+  harness.window.clearTimeout = id => { cleared.push(id); clear(id); };
+  const events = [];
+  card.logReconnect = event => events.push(event);
+  card.cleanupReconnectPresentationDiagnostics(image);
+  assert.ok(cleared.includes(timer));
+  assert.equal(state.firstFrameTimer, null);
+  harness.advanceTime(15000);
+  assert.deepEqual(events, []);
+});
+
+test("unchanged selected source preserves the monitoring generation and deadline", t => {
+  const { harness, card, image, video, state } = lifecyclePresentation(t);
+  presentFrame(video);
+  harness.advanceTime(9000);
+  card.updateCameraViewForCell(image.closest(".video-cell"));
+  assert.strictEqual(card._reconnectPresentationDiagnostics.get(image), state);
+  assert.equal(state.frameCount, 1);
+  harness.advanceTime(1000);
+  assert.equal(state.stallLogged, true);
+});
+
+test("changed selected source creates a generation that ignores retired callbacks", t => {
+  const { harness, card, image, video, state } = lifecyclePresentation(t);
+  const staleFrame = video.frameCallback;
+  const staleListeners = state.mediaListeners.filter(entry => entry.target === video);
+  const events = [];
+  card.logMedia = (...args) => events.push(args);
+  // Exercise the existing source-selection hook without changing maximize logic.
+  card._maximizedSlot = 0;
+  card.updateCameraViewForCell(image.closest(".video-cell"));
+  const next = card._reconnectPresentationDiagnostics.get(image);
+  assert.notStrictEqual(next, state);
+  assert.notEqual(next.cameraImage, state.cameraImage);
+  assert.equal(state.active, false);
+  assert.equal(state.firstFrameTimer, null);
+  staleFrame();
+  staleListeners.forEach(entry => entry.listener());
+  assert.equal(next.frameCount, 0);
+  assert.equal(next.firstFrameLogged, false);
+  assert.deepEqual(events, []);
+  presentFrame(video);
+  assert.equal(next.frameCount, 1);
+});
+
 test("first frame starts liveness and healthy presentation has no spinner", t => {
   const harness = setup(t);
   const card = harness.createCard();
