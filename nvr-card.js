@@ -236,6 +236,18 @@ const NVR_CAMERA_DRAG_TYPE =
   "application/x-nvr-camera";
 const NVR_GRID_CAMERA_DRAG_TYPE =
   "application/x-nvr-grid-camera";
+const NVR_RECONNECT_FIRST_FRAME_TIMEOUT = 15000;
+const NVR_FRAME_LIVENESS_SILENCE_TIMEOUT = 10000;
+const AUTO_DIM_DEFAULTS = Object.freeze({
+  enabled: false,
+  invalid: false,
+  timeout: 300,
+  fadeDuration: 8,
+  normalBrightness: 180,
+  dimBrightness: 0,
+  notifyService: null
+});
+const AUTO_DIM_FADE_STEPS = 8;
 
 class NVRCard extends HTMLElement {
   constructor() {
@@ -279,6 +291,32 @@ class NVRCard extends HTMLElement {
 
     this._sidebarCollapsed = null;
     this._viewportListenersInstalled = false;
+    this._autoDimConfig = AUTO_DIM_DEFAULTS;
+    this._idleTimer = null;
+    this._fadeTimer = null;
+    this._autoDimListenersInstalled = false;
+    this._autoDimState = "awake";
+    this._consumeNextClick = false;
+    this._autoDimFailed = false;
+    this._autoDimGeneration = 0;
+    this._autoDimDiagnosticConfigKey = null;
+    this._lastMouseActivityDiagnostic = -Infinity;
+    this._displayOwnershipEstablished = false;
+    this._displayOwnershipComplete = false;
+    this._autoDimPointerHandler = event => {
+      this.handleAutoDimActivity(event, true);
+    };
+    this._autoDimClickHandler = event => {
+      if (this._consumeNextClick) {
+        this.consumeWakeEvent(event);
+        this._consumeNextClick = false;
+        return;
+      }
+      this.handleAutoDimActivity(event, true);
+    };
+    this._autoDimActivityHandler = event => {
+      this.handleAutoDimActivity(event, false);
+    };
 
     this._viewportResizeHandler = event => {
       const source =
@@ -339,6 +377,10 @@ class NVRCard extends HTMLElement {
     this._savedViewsLoaded = false;
     this._savedViewsMessage = "";
     this._reconnectNodeIdentity = new WeakMap();
+    this._reconnectPresentationIdentities = new WeakMap();
+    this._reconnectPresentationDiagnostics = new WeakMap();
+    this._activeReconnectPresentationDiagnostics = new Set();
+    this._nextReconnectPresentationId = 1;
     this._lastObservedConnection = null;
     this._lastObservedConnectionConnected = null;
     this._nvrInstanceId =
@@ -639,6 +681,262 @@ class NVRCard extends HTMLElement {
       ...this.getReconnectDiagnosticContext(),
       ...details
     });
+  }
+
+
+  logMedia(event, details = {}) {
+    console.info("[NVR media]", {
+      event,
+      ...this.getReconnectDiagnosticContext(),
+      ...details
+    });
+  }
+
+
+  getReconnectPresentationIdentity(image) {
+    let identity = this._reconnectPresentationIdentities.get(image);
+    if (!identity) {
+      identity = `hui-image-${this._nextReconnectPresentationId++}`;
+      this._reconnectPresentationIdentities.set(image, identity);
+    }
+    return identity;
+  }
+
+
+  getReconnectPresentationDetails(state) {
+    return {
+      slot: state.slot,
+      logicalCamera: state.logicalCamera,
+      cameraImage: state.cameraImage,
+      cameraView: state.cameraView,
+      huiImageId: state.huiImageId,
+      elapsedMs: state.epochStart === null
+        ? null
+        : Math.round(performance.now() - state.epochStart)
+    };
+  }
+
+
+  findReconnectDownstream(image) {
+    const found = { player: null, video: null };
+    const visited = new Set();
+    const visit = root => {
+      if (!root || visited.has(root)) return;
+      visited.add(root);
+      root.querySelectorAll?.("*").forEach(element => {
+        if (
+          !found.player &&
+          (element.localName === "ha-hls-player" ||
+            element.localName === "ha-web-rtc-player")
+        ) found.player = element;
+        if (!found.video && element.localName === "video") found.video = element;
+        if (element.shadowRoot) visit(element.shadowRoot);
+      });
+    };
+    visit(image.shadowRoot);
+    return found;
+  }
+
+
+  cleanupReconnectPresentationDiagnostics(image) {
+    const state = this._reconnectPresentationDiagnostics.get(image);
+    if (!state) return;
+    state.observers.forEach(observer => observer.disconnect());
+    state.mediaListeners.forEach(({ target, event, listener }) => {
+      target.removeEventListener(event, listener);
+    });
+    if (state.frameCallback !== null && state.video?.cancelVideoFrameCallback) {
+      state.video.cancelVideoFrameCallback(state.frameCallback);
+    }
+    if (state.silenceTimer !== null) clearTimeout(state.silenceTimer);
+    state.statusElement?.remove();
+    state.active = false;
+    this._activeReconnectPresentationDiagnostics.delete(state);
+    this._reconnectPresentationDiagnostics.delete(image);
+  }
+
+
+  cleanupAllReconnectPresentationDiagnostics() {
+    [...this._activeReconnectPresentationDiagnostics].forEach(state => {
+      this.cleanupReconnectPresentationDiagnostics(state.image);
+    });
+  }
+
+
+  ensureReconnectPresentationStatusElement(state) {
+    if (state.statusElement || !state.image.isConnected) return;
+    const frame = state.image.closest(".camera-frame");
+    if (!frame) return;
+    const indicator = document.createElement("div");
+    indicator.className = "nvr-live-state-indicator";
+    indicator.hidden = true;
+    indicator.setAttribute("aria-label", "Camera stream stalled");
+    const icon = document.createElement("ha-icon");
+    icon.setAttribute("icon", "mdi:loading");
+    icon.setAttribute("aria-hidden", "true");
+    indicator.appendChild(icon);
+    frame.appendChild(indicator);
+    state.statusElement = indicator;
+  }
+
+
+  setReconnectPresentationVisualState(state, stalled) {
+    if (!state.active || !state.statusElement) return;
+    state.statusElement.hidden = !stalled;
+    state.visualState = stalled ? "stalled" : "live";
+  }
+
+
+  observeReconnectFrame(state, video) {
+    if (!state.active || state.video !== video || document.visibilityState === "hidden") return;
+    const wasStalled = state.stallLogged;
+    state.frameCount += 1;
+    state.lastFrameTime = performance.now();
+    if (!state.frameLivenessStarted) {
+      state.frameLivenessStarted = true;
+      this.logReconnect("frame-liveness-started", this.getReconnectPresentationDetails(state));
+    } else if (wasStalled) {
+      state.stallLogged = false;
+      state.stallStartedAt = null;
+      this.setReconnectPresentationVisualState(state, false);
+      this.logReconnect("frame-resumed", this.getReconnectPresentationDetails(state));
+    }
+    if (state.silenceTimer !== null) clearTimeout(state.silenceTimer);
+    state.silenceTimer = setTimeout(() => {
+      state.silenceTimer = null;
+      if (!state.active || document.visibilityState === "hidden" || state.lastFrameTime === null) return;
+      state.stallLogged = true;
+      state.stallStartedAt = performance.now();
+      this.setReconnectPresentationVisualState(state, true);
+      this.logReconnect("frame-stall-detected", {
+        ...this.getReconnectPresentationDetails(state),
+        elapsedSinceLastFrameMs: Math.round(performance.now() - state.lastFrameTime),
+        frameCount: state.frameCount
+      });
+    }, NVR_FRAME_LIVENESS_SILENCE_TIMEOUT);
+  }
+
+
+  handleReconnectVisibilityChange(state) {
+    if (!state.active || !state.frameLivenessStarted) return;
+    if (document.visibilityState === "hidden") {
+      if (state.silenceTimer !== null) clearTimeout(state.silenceTimer);
+      state.silenceTimer = null;
+      this.setReconnectPresentationVisualState(state, false);
+      return;
+    }
+    state.lastFrameTime = performance.now();
+  }
+
+
+  observeReconnectVideo(state, video) {
+    if (!video || state.video === video) return;
+    state.video = video;
+    ["waiting", "stalled", "error", "ended", "emptied", "playing"].forEach(event => {
+      const listener = () => {
+        const error = video.error;
+        this.logMedia("media-event", {
+          ...this.getReconnectPresentationDetails(state),
+          mediaEvent: event,
+          mediaErrorCode: event === "error" ? error?.code ?? null : null,
+          mediaErrorMessage: event === "error" ? error?.message ?? null : null
+        });
+      };
+      video.addEventListener(event, listener, { passive: true });
+      state.mediaListeners.push({ target: video, event, listener });
+    });
+    if (typeof video.requestVideoFrameCallback === "function") {
+      const nextFrame = () => {
+        if (!state.active || state.video !== video) return;
+        if (!state.firstFrameLogged) {
+          state.firstFrameLogged = true;
+          this.logReconnect("first-frame", this.getReconnectPresentationDetails(state));
+        }
+        this.observeReconnectFrame(state, video);
+        state.frameCallback = video.requestVideoFrameCallback(nextFrame);
+      };
+      state.frameCallback = video.requestVideoFrameCallback(nextFrame);
+    } else {
+      ["loadeddata", "playing"].forEach(event => {
+        const listener = () => {
+          if (state.firstFrameLogged) return;
+          state.firstFrameLogged = true;
+          this.logReconnect("first-frame", this.getReconnectPresentationDetails(state));
+        };
+        video.addEventListener(event, listener, { once: true, passive: true });
+        state.mediaListeners.push({ target: video, event, listener });
+      });
+    }
+  }
+
+
+  inspectReconnectPresentation(state) {
+    if (!state.active || !state.image.isConnected) return;
+    const downstream = this.findReconnectDownstream(state.image);
+    const observerConstructor = window.MutationObserver;
+    [state.image, state.image.shadowRoot].forEach(root => {
+      if (!root || state.observedRoots.has(root) || !observerConstructor) return;
+      state.observedRoots.add(root);
+      const observer = new observerConstructor(() => this.inspectReconnectPresentation(state));
+      observer.observe(root, { childList: true, subtree: true });
+      state.observers.push(observer);
+    });
+    state.image.shadowRoot?.querySelectorAll?.("*").forEach(element => {
+      if (!element.shadowRoot || state.observedRoots.has(element.shadowRoot) || !observerConstructor) return;
+      state.observedRoots.add(element.shadowRoot);
+      const observer = new observerConstructor(() => this.inspectReconnectPresentation(state));
+      observer.observe(element.shadowRoot, { childList: true, subtree: true });
+      state.observers.push(observer);
+    });
+    if (downstream.player && !state.downstreamLogged) {
+      state.downstreamLogged = true;
+      this.logReconnect("downstream-player-found", this.getReconnectPresentationDetails(state));
+    }
+    this.observeReconnectVideo(state, downstream.video);
+  }
+
+
+  armReconnectPresentationDiagnostics(image, slot, logicalCamera, sourceEntity, created = true) {
+    this.cleanupReconnectPresentationDiagnostics(image);
+    const state = {
+      image,
+      slot,
+      logicalCamera,
+      cameraImage: sourceEntity ?? null,
+      cameraView: image.cameraView ?? null,
+      huiImageId: this.getReconnectPresentationIdentity(image),
+      epochStart: performance.now(),
+      observers: [],
+      observedRoots: new Set(),
+      mediaListeners: [],
+      video: null,
+      frameCallback: null,
+      silenceTimer: null,
+      lastFrameTime: null,
+      frameCount: 0,
+      frameLivenessStarted: false,
+      firstFrameLogged: false,
+      stallLogged: false,
+      stallStartedAt: null,
+      statusElement: null,
+      visualState: "live",
+      downstreamLogged: false,
+      active: true
+    };
+    this._reconnectPresentationDiagnostics.set(image, state);
+    this._activeReconnectPresentationDiagnostics.add(state);
+    this.ensureReconnectPresentationStatusElement(state);
+    const visibilityListener = () => this.handleReconnectVisibilityChange(state);
+    document.addEventListener("visibilitychange", visibilityListener);
+    state.mediaListeners.push({ target: document, event: "visibilitychange", listener: visibilityListener });
+    this.logReconnect(created ? "presentation-created" : "presentation-source-changed", this.getReconnectPresentationDetails(state));
+    if (image.isConnected) this.logReconnect("presentation-attached", this.getReconnectPresentationDetails(state));
+    this.inspectReconnectPresentation(state);
+    setTimeout(() => {
+      if (state.active && !state.firstFrameLogged) {
+        this.logReconnect("first-frame-timeout", this.getReconnectPresentationDetails(state));
+      }
+    }, NVR_RECONNECT_FIRST_FRAME_TIMEOUT);
   }
 
 
@@ -1482,6 +1780,29 @@ class NVRCard extends HTMLElement {
 
     const normalized =
       this.normalizeConfig(config);
+    const autoDimDiagnosticKey = JSON.stringify(normalized.autoDim);
+    if (this._autoDimDiagnosticConfigKey !== autoDimDiagnosticKey) {
+      this._autoDimDiagnosticConfigKey = autoDimDiagnosticKey;
+      console.log("[NVR auto-dim] config normalized", {
+        enabled: normalized.autoDim.enabled,
+        timeout: normalized.autoDim.timeout,
+        fade_duration: normalized.autoDim.fadeDuration,
+        normal_brightness: normalized.autoDim.normalBrightness,
+        dim_brightness: normalized.autoDim.dimBrightness,
+        notify_service: normalized.autoDim.notifyService
+      });
+      const autoDimPresent = Object.prototype.hasOwnProperty.call(
+        config,
+        "auto_dim"
+      );
+      if (!autoDimPresent) {
+        console.log("[NVR auto-dim] disabled: block omitted");
+      } else if (normalized.autoDim.invalid) {
+        console.log("[NVR auto-dim] disabled: invalid config");
+      } else if (!normalized.autoDim.enabled) {
+        console.log("[NVR auto-dim] disabled: enabled false");
+      }
+    }
     const normalizedConfigKey =
       JSON.stringify(normalized);
     const nextConfigKey =
@@ -1516,6 +1837,12 @@ class NVRCard extends HTMLElement {
     this._cameras = normalized.cameras;
     this._cameraAspectRatio =
       normalized.cameraAspectRatio;
+    const autoDimChanged =
+      JSON.stringify(this._autoDimConfig) !==
+      JSON.stringify(normalized.autoDim);
+    if (autoDimChanged) {
+      this.applyAutoDimConfig(normalized.autoDim);
+    }
     this._normalizedConfigKey =
       normalizedConfigKey;
 
@@ -1562,10 +1889,75 @@ class NVRCard extends HTMLElement {
           ? config.camera_aspect_ratio
           : "16:9"
       );
+    const autoDim = this.normalizeAutoDim(
+      config.auto_dim,
+      Object.prototype.hasOwnProperty.call(config, "auto_dim")
+    );
 
     return {
       cameras,
-      cameraAspectRatio
+      cameraAspectRatio,
+      autoDim
+    };
+  }
+
+
+  normalizeAutoDim(value, present = true) {
+    if (!present) {
+      return { ...AUTO_DIM_DEFAULTS };
+    }
+    if (
+      !value ||
+      typeof value !== "object" ||
+      Array.isArray(value)
+    ) {
+      return { ...AUTO_DIM_DEFAULTS, invalid: true };
+    }
+
+    const number = (candidate, fallback, minimum, maximum) => {
+      const parsed = Number(candidate);
+      return Number.isFinite(parsed)
+        ? Math.min(maximum, Math.max(minimum, parsed))
+        : fallback;
+    };
+    const rawNotifyService =
+      value.notify_service ?? value.notifyService;
+    const notifyService =
+      typeof rawNotifyService === "string" &&
+      /^notify\.[a-z0-9_]+$/i.test(rawNotifyService.trim())
+        ? rawNotifyService.trim()
+        : null;
+    const invalid =
+      (Object.prototype.hasOwnProperty.call(value, "enabled") &&
+        typeof value.enabled !== "boolean") ||
+      (value.enabled === true && notifyService === null);
+
+    return {
+      enabled:
+        value.enabled === true &&
+        notifyService !== null &&
+        !invalid,
+      invalid,
+      timeout: number(value.timeout, 300, 1, Number.MAX_SAFE_INTEGER),
+      fadeDuration: number(
+        value.fade_duration ?? value.fadeDuration,
+        8,
+        0,
+        Number.MAX_SAFE_INTEGER
+      ),
+      normalBrightness: Math.round(number(
+        value.normal_brightness ?? value.normalBrightness,
+        180,
+        0,
+        255
+      )),
+      dimBrightness: Math.round(number(
+        value.dim_brightness ?? value.dimBrightness,
+        0,
+        0,
+        255
+      )),
+      notifyService
     };
   }
 
@@ -1716,6 +2108,7 @@ class NVRCard extends HTMLElement {
     this._lastObservedConnection = nextConnection;
     this._lastObservedConnectionConnected = nextConnected;
     this._hass = hass;
+    this.establishDisplayOwnership();
 
     if (
       previousHass &&
@@ -1760,6 +2153,24 @@ class NVRCard extends HTMLElement {
     this.logCardLifecycle("connected-callback");
     this.recordNvrFlight("card-connected");
     this.installViewportListeners();
+    if (this._autoDimConfig.enabled) {
+      this.installAutoDimListeners();
+      if (this._autoDimFailed) {
+        console.log(
+          "[NVR auto-dim] reconnect: prior failure latched; ownership not resent"
+        );
+      } else if (this._displayOwnershipComplete) {
+        console.log(
+          "[NVR auto-dim] reconnect: ownership already initialized; not resent"
+        );
+        this.resetIdleTimer();
+      } else if (this._displayOwnershipEstablished) {
+        console.log(
+          "[NVR auto-dim] reconnect: ownership initialization already in progress"
+        );
+      }
+    }
+    this.establishDisplayOwnership();
 
     if (
       this.isConnected &&
@@ -1772,13 +2183,17 @@ class NVRCard extends HTMLElement {
 
 
   disconnectedCallback() {
+    console.log("[NVR auto-dim] cleanup");
     this.logReconnect("card-disconnected");
+    this.cleanupAllReconnectPresentationDiagnostics();
     this.captureReconnectSnapshot("card-disconnected");
     this.logCardLifecycle("disconnected-callback");
     this.recordNvrFlight("card-disconnected");
     this.completeMaximizeMediaSession("disconnected");
     this.closeCameraContextMenu();
     this.removeViewportListeners();
+    this.removeAutoDimListeners();
+    this.clearAutoDimTimers();
 
     if (this._resizeObserver) {
       this._resizeObserver.disconnect();
@@ -1795,7 +2210,353 @@ class NVRCard extends HTMLElement {
   }
 
 
+  installAutoDimListeners() {
+    if (this._autoDimListenersInstalled) {
+      return;
+    }
+    this.addEventListener("pointerdown", this._autoDimPointerHandler, true);
+    this.addEventListener("click", this._autoDimClickHandler, true);
+    this.addEventListener("mousemove", this._autoDimActivityHandler, true);
+    this.addEventListener("dragstart", this._autoDimActivityHandler, true);
+    this.addEventListener("dragover", this._autoDimActivityHandler, true);
+    this.addEventListener("drop", this._autoDimActivityHandler, true);
+    this._autoDimListenersInstalled = true;
+  }
+
+
+  canUseAutoDim() {
+    return Boolean(
+      this._autoDimConfig.enabled &&
+      !this._autoDimFailed &&
+      this.isConnected &&
+      this._hass?.callService
+    );
+  }
+
+
+  applyAutoDimConfig(nextConfig) {
+    const previousFailed = this._autoDimFailed;
+    this.clearAutoDimTimers();
+    this._autoDimState = "awake";
+    this._consumeNextClick = false;
+    this._autoDimConfig = nextConfig;
+    this._autoDimGeneration += 1;
+    this._autoDimFailed = false;
+    this._displayOwnershipEstablished = false;
+    this._displayOwnershipComplete = false;
+    console.log(
+      `[NVR auto-dim] config changed; generation=${this._autoDimGeneration}`
+    );
+    if (previousFailed) {
+      console.log(
+        "[NVR auto-dim] previous failure cleared by config change"
+      );
+    }
+    if (nextConfig.invalid) {
+      console.warn(
+        "[NVR auto-dim] Invalid auto_dim configuration; auto-dim disabled."
+      );
+      this.removeAutoDimListeners();
+      return;
+    }
+    if (nextConfig.enabled) {
+      this.installAutoDimListeners();
+      this.establishDisplayOwnership();
+    } else {
+      this.removeAutoDimListeners();
+    }
+  }
+
+
+  establishDisplayOwnership() {
+    if (
+      !this.canUseAutoDim() ||
+      this._displayOwnershipEstablished
+    ) {
+      return;
+    }
+    this._displayOwnershipEstablished = true;
+    const generation = this._autoDimGeneration;
+    console.log(
+      "[NVR auto-dim] ownership initialized for new config " +
+      `generation=${generation}`
+    );
+    console.log("[NVR auto-dim] ownership start");
+    console.log(
+      "[NVR auto-dim] ownership auto-brightness off -> " +
+      this._autoDimConfig.notifyService
+    );
+    this.sendNotifyCommand(
+      "command_auto_screen_brightness",
+      { command: "turn_off" },
+      "disable automatic brightness",
+      () => {
+        console.log(
+          "[NVR auto-dim] ownership auto-brightness off ok"
+        );
+        console.log(
+          "[NVR auto-dim] ownership keep-screen-on -> " +
+          this._autoDimConfig.notifyService
+        );
+        this.sendNotifyCommand(
+          "command_screen_on",
+          { command: "keep_screen_on" },
+          "enable Keep screen on",
+          () => {
+            console.log(
+              "[NVR auto-dim] ownership keep-screen-on ok"
+            );
+            console.log(
+              "[NVR auto-dim] ownership normal brightness " +
+              `${this._autoDimConfig.normalBrightness} -> ` +
+              this._autoDimConfig.notifyService
+            );
+            this.sendBrightnessCommand(
+              this._autoDimConfig.normalBrightness,
+              () => {
+                console.log(
+                  "[NVR auto-dim] ownership normal brightness ok"
+                );
+                this._displayOwnershipComplete = true;
+                console.log("[NVR auto-dim] ownership complete");
+                this.resetIdleTimer();
+              }
+            );
+          },
+          generation
+        );
+      },
+      generation
+    );
+  }
+
+
+  removeAutoDimListeners() {
+    if (!this._autoDimListenersInstalled) {
+      return;
+    }
+    this.removeEventListener("pointerdown", this._autoDimPointerHandler, true);
+    this.removeEventListener("click", this._autoDimClickHandler, true);
+    this.removeEventListener("mousemove", this._autoDimActivityHandler, true);
+    this.removeEventListener("dragstart", this._autoDimActivityHandler, true);
+    this.removeEventListener("dragover", this._autoDimActivityHandler, true);
+    this.removeEventListener("drop", this._autoDimActivityHandler, true);
+    this._autoDimListenersInstalled = false;
+  }
+
+
+  consumeWakeEvent(event) {
+    event.preventDefault();
+    event.stopImmediatePropagation();
+  }
+
+
+  handleAutoDimActivity(event, consumeWhenWaking) {
+    if (
+      !this.canUseAutoDim() ||
+      !this._displayOwnershipComplete
+    ) {
+      return;
+    }
+    if (event.type === "mousemove" && document.visibilityState === "hidden") {
+      return;
+    }
+
+    const waking = this._autoDimState !== "awake";
+    if (waking) {
+      if (consumeWhenWaking) {
+        this.consumeWakeEvent(event);
+        this._consumeNextClick = event.type === "pointerdown";
+        console.log("[NVR auto-dim] wake interaction consumed");
+      }
+      this.restoreNormalBrightness();
+    }
+    const now = performance.now();
+    if (
+      event.type !== "mousemove" ||
+      now - this._lastMouseActivityDiagnostic >= 1000
+    ) {
+      console.log("[NVR auto-dim] activity reset timer");
+      if (event.type === "mousemove") {
+        this._lastMouseActivityDiagnostic = now;
+      }
+    }
+    this.resetIdleTimer();
+  }
+
+
+  clearAutoDimTimers() {
+    if (this._idleTimer !== null) {
+      window.clearTimeout(this._idleTimer);
+      this._idleTimer = null;
+    }
+    if (this._fadeTimer !== null) {
+      window.clearInterval(this._fadeTimer);
+      this._fadeTimer = null;
+    }
+  }
+
+
+  resetIdleTimer() {
+    if (this._idleTimer !== null) {
+      window.clearTimeout(this._idleTimer);
+      this._idleTimer = null;
+    }
+    if (
+      !this.canUseAutoDim() ||
+      !this._displayOwnershipComplete
+    ) {
+      return;
+    }
+    this._idleTimer = window.setTimeout(() => {
+      this._idleTimer = null;
+      console.log("[NVR auto-dim] timeout fired");
+      this.startBrightnessFade();
+    }, this._autoDimConfig.timeout * 1000);
+    console.log(
+      `[NVR auto-dim] timer armed: ${this._autoDimConfig.timeout}s`
+    );
+  }
+
+
+  startBrightnessFade() {
+    if (!this.canUseAutoDim()) {
+      return;
+    }
+    if (this._fadeTimer !== null) {
+      window.clearInterval(this._fadeTimer);
+      this._fadeTimer = null;
+    }
+
+    const { normalBrightness, dimBrightness, fadeDuration } =
+      this._autoDimConfig;
+    const steps = fadeDuration === 0 ? 1 : AUTO_DIM_FADE_STEPS;
+    let step = 0;
+    this._autoDimState = "dimming";
+    console.log(
+      "[NVR auto-dim] fade start: " +
+      `${normalBrightness} -> ${dimBrightness} over ${fadeDuration}s`
+    );
+
+    const advance = () => {
+      step += 1;
+      const brightness = Math.round(
+        normalBrightness +
+        (dimBrightness - normalBrightness) * (step / steps)
+      );
+      console.log(`[NVR auto-dim] brightness -> ${brightness}`);
+      this.sendBrightnessCommand(brightness);
+      if (step >= steps) {
+        if (this._fadeTimer !== null) {
+          window.clearInterval(this._fadeTimer);
+          this._fadeTimer = null;
+        }
+        this._autoDimState = "dimmed";
+        console.log("[NVR auto-dim] dim complete");
+      }
+    };
+
+    if (steps === 1) {
+      advance();
+      return;
+    }
+    this._fadeTimer = window.setInterval(
+      advance,
+      fadeDuration * 1000 / steps
+    );
+  }
+
+
+  restoreNormalBrightness() {
+    if (this._fadeTimer !== null) {
+      window.clearInterval(this._fadeTimer);
+      this._fadeTimer = null;
+    }
+    this._autoDimState = "awake";
+    console.log(
+      `[NVR auto-dim] wake brightness -> ${this._autoDimConfig.normalBrightness}`
+    );
+    this.sendBrightnessCommand(
+      this._autoDimConfig.normalBrightness,
+      () => console.log("[NVR auto-dim] wake complete")
+    );
+  }
+
+
+  sendBrightnessCommand(brightness, onSuccess = null) {
+    this.sendNotifyCommand(
+      "command_screen_brightness_level",
+      { command: brightness },
+      "send brightness command",
+      onSuccess
+    );
+  }
+
+
+  sendNotifyCommand(
+    message,
+    data,
+    failureOperation = "send brightness command",
+    onSuccess = null,
+    generation = this._autoDimGeneration
+  ) {
+    if (this._autoDimFailed) {
+      return;
+    }
+    const service = this._autoDimConfig.notifyService;
+    const separator = service?.indexOf(".") ?? -1;
+    if (!this._hass?.callService || separator < 1) {
+      return;
+    }
+    const domain = service.slice(0, separator);
+    const serviceName = service.slice(separator + 1);
+    try {
+      const result = this._hass.callService(domain, serviceName, {
+        message,
+        data
+      });
+      if (result && typeof result.then === "function") {
+        result.then(
+          () => {
+            if (generation === this._autoDimGeneration) {
+              onSuccess?.();
+            }
+          },
+          () => {
+            if (generation === this._autoDimGeneration) {
+              this.failAutoDimConfiguration(failureOperation);
+            }
+          }
+        );
+      } else {
+        if (generation === this._autoDimGeneration) {
+          onSuccess?.();
+        }
+      }
+    } catch (_error) {
+      if (generation === this._autoDimGeneration) {
+        this.failAutoDimConfiguration(failureOperation);
+      }
+    }
+  }
+
+
+  failAutoDimConfiguration(operation) {
+    if (this._autoDimFailed) {
+      return;
+    }
+    this._autoDimFailed = true;
+    this.clearAutoDimTimers();
+    this.removeAutoDimListeners();
+    console.warn(
+      `[NVR auto-dim] ${operation} failed; ` +
+      "auto-dim disabled for this configuration."
+    );
+  }
+
+
   render(reason = "direct-call") {
+    this.cleanupAllReconnectPresentationDiagnostics();
     this.logCardLifecycle("render-entry", {
       reason,
       existingPhysicalCellCount:
@@ -2699,6 +3460,39 @@ class NVRCard extends HTMLElement {
         background: #000;
 
         overflow: hidden;
+      }
+
+
+      .nvr-live-state-indicator {
+        position: absolute;
+        right: 8px;
+        bottom: 8px;
+        z-index: 6;
+        width: 24px;
+        height: 24px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: rgba(0, 0, 0, 0.58);
+        border-radius: 50%;
+        color: rgba(255, 255, 255, 0.9);
+        pointer-events: none;
+      }
+
+
+      .nvr-live-state-indicator[hidden] {
+        display: none;
+      }
+
+
+      .nvr-live-state-indicator ha-icon {
+        display: block;
+        animation: nvr-live-state-spin 1s linear infinite;
+      }
+
+
+      @keyframes nvr-live-state-spin {
+        to { transform: rotate(360deg); }
       }
 
 
@@ -3803,6 +4597,16 @@ class NVRCard extends HTMLElement {
           ? "live"
           : "auto";
 
+      if (this._reconnectPresentationDiagnostics.has(image)) {
+        this.armReconnectPresentationDiagnostics(
+          image,
+          slot,
+          this._assignedCameras[slot],
+          targetEntity,
+          false
+        );
+      }
+
       if (transition) {
         this.logLiveTransition(
           "source-properties-changed",
@@ -3865,6 +4669,9 @@ class NVRCard extends HTMLElement {
      *
      * Layout changes never call this function.
      */
+    this.cleanupReconnectPresentationDiagnostics(
+      cell.querySelector("hui-image.nvr-live-camera")
+    );
     cell.innerHTML = "";
 
     this.traceProviderCellLifecycle(
@@ -3945,7 +4752,7 @@ class NVRCard extends HTMLElement {
           camera.entity;
 
 
-        image.cameraImage =
+        const sourceEntity =
           slot === this._maximizedSlot
             ? HA_HUI_IMAGE_MAINSTREAM_ENTITIES[
                 camera.entity
@@ -3953,6 +4760,8 @@ class NVRCard extends HTMLElement {
             : HA_HUI_IMAGE_SUBSTREAM_ENTITIES[
                 camera.entity
               ] ?? camera.entity;
+
+        image.cameraImage = sourceEntity;
 
 
         image.cameraView = "live";
@@ -3967,6 +4776,12 @@ class NVRCard extends HTMLElement {
         frame.appendChild(image);
 
         cell.appendChild(frame);
+        this.armReconnectPresentationDiagnostics(
+          image,
+          slot,
+          cameraName,
+          sourceEntity
+        );
       } else {
 
       const providerExperimentCamera =
@@ -4093,6 +4908,12 @@ class NVRCard extends HTMLElement {
         frame.appendChild(image);
 
         cell.appendChild(frame);
+        this.armReconnectPresentationDiagnostics(
+          image,
+          slot,
+          cameraName,
+          camera.entity
+        );
       }
       }
     }
@@ -5146,6 +5967,8 @@ class NVRCard extends HTMLElement {
       return;
     }
 
+    this.resetIdleTimer();
+
     const grid =
       this.querySelector(".video-grid");
 
@@ -5312,6 +6135,8 @@ class NVRCard extends HTMLElement {
     if (this._maximizedSlot === null) {
       return;
     }
+
+    this.resetIdleTimer();
 
     const maximizedSlot = this._maximizedSlot;
     this.beginRestoreLiveTransition(

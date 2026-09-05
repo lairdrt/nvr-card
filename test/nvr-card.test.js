@@ -21,6 +21,31 @@ function storedWorkspace(harness, card) {
   );
 }
 
+function addReachableVideo(harness, image) {
+  if (!image.shadowRoot) {
+    image.attachShadow({ mode: "open" });
+  }
+  const stream = harness.window.document.createElement("ha-camera-stream");
+  const player = harness.window.document.createElement("ha-hls-player");
+  const video = harness.window.document.createElement("video");
+  video.requestVideoFrameCallback = callback => {
+    video.frameCallback = callback;
+    return 1;
+  };
+  video.cancelVideoFrameCallback = () => {};
+  player.attachShadow({ mode: "open" });
+  stream.attachShadow({ mode: "open" });
+  player.shadowRoot.appendChild(video);
+  stream.shadowRoot.appendChild(player);
+  image.shadowRoot.appendChild(stream);
+  return video;
+}
+
+function presentFrame(video) {
+  assert.equal(typeof video.frameCallback, "function");
+  video.frameCallback();
+}
+
 function assertIdentityUnchanged(harness, card, cameraName, before) {
   const after =
     harness.capturePlayerIdentity(card, cameraName);
@@ -57,6 +82,404 @@ function assertIdentitiesUnchanged(
     );
   });
 }
+
+function createAutoDimCard(harness, autoDim, hass = null) {
+  const card = harness.window.document.createElement("nvr-card");
+  const resolvedHass = hass ?? harness.createHass();
+  harness.window.document.body.appendChild(card);
+  card.setConfig({
+    cameras: harness.defaultCameras ?? [
+      { name: "Front", entity: "camera.front", active: true },
+      { name: "Garage", entity: "camera.garage", active: true }
+    ],
+    auto_dim: autoDim
+  });
+  card.hass = resolvedHass;
+  harness.flushAnimationFrames();
+  return card;
+}
+
+const enabledAutoDim = {
+  enabled: true,
+  timeout: 2,
+  fade_duration: 0,
+  normal_brightness: 180,
+  dim_brightness: 0,
+  notify_service: "notify.mobile_app_test_tablet"
+};
+
+test("auto-dim disabled creates no timer behavior or service calls", t => {
+  const harness = setup(t);
+  const hass = harness.createHass();
+  const calls = [];
+  hass.callService = (...args) => calls.push(args);
+  createAutoDimCard(harness, { ...enabledAutoDim, enabled: false }, hass);
+
+  harness.advanceTime(600000);
+  assert.deepEqual(calls, []);
+});
+
+test("omitted auto-dim is disabled with no listeners or service calls", t => {
+  const harness = setup(t);
+  const hass = harness.createHass();
+  const calls = [];
+  hass.callService = (...args) => calls.push(args);
+  const card = harness.createCard({ hass });
+  harness.advanceTime(600000);
+  assert.equal(card._autoDimConfig.enabled, false);
+  assert.equal(card._autoDimListenersInstalled, false);
+  assert.deepEqual(calls, []);
+});
+
+test("auto-dim timeout runs a bounded fade through the parsed notify service", t => {
+  const harness = setup(t);
+  const hass = harness.createHass();
+  const calls = [];
+  hass.callService = (...args) => calls.push(args);
+  createAutoDimCard(harness, { ...enabledAutoDim, fade_duration: 8 }, hass);
+  calls.length = 0;
+
+  harness.advanceTime(10000);
+  assert.equal(calls.length, 8);
+  assert.deepEqual(JSON.parse(JSON.stringify(calls.at(-1))), [
+    "notify",
+    "mobile_app_test_tablet",
+    {
+      message: "command_screen_brightness_level",
+      data: { command: 0 }
+    }
+  ]);
+});
+
+test("wake restores brightness and consumes the first interaction", t => {
+  const harness = setup(t);
+  const hass = harness.createHass();
+  const calls = [];
+  hass.callService = (...args) => calls.push(args);
+  const card = createAutoDimCard(harness, enabledAutoDim, hass);
+  card.assignCamera("Front");
+  calls.length = 0;
+  const button = card.querySelector(".sidebar-toggle");
+  let activated = 0;
+  button.addEventListener("click", () => activated += 1);
+  harness.advanceTime(2000);
+
+  const wake = new harness.window.Event("click", {
+    bubbles: true,
+    cancelable: true
+  });
+  button.dispatchEvent(wake);
+  assert.equal(wake.defaultPrevented, true);
+  assert.equal(activated, 0);
+  assert.equal(calls.at(-1)[2].data.command, 180);
+
+  button.click();
+  assert.equal(activated, 1);
+});
+
+test("card activity resets the auto-dim timeout", t => {
+  const harness = setup(t);
+  const hass = harness.createHass();
+  const calls = [];
+  hass.callService = (...args) => calls.push(args);
+  const card = createAutoDimCard(harness, enabledAutoDim, hass);
+  card.assignCamera("Front");
+  calls.length = 0;
+
+  harness.advanceTime(1500);
+  card.dispatchEvent(new harness.window.Event("mousemove", { bubbles: true }));
+  harness.advanceTime(1500);
+  assert.equal(calls.length, 0);
+  harness.advanceTime(500);
+  assert.equal(calls.length, 1);
+});
+
+test("auto-dim normalization clamps brightness and rejects invalid notify actions", t => {
+  const harness = setup(t);
+  const card = harness.window.document.createElement("nvr-card");
+  const normalized = card.normalizeAutoDim({
+    enabled: true,
+    timeout: "bad",
+    fade_duration: -4,
+    normal_brightness: 999,
+    dim_brightness: -12,
+    notify_service: "notify.mobile_app_tablet"
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(normalized)), {
+    enabled: true,
+    invalid: false,
+    timeout: 300,
+    fadeDuration: 0,
+    normalBrightness: 255,
+    dimBrightness: 0,
+    notifyService: "notify.mobile_app_tablet"
+  });
+  assert.equal(card.normalizeAutoDim({
+    enabled: true,
+    notify_service: "light.tablet"
+  }).enabled, false);
+});
+
+test("auto-dim lifecycle cleanup avoids duplicate timers and preserves players", t => {
+  const harness = setup(t);
+  const hass = harness.createHass();
+  const calls = [];
+  hass.callService = (...args) => calls.push(args);
+  const card = createAutoDimCard(harness, enabledAutoDim, hass);
+  card.assignCamera("Front");
+  const before = harness.capturePlayerIdentity(card, "Front");
+  calls.length = 0;
+
+  card.remove();
+  harness.advanceTime(5000);
+  assert.equal(calls.length, 0);
+  harness.window.document.body.appendChild(card);
+  card.connectedCallback();
+  harness.advanceTime(2000);
+  assert.equal(calls.length, 1);
+  const after = harness.capturePlayerIdentity(card, "Front");
+  assert.strictEqual(after.player, before.player);
+  assert.strictEqual(after.cell, before.cell);
+  assert.equal(after.player.isConnected, true);
+  assert.equal(after.player.connectedCount, 2);
+  assert.equal(after.player.disconnectedCount, 1);
+});
+
+test("brightness service failure is non-fatal and warns only once", t => {
+  const harness = setup(t);
+  const hass = harness.createHass();
+  hass.callService = () => {};
+  const warnings = [];
+  const originalWarn = harness.window.console.warn;
+  harness.window.console.warn = message => warnings.push(message);
+  t.after(() => harness.window.console.warn = originalWarn);
+  const card = createAutoDimCard(
+    harness,
+    { ...enabledAutoDim, fade_duration: 8 },
+    hass
+  );
+  hass.callService = () => {
+    throw new Error("unavailable");
+  };
+
+  harness.advanceTime(10000);
+  assert.equal(warnings.length, 1);
+  assert.equal(card._fadeTimer, null);
+  assert.equal(card.isConnected, true);
+});
+
+test("enabled auto-dim establishes display ownership in order once", t => {
+  const harness = setup(t);
+  const hass = harness.createHass();
+  const calls = [];
+  hass.callService = (...args) => calls.push(args);
+  const card = createAutoDimCard(harness, enabledAutoDim, hass);
+
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(calls)),
+    [
+      ["notify", "mobile_app_test_tablet", {
+        message: "command_auto_screen_brightness",
+        data: { command: "turn_off" }
+      }],
+      ["notify", "mobile_app_test_tablet", {
+        message: "command_screen_on",
+        data: { command: "keep_screen_on" }
+      }],
+      ["notify", "mobile_app_test_tablet", {
+        message: "command_screen_brightness_level",
+        data: { command: 180 }
+      }]
+    ]
+  );
+
+  card.hass = hass;
+  card.hass = { ...hass };
+  card.dispatchEvent(new harness.window.Event("mousemove", { bubbles: true }));
+  assert.equal(calls.length, 3);
+});
+
+test("ownership completion, not hass refresh, controls initial timeout", t => {
+  const harness = setup(t);
+  const hass = harness.createHass();
+  const completions = [];
+  hass.callService = () => ({
+    then(onFulfilled) {
+      completions.push(onFulfilled);
+    }
+  });
+  const card = createAutoDimCard(harness, enabledAutoDim, hass);
+  assert.equal(card._idleTimer, null);
+  assert.equal(completions.length, 1);
+
+  completions.shift()();
+  assert.equal(card._idleTimer, null);
+  completions.shift()();
+  assert.equal(card._idleTimer, null);
+  completions.shift()();
+  assert.notEqual(card._idleTimer, null);
+
+  harness.advanceTime(1500);
+  card.hass = { ...hass };
+  card.hass = { ...hass };
+  harness.advanceTime(500);
+  assert.equal(card._autoDimState, "dimmed");
+});
+
+test("invalid auto-dim service establishes no ownership or activity listeners", t => {
+  const harness = setup(t);
+  const hass = harness.createHass();
+  const calls = [];
+  hass.callService = (...args) => calls.push(args);
+  const warnings = [];
+  const originalWarn = harness.window.console.warn;
+  harness.window.console.warn = message => warnings.push(message);
+  t.after(() => harness.window.console.warn = originalWarn);
+  const card = createAutoDimCard(harness, {
+    ...enabledAutoDim,
+    notify_service: "light.tablet"
+  }, hass);
+
+  assert.equal(card._autoDimConfig.enabled, false);
+  assert.equal(card._autoDimListenersInstalled, false);
+  assert.deepEqual(calls, []);
+  assert.deepEqual(warnings, [
+    "[NVR auto-dim] Invalid auto_dim configuration; auto-dim disabled."
+  ]);
+});
+
+test("new card instance reasserts ownership while reconnecting one instance does not", t => {
+  const harness = setup(t);
+  const hass = harness.createHass();
+  const calls = [];
+  hass.callService = (...args) => calls.push(args);
+  const first = createAutoDimCard(harness, enabledAutoDim, hass);
+  assert.equal(calls.length, 3);
+
+  first.remove();
+  harness.window.document.body.appendChild(first);
+  assert.equal(calls.length, 3);
+
+  createAutoDimCard(harness, enabledAutoDim, hass);
+  assert.equal(calls.length, 6);
+});
+
+test("disabled to enabled establishes ownership and enabled to disabled stops work", t => {
+  const harness = setup(t);
+  const hass = harness.createHass();
+  const calls = [];
+  hass.callService = (...args) => calls.push(args);
+  const card = createAutoDimCard(
+    harness,
+    { ...enabledAutoDim, enabled: false },
+    hass
+  );
+  assert.equal(calls.length, 0);
+
+  card.setConfig({ cameras: [], auto_dim: enabledAutoDim });
+  assert.equal(calls.length, 3);
+  harness.advanceTime(2000);
+  assert.equal(calls.length, 4);
+
+  card.setConfig({
+    cameras: [],
+    auto_dim: { ...enabledAutoDim, enabled: false }
+  });
+  const stoppedAt = calls.length;
+  harness.advanceTime(60000);
+  assert.equal(calls.length, stoppedAt);
+  assert.equal(card._idleTimer, null);
+  assert.equal(card._fadeTimer, null);
+  assert.equal(card._autoDimListenersInstalled, false);
+});
+
+test("ownership failure is non-fatal and latches without retry", t => {
+  const harness = setup(t);
+  const hass = harness.createHass();
+  const calls = [];
+  hass.callService = (_domain, _service, payload) => {
+    calls.push(payload.message);
+    if (payload.message === "command_auto_screen_brightness") {
+      throw new Error("unavailable");
+    }
+  };
+  const warnings = [];
+  const originalWarn = harness.window.console.warn;
+  harness.window.console.warn = message => warnings.push(message);
+  t.after(() => harness.window.console.warn = originalWarn);
+
+  const card = createAutoDimCard(harness, enabledAutoDim, hass);
+  assert.deepEqual(calls, [
+    "command_auto_screen_brightness"
+  ]);
+  assert.deepEqual(warnings, [
+    "[NVR auto-dim] disable automatic brightness failed; " +
+      "auto-dim disabled for this configuration."
+  ]);
+  harness.advanceTime(60000);
+  assert.equal(calls.length, 1);
+  assert.equal(card._autoDimFailed, true);
+  assert.equal(card._idleTimer, null);
+  assert.equal(card.isConnected, true);
+});
+
+test("corrected notify service replaces a failed endpoint without stale calls", t => {
+  const harness = setup(t);
+  const hass = harness.createHass();
+  const calls = [];
+  hass.callService = (domain, service, payload) => {
+    calls.push({ domain, service, message: payload.message });
+    if (service === "mobile_app_bad") {
+      throw new Error("bad endpoint");
+    }
+  };
+  const originalWarn = harness.window.console.warn;
+  harness.window.console.warn = () => {};
+  t.after(() => harness.window.console.warn = originalWarn);
+  const card = createAutoDimCard(harness, {
+    ...enabledAutoDim,
+    notify_service: "notify.mobile_app_bad"
+  }, hass);
+  assert.equal(calls.length, 1);
+  assert.equal(card._autoDimFailed, true);
+
+  card.setConfig({
+    cameras: [],
+    auto_dim: {
+      ...enabledAutoDim,
+      notify_service: "notify.mobile_app_corrected"
+    }
+  });
+  assert.equal(card._autoDimFailed, false);
+  assert.deepEqual(calls.slice(1).map(call => call.service), [
+    "mobile_app_corrected",
+    "mobile_app_corrected",
+    "mobile_app_corrected"
+  ]);
+  harness.advanceTime(2000);
+  assert.equal(calls.at(-1).service, "mobile_app_corrected");
+  assert.equal(
+    calls.filter(call => call.service === "mobile_app_bad").length,
+    1
+  );
+});
+
+test("internal media events do not reset the inactivity timeout", t => {
+  const harness = setup(t);
+  const hass = harness.createHass();
+  const calls = [];
+  hass.callService = (...args) => calls.push(args);
+  const card = createAutoDimCard(harness, enabledAutoDim, hass);
+  card.assignCamera("Front");
+  calls.length = 0;
+  harness.advanceTime(1500);
+  card.querySelector("hui-image")?.dispatchEvent(
+    new harness.window.Event("playing", { bubbles: true })
+  );
+  harness.advanceTime(500);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][2].data.command, 0);
+});
 
 function installAnonymousMediaTree(
   window,
@@ -245,6 +668,134 @@ test("card disconnect and reconnect diagnostics preserve state and hui-image ide
     return entry.event === "reconnect-snapshot" &&
       entry.reason === "card-disconnected";
   }));
+});
+
+test("first frame starts liveness and healthy presentation has no spinner", t => {
+  const harness = setup(t);
+  const card = harness.createCard();
+  card.assignCamera("Garage");
+  const image = harness.getPlayer(card, "Garage");
+  const video = addReachableVideo(harness, image);
+  const state = card._reconnectPresentationDiagnostics.get(image);
+
+  card.inspectReconnectPresentation(state);
+  presentFrame(video);
+
+  assert.equal(state.firstFrameLogged, true);
+  assert.equal(state.frameLivenessStarted, true);
+  assert.equal(state.visualState, "live");
+  assert.equal(
+    card.querySelector(".nvr-live-state-indicator").hidden,
+    true
+  );
+});
+
+test("silence stalls only the affected presentation and resume clears it", t => {
+  const harness = setup(t);
+  const card = harness.createCard();
+  card.assignCamera("Garage");
+  card.assignCameraToSlot("Front", 1);
+  const garage = harness.getPlayer(card, "Garage");
+  const front = harness.getPlayer(card, "Front");
+  const garageVideo = addReachableVideo(harness, garage);
+  const frontVideo = addReachableVideo(harness, front);
+  const garageState = card._reconnectPresentationDiagnostics.get(garage);
+  const frontState = card._reconnectPresentationDiagnostics.get(front);
+
+  card.inspectReconnectPresentation(garageState);
+  card.inspectReconnectPresentation(frontState);
+  presentFrame(garageVideo);
+  presentFrame(frontVideo);
+  harness.advanceTime(10000);
+
+  assert.equal(garageState.stallLogged, true);
+  assert.equal(frontState.stallLogged, true);
+  assert.equal(
+    card.querySelector(".video-cell[data-slot=\"0\"] .nvr-live-state-indicator").hidden,
+    false
+  );
+  assert.equal(
+    card.querySelector(".video-cell[data-slot=\"1\"] .nvr-live-state-indicator").hidden,
+    false
+  );
+
+  presentFrame(garageVideo);
+  assert.equal(garageState.stallLogged, false);
+  assert.equal(
+    card.querySelector(".video-cell[data-slot=\"0\"] .nvr-live-state-indicator").hidden,
+    true
+  );
+  assert.equal(
+    card.querySelector(".video-cell[data-slot=\"1\"] .nvr-live-state-indicator").hidden,
+    false
+  );
+});
+
+test("later independent stall episodes are observational and do not render slots", t => {
+  const harness = setup(t);
+  const card = harness.createCard();
+  card.assignCamera("Garage");
+  const image = harness.getPlayer(card, "Garage");
+  const video = addReachableVideo(harness, image);
+  const state = card._reconnectPresentationDiagnostics.get(image);
+  const renderSlots = [];
+  const renderSlot = card.renderSlot.bind(card);
+  card.renderSlot = slot => {
+    renderSlots.push(slot);
+    return renderSlot(slot);
+  };
+
+  card.inspectReconnectPresentation(state);
+  presentFrame(video);
+  harness.advanceTime(10000);
+  presentFrame(video);
+  harness.advanceTime(10000);
+  presentFrame(video);
+  harness.advanceTime(10000);
+
+  assert.equal(state.stallLogged, true);
+  assert.deepEqual(renderSlots, []);
+  assert.equal(image.cameraView, "live");
+  assert.equal(image.cameraImage, "camera.lorex_mediaprofile_channel1_substream1_3");
+});
+
+test("hidden document suppresses false stall and source transition resets state", t => {
+  const harness = setup(t);
+  const card = harness.createCard();
+  card.assignCamera("Garage");
+  const image = harness.getPlayer(card, "Garage");
+  const video = addReachableVideo(harness, image);
+  const state = card._reconnectPresentationDiagnostics.get(image);
+  card.inspectReconnectPresentation(state);
+  presentFrame(video);
+  harness.setDocumentVisibility("hidden");
+  harness.advanceTime(20000);
+  assert.equal(state.stallLogged, false);
+
+  harness.setDocumentVisibility("visible");
+  card.maximizeCameraSlot(0);
+  assert.strictEqual(harness.getPlayer(card, "Garage"), image);
+  assert.equal(
+    card.querySelector(".nvr-live-state-indicator").hidden,
+    true
+  );
+});
+
+test("stale callbacks and disconnect cleanup do nothing", t => {
+  const harness = setup(t);
+  const card = harness.createCard();
+  card.assignCamera("Garage");
+  const image = harness.getPlayer(card, "Garage");
+  const video = addReachableVideo(harness, image);
+  const state = card._reconnectPresentationDiagnostics.get(image);
+  card.inspectReconnectPresentation(state);
+  presentFrame(video);
+  const staleCallback = video.frameCallback;
+  card.remove();
+  staleCallback();
+  harness.advanceTime(10000);
+  assert.equal(state.active, false);
+  assert.equal(state.stallLogged, false);
 });
 
 test("reconnect snapshot reports ownership and source without changing runtime state", t => {

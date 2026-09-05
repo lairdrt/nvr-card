@@ -28,6 +28,8 @@ export function createTestHarness({
   let currentTime = 0;
   let nextIntervalId = 1;
   const intervals = new Map();
+  let nextTimeoutId = 1;
+  const timeouts = new Map();
   const providerOpenCalls = [];
   const userStateBackend = new Map();
   const userStateCalls = [];
@@ -244,6 +246,25 @@ export function createTestHarness({
     }
   });
 
+  Object.defineProperty(window, "setTimeout", {
+    configurable: true,
+    value: (callback, delay = 0) => {
+      const timeoutId = nextTimeoutId++;
+      timeouts.set(timeoutId, {
+        callback,
+        nextTime: currentTime + delay
+      });
+      return timeoutId;
+    }
+  });
+
+  Object.defineProperty(window, "clearTimeout", {
+    configurable: true,
+    value: timeoutId => {
+      timeouts.delete(timeoutId);
+    }
+  });
+
   Object.defineProperty(window, "cancelAnimationFrame", {
     configurable: true,
     value: frameId => {
@@ -301,21 +322,34 @@ export function createTestHarness({
     const targetTime = currentTime + milliseconds;
 
     while (true) {
-      const next = [...intervals.entries()]
+      const scheduled = [
+        ...[...intervals.entries()].map(entry => ({
+          kind: "interval",
+          entry
+        })),
+        ...[...timeouts.entries()].map(entry => ({
+          kind: "timeout",
+          entry
+        }))
+      ];
+      const next = scheduled
         .sort((left, right) => {
-          return left[1].nextTime - right[1].nextTime;
+          return left.entry[1].nextTime - right.entry[1].nextTime;
         })[0];
 
-      if (!next || next[1].nextTime > targetTime) {
+      if (!next || next.entry[1].nextTime > targetTime) {
         break;
       }
 
-      const [intervalId, interval] = next;
-      currentTime = interval.nextTime;
-      interval.callback();
+      const [timerId, timer] = next.entry;
+      currentTime = timer.nextTime;
+      if (next.kind === "timeout") {
+        timeouts.delete(timerId);
+      }
+      timer.callback();
 
-      if (intervals.has(intervalId)) {
-        interval.nextTime += interval.delay;
+      if (next.kind === "interval" && intervals.has(timerId)) {
+        timer.nextTime += timer.delay;
       }
     }
 

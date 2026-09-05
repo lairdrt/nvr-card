@@ -1,0 +1,1 @@
+Enable-NetAdapter -Name "Ethernet" -Confirm:$false
