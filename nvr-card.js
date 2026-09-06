@@ -248,6 +248,9 @@ const AUTO_DIM_DEFAULTS = Object.freeze({
   notifyService: null
 });
 const AUTO_DIM_FADE_STEPS = 8;
+const AUTO_DIM_COMMAND_TIMEOUT = 15000;
+const AUTO_DIM_WAKE_CLICK_TIMEOUT = 500;
+const AUTO_DIM_WAKE_GESTURE_TIMEOUT = 10000;
 
 class NVRCard extends HTMLElement {
   constructor() {
@@ -296,28 +299,48 @@ class NVRCard extends HTMLElement {
     this._idleTimer = null;
     this._fadeTimer = null;
     this._autoDimListenersInstalled = false;
-    this._autoDimState = "awake";
-    this._consumeNextClick = false;
-    this._autoDimFailed = false;
+    this._autoDimState = "disabled";
     this._autoDimGeneration = 0;
-    this._autoDimDiagnosticConfigKey = null;
-    this._lastMouseActivityDiagnostic = -Infinity;
-    this._displayOwnershipEstablished = false;
     this._displayOwnershipComplete = false;
+    this._autoDimUsable = false;
+    this._autoDimConnection = null;
+    this._autoDimConnectionLost = false;
+    this._autoDimConnectionHandlers = null;
+    this._autoDimInFlight = null;
+    this._autoDimPendingCommand = null;
+    this._autoDimCommandTimer = null;
+    this._wakeGesture = null;
+    this._wakeClickTimer = null;
     this._autoDimPointerHandler = event => {
+      this.clearWakeGesture();
       this.handleAutoDimActivity(event, true);
     };
     this._autoDimClickHandler = event => {
-      if (this._consumeNextClick) {
+      const gesture = this._wakeGesture;
+      this.clearWakeGesture();
+      if (gesture && event.target === gesture.target &&
+          (event.pointerId === undefined || event.pointerId === gesture.pointerId)) {
         this.consumeWakeEvent(event);
-        this._consumeNextClick = false;
         return;
       }
       this.handleAutoDimActivity(event, true);
     };
-    this._autoDimActivityHandler = event => {
-      this.handleAutoDimActivity(event, false);
+    this._autoDimPointerEndHandler = event => {
+      if (!this._wakeGesture || event.pointerId !== this._wakeGesture.pointerId) return;
+      if (event.type === "pointercancel") {
+        this.clearWakeGesture();
+        return;
+      }
+      const gesture = this._wakeGesture;
+      const generation = this._autoDimGeneration;
+      if (this._wakeClickTimer !== null) window.clearTimeout(this._wakeClickTimer);
+      this._wakeClickTimer = window.setTimeout(() => {
+        if (generation === this._autoDimGeneration && this._wakeGesture === gesture) {
+          this.clearWakeGesture();
+        }
+      }, AUTO_DIM_WAKE_CLICK_TIMEOUT);
     };
+    this._autoDimActivityHandler = event => this.handleAutoDimActivity(event, false);
 
     this._viewportResizeHandler = event => {
       const source =
@@ -1983,31 +2006,8 @@ class NVRCard extends HTMLElement {
     this._activeReconnectPresentationDiagnostics.forEach(state => {
       if (state.statusElement) this.positionLiveStatusIndicator(state.statusElement);
     });
-    const autoDimDiagnosticKey = JSON.stringify(normalized.autoDim);
-    if (this._autoDimDiagnosticConfigKey !== autoDimDiagnosticKey) {
-      this._autoDimDiagnosticConfigKey = autoDimDiagnosticKey;
-      console.log("[NVR auto-dim] config normalized", {
-        enabled: normalized.autoDim.enabled,
-        timeout: normalized.autoDim.timeout,
-        fade_duration: normalized.autoDim.fadeDuration,
-        normal_brightness: normalized.autoDim.normalBrightness,
-        dim_brightness: normalized.autoDim.dimBrightness,
-        notify_service: normalized.autoDim.notifyService
-      });
-      const autoDimPresent = Object.prototype.hasOwnProperty.call(
-        config,
-        "auto_dim"
-      );
-      if (!autoDimPresent) {
-        console.log("[NVR auto-dim] disabled: block omitted");
-      } else if (normalized.autoDim.invalid) {
-        console.log("[NVR auto-dim] disabled: invalid config");
-      } else if (!normalized.autoDim.enabled) {
-        console.log("[NVR auto-dim] disabled: enabled false");
-      }
-    }
     const normalizedConfigKey =
-      JSON.stringify(normalized);
+      JSON.stringify({ cameras: normalized.cameras, cameraAspectRatio: normalized.cameraAspectRatio });
     const nextConfigKey =
       this.getLifecycleConfigKey(normalizedConfigKey);
     const equivalent =
@@ -2018,6 +2018,9 @@ class NVRCard extends HTMLElement {
     });
 
     this.config = config;
+    if (JSON.stringify(this._autoDimConfig) !== JSON.stringify(normalized.autoDim)) {
+      this.applyAutoDimConfig(normalized.autoDim);
+    }
 
     if (equivalent) {
       this.logCardLifecycle("set-config-equivalent-no-op", {
@@ -2040,12 +2043,6 @@ class NVRCard extends HTMLElement {
     this._cameras = normalized.cameras;
     this._cameraAspectRatio =
       normalized.cameraAspectRatio;
-    const autoDimChanged =
-      JSON.stringify(this._autoDimConfig) !==
-      JSON.stringify(normalized.autoDim);
-    if (autoDimChanged) {
-      this.applyAutoDimConfig(normalized.autoDim);
-    }
     this._normalizedConfigKey =
       normalizedConfigKey;
 
@@ -2118,7 +2115,9 @@ class NVRCard extends HTMLElement {
     }
 
     const number = (candidate, fallback, minimum, maximum) => {
-      const parsed = Number(candidate);
+      const parsed = typeof candidate === "number" ||
+        (typeof candidate === "string" && candidate.trim() !== "")
+        ? Number(candidate) : NaN;
       return Number.isFinite(parsed)
         ? Math.min(maximum, Math.max(minimum, parsed))
         : fallback;
@@ -2130,7 +2129,14 @@ class NVRCard extends HTMLElement {
       /^notify\.[a-z0-9_]+$/i.test(rawNotifyService.trim())
         ? rawNotifyService.trim()
         : null;
+    const normalBrightness = Math.round(number(
+      value.normal_brightness ?? value.normalBrightness, 180, 0, 255
+    ));
+    const dimBrightness = Math.round(number(
+      value.dim_brightness ?? value.dimBrightness, 0, 0, 255
+    ));
     const invalid =
+      (value.enabled === true && normalBrightness <= dimBrightness) ||
       (Object.prototype.hasOwnProperty.call(value, "enabled") &&
         typeof value.enabled !== "boolean") ||
       (value.enabled === true && notifyService === null);
@@ -2141,25 +2147,10 @@ class NVRCard extends HTMLElement {
         notifyService !== null &&
         !invalid,
       invalid,
-      timeout: number(value.timeout, 300, 1, Number.MAX_SAFE_INTEGER),
-      fadeDuration: number(
-        value.fade_duration ?? value.fadeDuration,
-        8,
-        0,
-        Number.MAX_SAFE_INTEGER
-      ),
-      normalBrightness: Math.round(number(
-        value.normal_brightness ?? value.normalBrightness,
-        180,
-        0,
-        255
-      )),
-      dimBrightness: Math.round(number(
-        value.dim_brightness ?? value.dimBrightness,
-        0,
-        0,
-        255
-      )),
+      timeout: number(value.timeout, 300, 1, 86400),
+      fadeDuration: number(value.fade_duration ?? value.fadeDuration, 8, 0, 300),
+      normalBrightness,
+      dimBrightness,
       notifyService
     };
   }
@@ -2311,7 +2302,7 @@ class NVRCard extends HTMLElement {
     this._lastObservedConnection = nextConnection;
     this._lastObservedConnectionConnected = nextConnected;
     this._hass = hass;
-    this.establishDisplayOwnership();
+    this.syncAutoDimConnection();
 
     if (
       previousHass &&
@@ -2364,24 +2355,8 @@ class NVRCard extends HTMLElement {
     this.logCardLifecycle("connected-callback");
     this.recordNvrFlight("card-connected");
     this.installViewportListeners();
-    if (this._autoDimConfig.enabled) {
-      this.installAutoDimListeners();
-      if (this._autoDimFailed) {
-        console.log(
-          "[NVR auto-dim] reconnect: prior failure latched; ownership not resent"
-        );
-      } else if (this._displayOwnershipComplete) {
-        console.log(
-          "[NVR auto-dim] reconnect: ownership already initialized; not resent"
-        );
-        this.resetIdleTimer();
-      } else if (this._displayOwnershipEstablished) {
-        console.log(
-          "[NVR auto-dim] reconnect: ownership initialization already in progress"
-        );
-      }
-    }
-    this.establishDisplayOwnership();
+    if (this._autoDimConfig.enabled) this.installAutoDimListeners();
+    this.syncAutoDimConnection();
 
     if (
       this.isConnected &&
@@ -2394,7 +2369,6 @@ class NVRCard extends HTMLElement {
 
 
   disconnectedCallback() {
-    console.log("[NVR auto-dim] cleanup");
     this.logReconnect("card-disconnected");
     this.cleanupAllReconnectPresentationDiagnostics();
     this.captureReconnectSnapshot("card-disconnected");
@@ -2404,7 +2378,9 @@ class NVRCard extends HTMLElement {
     this.closeCameraContextMenu();
     this.removeViewportListeners();
     this.removeAutoDimListeners();
-    this.clearAutoDimTimers();
+    this.unbindAutoDimConnection();
+    this._autoDimUsable = false;
+    this.suspendAutoDim("detached");
 
     if (this._resizeObserver) {
       this._resizeObserver.disconnect();
@@ -2422,137 +2398,182 @@ class NVRCard extends HTMLElement {
 
 
   installAutoDimListeners() {
-    if (this._autoDimListenersInstalled) {
-      return;
-    }
+    if (this._autoDimListenersInstalled) return;
     this.addEventListener("pointerdown", this._autoDimPointerHandler, true);
     this.addEventListener("click", this._autoDimClickHandler, true);
-    this.addEventListener("mousemove", this._autoDimActivityHandler, true);
-    this.addEventListener("dragstart", this._autoDimActivityHandler, true);
-    this.addEventListener("dragover", this._autoDimActivityHandler, true);
-    this.addEventListener("drop", this._autoDimActivityHandler, true);
+    for (const event of ["mousemove", "dragstart", "dragover", "drop"]) {
+      this.addEventListener(event, this._autoDimActivityHandler, true);
+    }
+    // Release may occur outside the card; only the captured wake gesture is handled.
+    document.addEventListener("pointerup", this._autoDimPointerEndHandler, true);
+    document.addEventListener("pointercancel", this._autoDimPointerEndHandler, true);
     this._autoDimListenersInstalled = true;
   }
 
 
+  removeAutoDimListeners() {
+    this.removeEventListener("pointerdown", this._autoDimPointerHandler, true);
+    this.removeEventListener("click", this._autoDimClickHandler, true);
+    for (const event of ["mousemove", "dragstart", "dragover", "drop"]) {
+      this.removeEventListener(event, this._autoDimActivityHandler, true);
+    }
+    document.removeEventListener("pointerup", this._autoDimPointerEndHandler, true);
+    document.removeEventListener("pointercancel", this._autoDimPointerEndHandler, true);
+    this._autoDimListenersInstalled = false;
+    this.clearWakeGesture();
+  }
+
+
+  clearWakeGesture() {
+    if (this._wakeClickTimer !== null) window.clearTimeout(this._wakeClickTimer);
+    this._wakeClickTimer = null;
+    this._wakeGesture = null;
+  }
+
+
+  isAutoDimServiceUsable() {
+    return this.isConnected && typeof this._hass?.callService === "function" &&
+      this._hass?.connection?.connected !== false && !this._autoDimConnectionLost;
+  }
+
+
   canUseAutoDim() {
-    return Boolean(
-      this._autoDimConfig.enabled &&
-      !this._autoDimFailed &&
-      this.isConnected &&
-      this._hass?.callService
-    );
+    return this._autoDimConfig.enabled && this.isAutoDimServiceUsable();
+  }
+
+
+  unbindAutoDimConnection() {
+    if (this._autoDimConnectionHandlers) {
+      for (const [event, handler] of Object.entries(this._autoDimConnectionHandlers)) {
+        this._autoDimConnection?.removeEventListener?.(event, handler);
+      }
+    }
+    this._autoDimConnectionHandlers = null;
+    this._autoDimConnection = null;
+    this._autoDimConnectionLost = false;
+  }
+
+
+  syncAutoDimConnection() {
+    const connection = this.isConnected && (this._autoDimConfig.enabled || this._autoDimState === "disabling")
+      ? this._hass?.connection ?? null : null;
+    if (connection !== this._autoDimConnection) {
+      if (this._autoDimUsable) this.suspendAutoDim("connection changed");
+      this._autoDimUsable = false;
+      this.unbindAutoDimConnection();
+      this._autoDimConnection = connection;
+      if (connection?.addEventListener && connection?.removeEventListener) {
+        const changed = lost => {
+          if (this._autoDimConnection !== connection || !this.isConnected) return;
+          this._autoDimConnectionLost = lost;
+          this.updateAutoDimAvailability();
+        };
+        this._autoDimConnectionHandlers = {
+          ready: () => changed(false),
+          disconnected: () => changed(true)
+        };
+        for (const [event, handler] of Object.entries(this._autoDimConnectionHandlers)) {
+          connection.addEventListener(event, handler);
+        }
+      }
+    }
+    this.updateAutoDimAvailability();
+  }
+
+
+  updateAutoDimAvailability() {
+    const usable = this.canUseAutoDim();
+    const wasUsable = this._autoDimUsable;
+    this._autoDimUsable = usable;
+    if (!usable) {
+      if (wasUsable || (this._autoDimState === "disabling" && !this.isAutoDimServiceUsable())) {
+        this.suspendAutoDim("connection unavailable");
+      }
+      return;
+    }
+    if (!wasUsable) this.establishDisplayOwnership();
+  }
+
+
+  invalidateAutoDimOperation() {
+    this._autoDimGeneration += 1;
+    this.clearAutoDimTimers();
+    this.clearWakeGesture();
+    if (this._autoDimCommandTimer !== null) window.clearTimeout(this._autoDimCommandTimer);
+    this._autoDimCommandTimer = null;
+    this._autoDimPendingCommand = null;
+    // Keep the in-flight barrier until the actual service promise settles.
+    return this._autoDimGeneration;
+  }
+
+
+  isAutoDimOperationCurrent(generation) {
+    return generation === this._autoDimGeneration && this.isAutoDimServiceUsable() &&
+      ["initializing", "restoring", "awake", "dimming", "dimmed", "disabling"].includes(this._autoDimState);
   }
 
 
   applyAutoDimConfig(nextConfig) {
-    const previousFailed = this._autoDimFailed;
-    this.clearAutoDimTimers();
-    this._autoDimState = "awake";
-    this._consumeNextClick = false;
+    const previous = this._autoDimConfig;
+    const restoreOnDisable = previous.enabled && !nextConfig.enabled && this.isAutoDimServiceUsable();
+    const generation = this.invalidateAutoDimOperation();
+    this.removeAutoDimListeners();
+    this.unbindAutoDimConnection();
     this._autoDimConfig = nextConfig;
-    this._autoDimGeneration += 1;
-    this._autoDimFailed = false;
-    this._displayOwnershipEstablished = false;
     this._displayOwnershipComplete = false;
-    console.log(
-      `[NVR auto-dim] config changed; generation=${this._autoDimGeneration}`
-    );
-    if (previousFailed) {
-      console.log(
-        "[NVR auto-dim] previous failure cleared by config change"
-      );
-    }
+    this._autoDimUsable = false;
+    this._autoDimState = nextConfig.invalid ? "error" : nextConfig.enabled ? "suspended" : "disabled";
     if (nextConfig.invalid) {
-      console.warn(
-        "[NVR auto-dim] Invalid auto_dim configuration; auto-dim disabled."
-      );
-      this.removeAutoDimListeners();
-      return;
+      console.warn("[NVR auto-dim] Invalid auto_dim configuration; auto-dim disabled.");
+    }
+    if (restoreOnDisable) {
+      this._autoDimState = "disabling";
+      this.syncAutoDimConnection();
+      this.queueAutoDimCommand(generation, previous.notifyService,
+        "command_screen_brightness_level", { command: previous.normalBrightness }, () => {
+          this._autoDimState = nextConfig.invalid ? "error" : "disabled";
+          this.unbindAutoDimConnection();
+        });
     }
     if (nextConfig.enabled) {
       this.installAutoDimListeners();
-      this.establishDisplayOwnership();
-    } else {
-      this.removeAutoDimListeners();
+      this.syncAutoDimConnection();
     }
   }
 
 
   establishDisplayOwnership() {
-    if (
-      !this.canUseAutoDim() ||
-      this._displayOwnershipEstablished
-    ) {
-      return;
-    }
-    this._displayOwnershipEstablished = true;
-    const generation = this._autoDimGeneration;
-    console.log(
-      "[NVR auto-dim] ownership initialized for new config " +
-      `generation=${generation}`
-    );
-    console.log("[NVR auto-dim] ownership start");
-    console.log(
-      "[NVR auto-dim] ownership auto-brightness off -> " +
-      this._autoDimConfig.notifyService
-    );
-    this.sendNotifyCommand(
-      "command_auto_screen_brightness",
-      { command: "turn_off" },
-      "disable automatic brightness",
-      () => {
-        console.log(
-          "[NVR auto-dim] ownership auto-brightness off ok"
-        );
-        console.log(
-          "[NVR auto-dim] ownership keep-screen-on -> " +
-          this._autoDimConfig.notifyService
-        );
-        this.sendNotifyCommand(
-          "command_screen_on",
-          { command: "keep_screen_on" },
-          "enable Keep screen on",
-          () => {
-            console.log(
-              "[NVR auto-dim] ownership keep-screen-on ok"
-            );
-            console.log(
-              "[NVR auto-dim] ownership normal brightness " +
-              `${this._autoDimConfig.normalBrightness} -> ` +
-              this._autoDimConfig.notifyService
-            );
-            this.sendBrightnessCommand(
-              this._autoDimConfig.normalBrightness,
-              () => {
-                console.log(
-                  "[NVR auto-dim] ownership normal brightness ok"
-                );
-                this._displayOwnershipComplete = true;
-                console.log("[NVR auto-dim] ownership complete");
-                this.resetIdleTimer();
-              }
-            );
-          },
-          generation
-        );
-      },
-      generation
-    );
+    if (!this.canUseAutoDim() || this._autoDimState !== "suspended") return;
+    const generation = this.invalidateAutoDimOperation();
+    this._displayOwnershipComplete = false;
+    this._autoDimState = "initializing";
+    const service = this._autoDimConfig.notifyService;
+    this.queueAutoDimCommand(generation, service, "command_auto_screen_brightness",
+      { command: "turn_off" }, () => {
+        this.queueAutoDimCommand(generation, service, "command_screen_on",
+          { command: "keep_screen_on" }, () => {
+            this.sendBrightnessCommand(this._autoDimConfig.normalBrightness, generation, () => {
+              this._displayOwnershipComplete = true;
+              this._autoDimState = "awake";
+              console.info("[NVR auto-dim] ready (HA commands completed)");
+              this.resetIdleTimer();
+            });
+          });
+      });
   }
 
 
-  removeAutoDimListeners() {
-    if (!this._autoDimListenersInstalled) {
-      return;
+  suspendAutoDim(reason, failure = false) {
+    const wasActive = !["disabled", "error", "suspended"].includes(this._autoDimState);
+    this.invalidateAutoDimOperation();
+    this._displayOwnershipComplete = false;
+    this._autoDimState = this._autoDimConfig.invalid ? "error"
+      : this._autoDimConfig.enabled ? "suspended" : "disabled";
+    if (!this._autoDimConfig.enabled) this.unbindAutoDimConnection();
+    if (wasActive) {
+      const log = failure ? console.warn : console.info;
+      log.call(console, "[NVR auto-dim] suspended", { reason });
     }
-    this.removeEventListener("pointerdown", this._autoDimPointerHandler, true);
-    this.removeEventListener("click", this._autoDimClickHandler, true);
-    this.removeEventListener("mousemove", this._autoDimActivityHandler, true);
-    this.removeEventListener("dragstart", this._autoDimActivityHandler, true);
-    this.removeEventListener("dragover", this._autoDimActivityHandler, true);
-    this.removeEventListener("drop", this._autoDimActivityHandler, true);
-    this._autoDimListenersInstalled = false;
   }
 
 
@@ -2563,206 +2584,149 @@ class NVRCard extends HTMLElement {
 
 
   handleAutoDimActivity(event, consumeWhenWaking) {
-    if (
-      !this.canUseAutoDim() ||
-      !this._displayOwnershipComplete
-    ) {
+    if (!this.canUseAutoDim()) return;
+    if (event.type === "mousemove" && document.visibilityState === "hidden") return;
+    const state = this._autoDimState;
+    if (state === "awake") {
+      this.resetIdleTimer();
       return;
     }
-    if (event.type === "mousemove" && document.visibilityState === "hidden") {
-      return;
+    // Transient failures are retried only by a deliberate gesture or reconnect.
+    if (state === "suspended" && !consumeWhenWaking) return;
+    if (!["dimming", "dimmed", "restoring", "suspended"].includes(state)) return;
+    if (consumeWhenWaking) this.consumeWakeEvent(event);
+    if (state === "suspended") this.establishDisplayOwnership();
+    else if (state !== "restoring") this.restoreNormalBrightness();
+    if (consumeWhenWaking && event.type === "pointerdown" &&
+        ["initializing", "restoring", "awake"].includes(this._autoDimState)) {
+      const gesture = { pointerId: event.pointerId, target: event.target };
+      const generation = this._autoDimGeneration;
+      this._wakeGesture = gesture;
+      this._wakeClickTimer = window.setTimeout(() => {
+        if (generation === this._autoDimGeneration && this._wakeGesture === gesture) {
+          this.clearWakeGesture();
+        }
+      }, AUTO_DIM_WAKE_GESTURE_TIMEOUT);
     }
-
-    const waking = this._autoDimState !== "awake";
-    if (waking) {
-      if (consumeWhenWaking) {
-        this.consumeWakeEvent(event);
-        this._consumeNextClick = event.type === "pointerdown";
-        console.log("[NVR auto-dim] wake interaction consumed");
-      }
-      this.restoreNormalBrightness();
-    }
-    const now = performance.now();
-    if (
-      event.type !== "mousemove" ||
-      now - this._lastMouseActivityDiagnostic >= 1000
-    ) {
-      console.log("[NVR auto-dim] activity reset timer");
-      if (event.type === "mousemove") {
-        this._lastMouseActivityDiagnostic = now;
-      }
-    }
-    this.resetIdleTimer();
   }
 
 
   clearAutoDimTimers() {
-    if (this._idleTimer !== null) {
-      window.clearTimeout(this._idleTimer);
-      this._idleTimer = null;
-    }
-    if (this._fadeTimer !== null) {
-      window.clearInterval(this._fadeTimer);
-      this._fadeTimer = null;
-    }
+    if (this._idleTimer !== null) window.clearTimeout(this._idleTimer);
+    if (this._fadeTimer !== null) window.clearTimeout(this._fadeTimer);
+    this._idleTimer = null;
+    this._fadeTimer = null;
   }
 
 
   resetIdleTimer() {
-    if (this._idleTimer !== null) {
-      window.clearTimeout(this._idleTimer);
-      this._idleTimer = null;
-    }
-    if (
-      !this.canUseAutoDim() ||
-      !this._displayOwnershipComplete
-    ) {
+    if (this._idleTimer !== null) window.clearTimeout(this._idleTimer);
+    this._idleTimer = null;
+    if (!this.canUseAutoDim() || !this._displayOwnershipComplete) return;
+    if (["dimming", "dimmed"].includes(this._autoDimState)) {
+      this.restoreNormalBrightness();
       return;
     }
-    this._idleTimer = window.setTimeout(() => {
+    if (this._autoDimState !== "awake") return;
+    const generation = this._autoDimGeneration;
+    const timer = window.setTimeout(() => {
+      if (!this.isAutoDimOperationCurrent(generation) || this._idleTimer !== timer) return;
       this._idleTimer = null;
-      console.log("[NVR auto-dim] timeout fired");
       this.startBrightnessFade();
     }, this._autoDimConfig.timeout * 1000);
-    console.log(
-      `[NVR auto-dim] timer armed: ${this._autoDimConfig.timeout}s`
-    );
+    this._idleTimer = timer;
   }
 
 
   startBrightnessFade() {
-    if (!this.canUseAutoDim()) {
-      return;
-    }
-    if (this._fadeTimer !== null) {
-      window.clearInterval(this._fadeTimer);
-      this._fadeTimer = null;
-    }
-
-    const { normalBrightness, dimBrightness, fadeDuration } =
-      this._autoDimConfig;
+    if (!this.canUseAutoDim() || !this._displayOwnershipComplete || this._autoDimState !== "awake") return;
+    const generation = this.invalidateAutoDimOperation();
+    this._autoDimState = "dimming";
+    const { normalBrightness, dimBrightness, fadeDuration } = this._autoDimConfig;
     const steps = fadeDuration === 0 ? 1 : AUTO_DIM_FADE_STEPS;
     let step = 0;
-    this._autoDimState = "dimming";
-    console.log(
-      "[NVR auto-dim] fade start: " +
-      `${normalBrightness} -> ${dimBrightness} over ${fadeDuration}s`
-    );
-
     const advance = () => {
+      if (!this.isAutoDimOperationCurrent(generation)) return;
+      this._fadeTimer = null;
       step += 1;
-      const brightness = Math.round(
-        normalBrightness +
-        (dimBrightness - normalBrightness) * (step / steps)
-      );
-      console.log(`[NVR auto-dim] brightness -> ${brightness}`);
-      this.sendBrightnessCommand(brightness);
-      if (step >= steps) {
-        if (this._fadeTimer !== null) {
-          window.clearInterval(this._fadeTimer);
-          this._fadeTimer = null;
+      const brightness = Math.round(normalBrightness + (dimBrightness - normalBrightness) * (step / steps));
+      this.sendBrightnessCommand(brightness, generation, () => {
+        if (step === steps) {
+          this._autoDimState = "dimmed";
+          console.info("[NVR auto-dim] dimmed (HA command completed)");
+        } else {
+          this._fadeTimer = window.setTimeout(advance, fadeDuration * 1000 / steps);
         }
-        this._autoDimState = "dimmed";
-        console.log("[NVR auto-dim] dim complete");
-      }
+      });
     };
-
-    if (steps === 1) {
-      advance();
-      return;
-    }
-    this._fadeTimer = window.setInterval(
-      advance,
-      fadeDuration * 1000 / steps
-    );
+    if (steps === 1) advance();
+    else this._fadeTimer = window.setTimeout(advance, fadeDuration * 1000 / steps);
   }
 
 
   restoreNormalBrightness() {
-    if (this._fadeTimer !== null) {
-      window.clearInterval(this._fadeTimer);
-      this._fadeTimer = null;
-    }
-    this._autoDimState = "awake";
-    console.log(
-      `[NVR auto-dim] wake brightness -> ${this._autoDimConfig.normalBrightness}`
-    );
-    this.sendBrightnessCommand(
-      this._autoDimConfig.normalBrightness,
-      () => console.log("[NVR auto-dim] wake complete")
-    );
+    if (!this.canUseAutoDim() || !["dimming", "dimmed"].includes(this._autoDimState)) return;
+    const generation = this.invalidateAutoDimOperation();
+    this._autoDimState = "restoring";
+    this.sendBrightnessCommand(this._autoDimConfig.normalBrightness, generation, () => {
+      this._autoDimState = "awake";
+      console.info("[NVR auto-dim] awake (HA command completed)");
+      this.resetIdleTimer();
+    });
   }
 
 
-  sendBrightnessCommand(brightness, onSuccess = null) {
-    this.sendNotifyCommand(
-      "command_screen_brightness_level",
-      { command: brightness },
-      "send brightness command",
-      onSuccess
-    );
+  sendBrightnessCommand(brightness, generation, onSuccess) {
+    this.queueAutoDimCommand(generation, this._autoDimConfig.notifyService,
+      "command_screen_brightness_level", { command: brightness }, onSuccess);
   }
 
 
-  sendNotifyCommand(
-    message,
-    data,
-    failureOperation = "send brightness command",
-    onSuccess = null,
-    generation = this._autoDimGeneration
-  ) {
-    if (this._autoDimFailed) {
-      return;
-    }
-    const service = this._autoDimConfig.notifyService;
-    const separator = service?.indexOf(".") ?? -1;
-    if (!this._hass?.callService || separator < 1) {
-      return;
-    }
-    const domain = service.slice(0, separator);
-    const serviceName = service.slice(separator + 1);
+  queueAutoDimCommand(generation, service, message, data, onSuccess) {
+    if (!this.isAutoDimOperationCurrent(generation)) return;
+    const command = { generation, service, message, data, onSuccess };
+    this._autoDimPendingCommand = command;
+    // Also bound time waiting behind an obsolete in-flight request. Timeout suspends
+    // intent; it does not pretend the service request was cancelled or start another.
+    this._autoDimCommandTimer = window.setTimeout(() => {
+      if (this.isAutoDimOperationCurrent(generation) &&
+          (this._autoDimPendingCommand === command || this._autoDimInFlight === command)) {
+        this.suspendAutoDim("command timeout", true);
+      }
+    }, AUTO_DIM_COMMAND_TIMEOUT);
+    this.pumpAutoDimCommand();
+  }
+
+
+  pumpAutoDimCommand() {
+    if (this._autoDimInFlight || !this._autoDimPendingCommand) return;
+    const command = this._autoDimPendingCommand;
+    this._autoDimPendingCommand = null;
+    if (!this.isAutoDimOperationCurrent(command.generation)) return;
+    this._autoDimInFlight = command;
+    const settled = error => {
+      if (this._autoDimInFlight !== command) return;
+      this._autoDimInFlight = null;
+      if (command.generation === this._autoDimGeneration && !this.isAutoDimServiceUsable()) {
+        this._autoDimUsable = false;
+        this.suspendAutoDim("connection unavailable");
+      } else if (this.isAutoDimOperationCurrent(command.generation)) {
+        window.clearTimeout(this._autoDimCommandTimer);
+        this._autoDimCommandTimer = null;
+        if (error) this.suspendAutoDim("service operation failed", true);
+        else command.onSuccess();
+      }
+      this.pumpAutoDimCommand();
+    };
     try {
-      const result = this._hass.callService(domain, serviceName, {
-        message,
-        data
-      });
-      if (result && typeof result.then === "function") {
-        result.then(
-          () => {
-            if (generation === this._autoDimGeneration) {
-              onSuccess?.();
-            }
-          },
-          () => {
-            if (generation === this._autoDimGeneration) {
-              this.failAutoDimConfiguration(failureOperation);
-            }
-          }
-        );
-      } else {
-        if (generation === this._autoDimGeneration) {
-          onSuccess?.();
-        }
-      }
-    } catch (_error) {
-      if (generation === this._autoDimGeneration) {
-        this.failAutoDimConfiguration(failureOperation);
-      }
+      const separator = command.service.indexOf(".");
+      const result = this._hass.callService(command.service.slice(0, separator),
+        command.service.slice(separator + 1), { message: command.message, data: command.data });
+      if (result && typeof result.then === "function") result.then(() => settled(false), () => settled(true));
+      else settled(false);
+    } catch {
+      settled(true);
     }
-  }
-
-
-  failAutoDimConfiguration(operation) {
-    if (this._autoDimFailed) {
-      return;
-    }
-    this._autoDimFailed = true;
-    this.clearAutoDimTimers();
-    this.removeAutoDimListeners();
-    console.warn(
-      `[NVR auto-dim] ${operation} failed; ` +
-      "auto-dim disabled for this configuration."
-    );
   }
 
 

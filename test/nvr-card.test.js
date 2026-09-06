@@ -236,7 +236,7 @@ test("auto-dim lifecycle cleanup avoids duplicate timers and preserves players",
   harness.window.document.body.appendChild(card);
   card.connectedCallback();
   harness.advanceTime(2000);
-  assert.equal(calls.length, 1);
+  assert.equal(calls.length, 4); // Three ownership commands on reattach, then one dim.
   const after = harness.capturePlayerIdentity(card, "Front");
   assert.strictEqual(after.player, before.player);
   assert.strictEqual(after.cell, before.cell);
@@ -323,6 +323,8 @@ test("ownership completion, not hass refresh, controls initial timeout", t => {
   card.hass = { ...hass };
   card.hass = { ...hass };
   harness.advanceTime(500);
+  assert.equal(card._autoDimState, "dimming");
+  completions.shift()();
   assert.equal(card._autoDimState, "dimmed");
 });
 
@@ -348,7 +350,7 @@ test("invalid auto-dim service establishes no ownership or activity listeners", 
   ]);
 });
 
-test("new card instance reasserts ownership while reconnecting one instance does not", t => {
+test("new card instance and reattach each establish ownership once", t => {
   const harness = setup(t);
   const hass = harness.createHass();
   const calls = [];
@@ -358,10 +360,10 @@ test("new card instance reasserts ownership while reconnecting one instance does
 
   first.remove();
   harness.window.document.body.appendChild(first);
-  assert.equal(calls.length, 3);
+  assert.equal(calls.length, 6);
 
   createAutoDimCard(harness, enabledAutoDim, hass);
-  assert.equal(calls.length, 6);
+  assert.equal(calls.length, 9);
 });
 
 test("disabled to enabled establishes ownership and enabled to disabled stops work", t => {
@@ -393,7 +395,7 @@ test("disabled to enabled establishes ownership and enabled to disabled stops wo
   assert.equal(card._autoDimListenersInstalled, false);
 });
 
-test("ownership failure is non-fatal and latches without retry", t => {
+test("ownership failure suspends without automatic retry", t => {
   const harness = setup(t);
   const hass = harness.createHass();
   const calls = [];
@@ -413,12 +415,11 @@ test("ownership failure is non-fatal and latches without retry", t => {
     "command_auto_screen_brightness"
   ]);
   assert.deepEqual(warnings, [
-    "[NVR auto-dim] disable automatic brightness failed; " +
-      "auto-dim disabled for this configuration."
+    "[NVR auto-dim] suspended"
   ]);
   harness.advanceTime(60000);
   assert.equal(calls.length, 1);
-  assert.equal(card._autoDimFailed, true);
+  assert.equal(card._autoDimState, "suspended");
   assert.equal(card._idleTimer, null);
   assert.equal(card.isConnected, true);
 });
@@ -441,7 +442,7 @@ test("corrected notify service replaces a failed endpoint without stale calls", 
     notify_service: "notify.mobile_app_bad"
   }, hass);
   assert.equal(calls.length, 1);
-  assert.equal(card._autoDimFailed, true);
+  assert.equal(card._autoDimState, "suspended");
 
   card.setConfig({
     cameras: [],
@@ -450,7 +451,7 @@ test("corrected notify service replaces a failed endpoint without stale calls", 
       notify_service: "notify.mobile_app_corrected"
     }
   });
-  assert.equal(card._autoDimFailed, false);
+  assert.equal(card._autoDimState, "awake");
   assert.deepEqual(calls.slice(1).map(call => call.service), [
     "mobile_app_corrected",
     "mobile_app_corrected",

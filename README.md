@@ -15,16 +15,22 @@ auto_dim:
   notify_service: notify.mobile_app_sm_x30
 ```
 
-- `timeout`: inactivity period in seconds.
-- `fade_duration`: seconds used for the bounded brightness fade.
-- `normal_brightness` and `dim_brightness`: brightness levels from 0 through 255.
+- `timeout`: inactivity period in seconds, clamped to 1..86400 (default 300).
+- `fade_duration`: scheduled fade duration in seconds, clamped to 0..300 (default 8). Steps are serialized; HA request latency can extend the fade.
+- `normal_brightness` and `dim_brightness`: brightness levels from 0 through 255 (defaults 180 and 0). Normal must exceed dim for an enabled configuration. Numeric strings remain supported; null, empty, and nonnumeric values use defaults.
 - `notify_service`: notification action for the device that accepts Home Assistant Companion brightness and display commands.
 
 To find the Companion action, go to **Settings -> Tools -> Actions**, search for `mobile_app`, and choose **Send a notification via <device>**. The action will look like `notify.mobile_app_sm_x30`. The configured endpoint must support the Companion brightness and display commands; the card does not discover or infer the correct device.
 
 When enabled, NVR Card disables Android automatic brightness, enables Companion **Keep screen on**, establishes `normal_brightness`, and then manages inactivity dimming. Android may require the Home Assistant Companion permission **Allow this app to change system settings**. On the tested Galaxy tablet, `dim_brightness: 0` selects minimum brightness rather than turning the display off; use `1` or another small value if preferred.
 
-If `auto_dim` is omitted, disabled, or invalid, the feature does not take display ownership or install activity tracking. A failed notify action disables auto-dim for that exact configuration after one warning. Correcting the YAML creates a fresh configuration and tries only the new endpoint.
+Auto-dim is configured independently on each card; it has no device detection, shared runtime state, or persisted settings. Omitted/disabled configuration does not start ownership or activity tracking. Invalid configuration is blocked until corrected. Changing only `auto_dim` preserves camera media.
+
+Startup and each usable reconnect/reattach run the ownership commands serially, then restore normal brightness. Inactivity starts only after that HA command succeeds. Wake cancels unsent fade work, waits behind any request already in flight, and restores normal brightness before restarting inactivity. The wake gesture and its matching click are consumed; suppression clears on cancellation, expires after release, and cannot remain waiting indefinitely for an unrelated click.
+
+Disconnect/detach cancels pending work. Service failures suspend auto-dim without permanently blocking the configuration. It resumes on a genuine reconnect/reattach or a deliberate pointer/click recovery gesture, with no polling or automatic retry loop. A 15-second command/wait deadline suspends a stuck operation. An unresolved service request remains a serialization barrier until it settles; the card cannot cancel an already-delivered notification or safely overlap it with another request.
+
+Disabling an active configuration while connected makes one bounded best-effort restoration to its previous normal brightness. It does not restore Android automatic-brightness or keep-screen-on settings, whose previous values are unknown. Logs report HA command completion and logical transitions, not observed physical brightness.
 
 ## Terminal stream recovery
 
