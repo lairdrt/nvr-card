@@ -8,6 +8,10 @@ const NVR_BUILD = "__NVR_BUILD__";
 const USE_HA_HUI_IMAGE_EXPERIMENT = true;
 const NVR_LIVE_TRANSITION_DIAGNOSTICS = false;
 const NVR_GRID_SLOT_CAPACITY = 16;
+const NVR_SWIPE_MIN_DISTANCE = 60;
+const NVR_SWIPE_HORIZONTAL_RATIO = 1.5;
+const NVR_SWIPE_MAX_DURATION = 3000;
+const NVR_SWIPE_CLICK_WINDOW = 700;
 const NVR_MAXIMIZE_DIAGNOSTICS = false;
 const NVR_MAXIMIZE_FLIGHT_RECORDER = true;
 const NVR_DIAGNOSTIC_LIVE_SLOT_LIMIT = 4;
@@ -213,6 +217,9 @@ class NVRCard extends HTMLElement {
     this._selectedCamera = null;
     this._selectedLayout = null;
     this._maximizedSlot = null;
+    this._maximizedCameraOverride = null;
+    this._maximizedSwipe = null;
+    this._swipeClick = null;
     this._placementClickPending = false;
     this._cameraContextSlot = null;
 
@@ -617,6 +624,7 @@ class NVRCard extends HTMLElement {
   getLifecycleAssignedSlots() {
     return this._assignedCameras.flatMap(
       (cameraName, slot) => {
+        cameraName = this.getPresentationCameraName(slot);
         if (cameraName === null) {
           return [];
         }
@@ -717,6 +725,9 @@ class NVRCard extends HTMLElement {
 
 
   cleanupReconnectPresentationDiagnostics(image) {
+    if (image && this._maximizedSwipe?.cell === image.closest(".video-cell")) {
+      this._maximizedSwipe = null;
+    }
     const state = this._reconnectPresentationDiagnostics.get(image);
     if (!state) return;
     this.cancelTerminalRecovery(state, "presentation-retired");
@@ -836,7 +847,7 @@ class NVRCard extends HTMLElement {
     if (!state.active || state.recoveryAttempted || !oldImage.isConnected ||
         !frame?.classList.contains("camera-frame") ||
         Number(cell?.dataset.slot) !== state.slot ||
-        this._assignedCameras[state.slot] !== state.logicalCamera) return;
+        this.getPresentationCameraName(state.slot) !== state.logicalCamera) return;
     state.recoveryAttempted = true;
     this.setReconnectPresentationVisualState(state, true);
     this.logReconnect("terminal-recovery-start", this.getReconnectPresentationDetails(state));
@@ -1102,6 +1113,7 @@ class NVRCard extends HTMLElement {
   captureReconnectSnapshot(reason) {
     const cells = this._assignedCameras.flatMap(
       (cameraName, slot) => {
+        cameraName = this.getPresentationCameraName(slot);
         if (cameraName === null) {
           return [];
         }
@@ -2312,7 +2324,7 @@ class NVRCard extends HTMLElement {
       if (!this._reconnectPresentationSources.has(image)) return;
       const slot = Number(image.closest(".video-cell")?.dataset.slot);
       this.armReconnectPresentationDiagnostics(
-        image, slot, this._assignedCameras[slot],
+        image, slot, this.getPresentationCameraName(slot),
         this._reconnectPresentationSources.get(image), false
       );
     });
@@ -2335,6 +2347,8 @@ class NVRCard extends HTMLElement {
 
 
   disconnectedCallback() {
+    this._maximizedSwipe = null;
+    this._swipeClick = null;
     this.logReconnect("card-disconnected");
     this.cleanupAllReconnectPresentationDiagnostics();
     this.captureReconnectSnapshot("card-disconnected");
@@ -2707,6 +2721,9 @@ class NVRCard extends HTMLElement {
     this.closeAllProviderPresentations();
     this.closeCameraContextMenu();
     this._maximizedSlot = null;
+    this._maximizedCameraOverride = null;
+    this._maximizedSwipe = null;
+    this._swipeClick = null;
     this._placementClickPending = false;
 
     this.innerHTML = `
@@ -3575,6 +3592,7 @@ class NVRCard extends HTMLElement {
       .video-grid.camera-maximized
         .video-cell.maximized-camera {
         display: block;
+        touch-action: pan-y;
 
         grid-column: 1 / -1 !important;
         grid-row: 1 / -1 !important;
@@ -3907,11 +3925,13 @@ class NVRCard extends HTMLElement {
   }
 
 
+  getEnabledCameras() {
+    return this._cameras.filter(camera => camera.active === true);
+  }
+
+
   buildCameraList() {
-    return this._cameras
-      .filter(camera => {
-        return camera.active === true;
-      })
+    return this.getEnabledCameras()
       .map(camera => {
 
         const liveClass =
@@ -4610,10 +4630,10 @@ class NVRCard extends HTMLElement {
       return null;
     }
 
-    const camera = this.getCameraByName(this._assignedCameras[slot]);
+    const camera = this.getCameraByName(this.getPresentationCameraName(slot));
     const transition = {
       startTime: performance.now(),
-      camera: this._assignedCameras[slot],
+      camera: this.getPresentationCameraName(slot),
       slot,
       fromEntity: image.cameraImage ?? null,
       toEntity: this.getCameraLiveSource(camera, true),
@@ -4631,10 +4651,10 @@ class NVRCard extends HTMLElement {
       return null;
     }
 
-    const camera = this.getCameraByName(this._assignedCameras[slot]);
+    const camera = this.getCameraByName(this.getPresentationCameraName(slot));
     const transition = {
       startTime: performance.now(),
-      camera: this._assignedCameras[slot],
+      camera: this.getPresentationCameraName(slot),
       slot,
       fromEntity: image.cameraImage ?? null,
       toEntity: this.getCameraLiveSource(camera, false),
@@ -4687,7 +4707,7 @@ class NVRCard extends HTMLElement {
       const targetEntity =
         USE_HA_HUI_IMAGE_EXPERIMENT
           ? this.getCameraLiveSource(
-              this.getCameraByName(this._assignedCameras[slot]), slot === this._maximizedSlot
+              this.getCameraByName(this.getPresentationCameraName(slot)), slot === this._maximizedSlot
             )
           : configuredEntity;
       const transition =
@@ -4715,7 +4735,7 @@ class NVRCard extends HTMLElement {
         this.armReconnectPresentationDiagnostics(
           image,
           slot,
-          this._assignedCameras[slot],
+          this.getPresentationCameraName(slot),
           targetEntity,
           false
         );
@@ -4755,6 +4775,7 @@ class NVRCard extends HTMLElement {
 
 
   renderSlot(slot) {
+    if (slot === this._maximizedSlot) this._maximizedSwipe = null;
     const cell =
       this.querySelector(
         `.video-cell[data-slot="${slot}"]`
@@ -4771,7 +4792,7 @@ class NVRCard extends HTMLElement {
       {
         requestedSlot: slot,
         assignedCameraName:
-          this._assignedCameras[slot] ?? null
+          this.getPresentationCameraName(slot) ?? null
       }
     );
 
@@ -4799,7 +4820,7 @@ class NVRCard extends HTMLElement {
 
 
     const cameraName =
-      this._assignedCameras[slot];
+      this.getPresentationCameraName(slot);
 
 
     cell.draggable =
@@ -6138,6 +6159,11 @@ class NVRCard extends HTMLElement {
 
 
   replaceMaximizedCamera(cameraName) {
+    if (this._maximizedCameraOverride !== null) {
+      this._maximizedCameraOverride = null;
+      this._maximizedSwipe = null;
+      this.renderSlot(this._maximizedSlot);
+    }
     const slot = this._maximizedSlot;
     const camera = this.getCameraByName(cameraName);
 
@@ -6215,6 +6241,8 @@ class NVRCard extends HTMLElement {
 
 
   restoreMaximizedCamera() {
+    this._maximizedSwipe = null;
+    this._swipeClick = null;
     if (this._maximizedSlot === null) {
       return;
     }
@@ -6222,6 +6250,8 @@ class NVRCard extends HTMLElement {
     this.resetIdleTimer();
 
     const maximizedSlot = this._maximizedSlot;
+    const wasBrowsing = this._maximizedCameraOverride !== null;
+    this._maximizedCameraOverride = null;
     this.beginRestoreLiveTransition(
       maximizedSlot,
       this.querySelector(
@@ -6271,6 +6301,7 @@ class NVRCard extends HTMLElement {
       });
 
     this._maximizedSlot = null;
+    if (wasBrowsing) this.renderSlot(maximizedSlot);
     this.updateCameraViewForCell(
       this.querySelector(
         `.video-cell[data-slot="${maximizedSlot}"]`
@@ -7172,6 +7203,70 @@ class NVRCard extends HTMLElement {
   }
 
 
+  // Browsing changes presentation only. Grid assignments remain the restore and persistence state.
+  getPresentationCameraName(slot) {
+    return slot === this._maximizedSlot && this._maximizedCameraOverride !== null
+      ? this._maximizedCameraOverride
+      : this._assignedCameras[slot];
+  }
+
+
+  navigateMaximizedCamera(offset) {
+    if (!USE_HA_HUI_IMAGE_EXPERIMENT || this._maximizedSlot === null ||
+        (offset !== 1 && offset !== -1)) return;
+    const cameras = this.getEnabledCameras();
+    const index = cameras.findIndex(camera => camera.name === this.getPresentationCameraName(this._maximizedSlot));
+    if (cameras.length < 2 || index < 0) return;
+    const camera = cameras[(index + offset + cameras.length) % cameras.length];
+    this._maximizedSwipe = null;
+    this.resetIdleTimer();
+    this.completeMaximizeMediaSession("swipe-navigation");
+    this._maximizedPlayerFit = null;
+    this._maximizedCameraOverride = camera.name;
+    this.renderSlot(this._maximizedSlot);
+    this.fitLiveCameras("swipe-navigation");
+    this.scheduleCameraFit();
+  }
+
+
+  attachMaximizedSwipeHandlers(grid) {
+    grid.addEventListener("pointerdown", event => {
+      this._maximizedSwipe = null;
+      this._swipeClick = null;
+      const cell = event.composedPath().find(node => node instanceof Element && node.classList.contains("maximized-camera"));
+      if (this._maximizedSlot === null || !cell || this._wakeGesture || event.defaultPrevented ||
+          !["touch", "pen"].includes(event.pointerType) || event.isPrimary === false) return;
+      this._maximizedSwipe = { id: event.pointerId, x: event.clientX, y: event.clientY, startedAt: performance.now(), cell };
+    });
+    grid.addEventListener("pointerup", event => {
+      const gesture = this._maximizedSwipe;
+      if (!gesture || event.pointerId !== gesture.id) return;
+      this._maximizedSwipe = null;
+      if (this._wakeGesture || event.defaultPrevented || this._maximizedSlot === null ||
+          !gesture.cell.classList.contains("maximized-camera")) return;
+      const dx = event.clientX - gesture.x, dy = event.clientY - gesture.y;
+      if (performance.now() - gesture.startedAt > NVR_SWIPE_MAX_DURATION ||
+          Math.abs(dx) < NVR_SWIPE_MIN_DISTANCE ||
+          Math.abs(dx) < NVR_SWIPE_HORIZONTAL_RATIO * Math.abs(dy)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      this._swipeClick = { id: event.pointerId, until: performance.now() + NVR_SWIPE_CLICK_WINDOW };
+      this.navigateMaximizedCamera(dx > 0 ? 1 : -1);
+    });
+    grid.addEventListener("pointerleave", () => { this._maximizedSwipe = null; });
+    grid.addEventListener("pointercancel", event => {
+      if (event.pointerId === this._maximizedSwipe?.id) this._maximizedSwipe = null;
+    });
+    for (const type of ["click", "dblclick"]) grid.addEventListener(type, event => {
+      const swipe = this._swipeClick;
+      if (!swipe || performance.now() > swipe.until) return;
+      if (event.pointerId !== undefined && event.pointerId !== swipe.id) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    }, true);
+  }
+
+
   attachCameraMaximizeHandlers() {
     const grid =
       this.querySelector(".video-grid");
@@ -7179,6 +7274,8 @@ class NVRCard extends HTMLElement {
     if (!grid) {
       return;
     }
+
+    this.attachMaximizedSwipeHandlers(grid);
 
     grid.addEventListener(
       "click",
