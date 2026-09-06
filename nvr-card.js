@@ -237,7 +237,7 @@ const NVR_CAMERA_DRAG_TYPE =
 const NVR_GRID_CAMERA_DRAG_TYPE =
   "application/x-nvr-grid-camera";
 const NVR_RECONNECT_FIRST_FRAME_TIMEOUT = 15000;
-const NVR_FRAME_LIVENESS_SILENCE_TIMEOUT = 10000;
+const NVR_FRAME_LIVENESS_STALL_DEFAULT = 10;
 const AUTO_DIM_DEFAULTS = Object.freeze({
   enabled: false,
   invalid: false,
@@ -381,6 +381,7 @@ class NVRCard extends HTMLElement {
     this._reconnectPresentationIdentities = new WeakMap();
     this._reconnectPresentationDiagnostics = new WeakMap();
     this._reconnectPresentationSources = new WeakMap();
+    this._terminalRecoveryAttempts = new WeakSet();
     this._activeReconnectPresentationDiagnostics = new Set();
     this._nextReconnectPresentationId = 1;
     this._lastObservedConnection = null;
@@ -743,6 +744,7 @@ class NVRCard extends HTMLElement {
   cleanupReconnectPresentationDiagnostics(image) {
     const state = this._reconnectPresentationDiagnostics.get(image);
     if (!state) return;
+    this.cancelTerminalRecovery(state, "presentation-retired");
     state.active = false;
     this.cleanupReconnectVideo(state);
     state.observers.forEach(observer => observer.disconnect());
@@ -750,6 +752,7 @@ class NVRCard extends HTMLElement {
       target.removeEventListener(event, listener);
     });
     if (state.silenceTimer !== null) clearTimeout(state.silenceTimer);
+    state.silenceTimer = null;
     if (state.firstFrameTimer !== null) clearTimeout(state.firstFrameTimer);
     state.firstFrameTimer = null;
     state.statusElement?.remove();
@@ -786,8 +789,100 @@ class NVRCard extends HTMLElement {
 
   setReconnectPresentationVisualState(state, stalled) {
     if (!state.active || !state.statusElement) return;
-    state.statusElement.hidden = !stalled;
-    state.visualState = stalled ? "stalled" : "live";
+    state.statusElement.hidden = !stalled && !state.recoveryAttempted;
+    state.visualState = state.recoveryAttempted ? "reconnecting" : stalled ? "stalled" : "live";
+    state.statusElement.classList.toggle("reconnecting", state.recoveryAttempted);
+    state.statusElement.setAttribute("aria-label", state.recoveryAttempted
+      ? "Camera stream reconnecting" : "Camera stream stalled");
+    state.statusElement.querySelector("ha-icon").setAttribute("icon",
+      state.recoveryAttempted ? "mdi:sync" : "mdi:loading");
+  }
+
+
+  normalizeLiveRecovery(value) {
+    const seconds = (candidate, fallback, minimum, maximum) => {
+      const parsed = typeof candidate === "number" ||
+        (typeof candidate === "string" && candidate.trim() !== "")
+        ? Number(candidate) : NaN;
+      return Number.isFinite(parsed) && parsed > 0
+        ? Math.min(maximum, Math.max(minimum, parsed)) : fallback;
+    };
+    return {
+      enabled: value?.enabled === true && !Array.isArray(value),
+      stallAfter: seconds(value?.stall_after, NVR_FRAME_LIVENESS_STALL_DEFAULT, 5, 300),
+      reconnectAfter: seconds(value?.reconnect_after, 360, 60, 86400)
+    };
+  }
+
+
+  cancelTerminalRecovery(state, reason) {
+    if (state.terminalTimer === null) return;
+    clearTimeout(state.terminalTimer);
+    state.terminalTimer = null;
+    this.logReconnect("terminal-recovery-cancelled", {
+      ...this.getReconnectPresentationDetails(state), reason
+    });
+  }
+
+
+  armTerminalRecovery(state) {
+    if (!this._liveRecovery?.enabled || !state.active || !state.stallLogged ||
+        state.stallStartedAt === null || state.recoveryAttempted ||
+        state.terminalTimer !== null || document.visibilityState === "hidden") return;
+    const remaining = Math.max(0, this._liveRecovery.reconnectAfter * 1000 -
+      (performance.now() - state.stallStartedAt));
+    const timer = setTimeout(() => {
+      if (state.terminalTimer !== timer) return;
+      state.terminalTimer = null;
+      if (!state.active || !state.stallLogged || state.recoveryAttempted ||
+          !this._liveRecovery.enabled || document.visibilityState === "hidden") return;
+      this.replaceTerminallyStalledImage(state);
+    }, remaining);
+    state.terminalTimer = timer;
+    this.logReconnect("terminal-recovery-armed", this.getReconnectPresentationDetails(state));
+  }
+
+
+  createLiveCameraImage(entity, sourceEntity) {
+    const image = document.createElement("hui-image");
+    image.className = "nvr-live-camera";
+    image.dataset.entity = entity;
+    image.cameraImage = sourceEntity;
+    image.cameraView = "live";
+    if (this._hass) image.hass = this._hass;
+    return image;
+  }
+
+
+  replaceTerminallyStalledImage(state) {
+    const oldImage = state.image;
+    const frame = oldImage.parentElement;
+    const cell = frame?.parentElement;
+    if (!state.active || state.recoveryAttempted || !oldImage.isConnected ||
+        !frame?.classList.contains("camera-frame") ||
+        Number(cell?.dataset.slot) !== state.slot ||
+        this._assignedCameras[state.slot] !== state.logicalCamera) return;
+    state.recoveryAttempted = true;
+    this.setReconnectPresentationVisualState(state, true);
+    this.logReconnect("terminal-recovery-start", this.getReconnectPresentationDetails(state));
+    const indicator = state.statusElement;
+    state.statusElement = null; // Keep the existing frame's indicator during retirement.
+    this.cleanupReconnectPresentationDiagnostics(oldImage);
+    this._reconnectPresentationSources.delete(oldImage);
+    if (this._activeMaximizeMediaSession?.slot === state.slot) {
+      this.completeMaximizeMediaSession("presentation-retired");
+    }
+    const image = this.createLiveCameraImage(oldImage.dataset.entity, state.cameraImage);
+    this._terminalRecoveryAttempts.delete(oldImage);
+    this._terminalRecoveryAttempts.add(image);
+    image.style.cssText = oldImage.style.cssText;
+    if (this._maximizedPlayerFit?.image === oldImage) {
+      this._maximizedPlayerFit.image = image;
+    }
+    oldImage.replaceWith(image);
+    this._reconnectNodeIdentity.set(cell, image);
+    this.armReconnectPresentationDiagnostics(image, state.slot, state.logicalCamera,
+      state.cameraImage, true, { indicator });
   }
 
 
@@ -804,48 +899,68 @@ class NVRCard extends HTMLElement {
   observeReconnectFrame(state, video) {
     if (!state.active || state.video !== video || document.visibilityState === "hidden") return;
     const wasStalled = state.stallLogged;
+    this.cancelTerminalRecovery(state, "frame-resumed");
+    const wasReconnecting = state.recoveryAttempted;
+    if (state.recoveryAttempted) {
+      state.recoveryAttempted = false;
+      this._terminalRecoveryAttempts.delete(state.image);
+      this.logReconnect("terminal-recovery-complete", this.getReconnectPresentationDetails(state));
+    }
+    state.stallLogged = false;
+    state.stallStartedAt = null;
+    if (wasStalled || wasReconnecting) this.setReconnectPresentationVisualState(state, false);
     state.frameCount += 1;
     state.lastFrameTime = performance.now();
     if (!state.frameLivenessStarted) {
       state.frameLivenessStarted = true;
       this.logReconnect("frame-liveness-started", this.getReconnectPresentationDetails(state));
     } else if (wasStalled) {
-      state.stallLogged = false;
-      state.stallStartedAt = null;
-      this.setReconnectPresentationVisualState(state, false);
       this.logReconnect("frame-resumed", this.getReconnectPresentationDetails(state));
     }
     this.armReconnectSilenceTimer(state);
   }
 
 
-  armReconnectSilenceTimer(state) {
+  armReconnectSilenceTimer(state, rebase = true) {
     if (state.silenceTimer !== null) clearTimeout(state.silenceTimer);
-    state.silenceTimer = setTimeout(() => {
+    state.silenceTimer = null;
+    if (!state.active || !state.image.isConnected || document.visibilityState === "hidden") return;
+    if (rebase) state.silenceStartedAt = performance.now();
+    const remaining = Math.max(0,
+      (this._liveRecovery?.stallAfter ?? NVR_FRAME_LIVENESS_STALL_DEFAULT) * 1000 -
+      (performance.now() - state.silenceStartedAt));
+    const timer = setTimeout(() => {
+      if (state.silenceTimer !== timer) return;
       state.silenceTimer = null;
-      if (!state.active || document.visibilityState === "hidden" || state.lastFrameTime === null) return;
+      if (!state.active || !state.image.isConnected || document.visibilityState === "hidden") return;
       this.setReconnectPresentationVisualState(state, true);
       if (state.stallLogged) return;
       state.stallLogged = true;
       state.stallStartedAt = performance.now();
+      this.armTerminalRecovery(state);
       this.logReconnect("frame-stall-detected", {
         ...this.getReconnectPresentationDetails(state),
-        elapsedSinceLastFrameMs: Math.round(performance.now() - state.lastFrameTime),
+        elapsedSinceLastFrameMs: state.lastFrameTime === null
+          ? null : Math.round(performance.now() - state.lastFrameTime),
         frameCount: state.frameCount
       });
-    }, NVR_FRAME_LIVENESS_SILENCE_TIMEOUT);
+    }, remaining);
+    state.silenceTimer = timer;
   }
 
 
   handleReconnectVisibilityChange(state) {
-    if (!state.active || !state.frameLivenessStarted) return;
+    if (!state.active) return;
     if (document.visibilityState === "hidden") {
+      this.cancelTerminalRecovery(state, "document-hidden");
+      state.stallLogged = false;
+      state.stallStartedAt = null;
       if (state.silenceTimer !== null) clearTimeout(state.silenceTimer);
       state.silenceTimer = null;
       this.setReconnectPresentationVisualState(state, false);
       return;
     }
-    state.lastFrameTime = performance.now();
+    if (state.lastFrameTime !== null) state.lastFrameTime = performance.now();
     this.armReconnectSilenceTimer(state);
   }
 
@@ -939,12 +1054,22 @@ class NVRCard extends HTMLElement {
   }
 
 
-  armReconnectPresentationDiagnostics(image, slot, logicalCamera, sourceEntity, created = true) {
+  armReconnectPresentationDiagnostics(image, slot, logicalCamera, sourceEntity, created = true, recovery = null) {
+    if (this._reconnectPresentationSources.has(image) &&
+        this._reconnectPresentationSources.get(image) !== sourceEntity) {
+      this._terminalRecoveryAttempts.delete(image);
+    }
     this._reconnectPresentationSources.set(image, sourceEntity);
     const previous = this._reconnectPresentationDiagnostics.get(image);
     if (previous?.active && previous.cameraImage === sourceEntity) {
       previous.slot = slot;
       previous.logicalCamera = logicalCamera;
+      if (previous.silenceTimer === null && !previous.frameLivenessStarted &&
+          !previous.stallLogged && image.isConnected) {
+        this.ensureReconnectPresentationStatusElement(previous);
+        this.inspectReconnectPresentation(previous);
+        this.armReconnectSilenceTimer(previous);
+      }
       return;
     }
     this.cleanupReconnectPresentationDiagnostics(image);
@@ -964,13 +1089,16 @@ class NVRCard extends HTMLElement {
       frameCallback: null,
       firstFrameTimer: null,
       silenceTimer: null,
+      silenceStartedAt: null,
+      terminalTimer: null,
+      recoveryAttempted: this._terminalRecoveryAttempts.has(image),
       lastFrameTime: null,
       frameCount: 0,
       frameLivenessStarted: false,
       firstFrameLogged: false,
       stallLogged: false,
       stallStartedAt: null,
-      statusElement: null,
+      statusElement: recovery?.indicator ?? null,
       visualState: "live",
       downstreamLogged: false,
       active: true
@@ -978,12 +1106,15 @@ class NVRCard extends HTMLElement {
     this._reconnectPresentationDiagnostics.set(image, state);
     this._activeReconnectPresentationDiagnostics.add(state);
     this.ensureReconnectPresentationStatusElement(state);
+    this.setReconnectPresentationVisualState(state, false);
     const visibilityListener = () => this.handleReconnectVisibilityChange(state);
     document.addEventListener("visibilitychange", visibilityListener);
     state.mediaListeners.push({ target: document, event: "visibilitychange", listener: visibilityListener });
     this.logReconnect(created ? "presentation-created" : "presentation-source-changed", this.getReconnectPresentationDetails(state));
     if (image.isConnected) this.logReconnect("presentation-attached", this.getReconnectPresentationDetails(state));
     this.inspectReconnectPresentation(state);
+    // The same silence window covers initial frame absence and later frame loss.
+    this.armReconnectSilenceTimer(state);
     state.firstFrameTimer = setTimeout(() => {
       state.firstFrameTimer = null;
       if (state.active && !state.firstFrameLogged) {
@@ -1834,6 +1965,18 @@ class NVRCard extends HTMLElement {
     const normalized =
       this.normalizeConfig(config);
     const position = config.live_status?.position;
+    const recovery = this.normalizeLiveRecovery(config.live_recovery);
+    if (JSON.stringify(recovery) !== JSON.stringify(this._liveRecovery)) {
+      const stallChanged = recovery.stallAfter !== this._liveRecovery?.stallAfter;
+      this._liveRecovery = recovery;
+      this._activeReconnectPresentationDiagnostics.forEach(state => {
+        if (stallChanged && !state.stallLogged && state.silenceTimer !== null) {
+          this.armReconnectSilenceTimer(state, false);
+        }
+        this.cancelTerminalRecovery(state, "config-changed");
+        this.armTerminalRecovery(state);
+      });
+    }
     this._liveStatusPosition = [
       "bottom-left", "bottom-right", "top-left", "top-right"
     ].includes(position) ? position : "bottom-left";
@@ -4804,20 +4947,6 @@ class NVRCard extends HTMLElement {
 
 
       if (USE_HA_HUI_IMAGE_EXPERIMENT) {
-        const image =
-          document.createElement(
-            "hui-image"
-          );
-
-
-        image.className =
-          "nvr-live-camera";
-
-
-        image.dataset.entity =
-          camera.entity;
-
-
         const sourceEntity =
           slot === this._maximizedSlot
             ? HA_HUI_IMAGE_MAINSTREAM_ENTITIES[
@@ -4827,17 +4956,7 @@ class NVRCard extends HTMLElement {
                 camera.entity
               ] ?? camera.entity;
 
-        image.cameraImage = sourceEntity;
-
-
-        image.cameraView = "live";
-
-
-        if (this._hass) {
-          image.hass =
-            this._hass;
-        }
-
+        const image = this.createLiveCameraImage(camera.entity, sourceEntity);
 
         frame.appendChild(image);
 
