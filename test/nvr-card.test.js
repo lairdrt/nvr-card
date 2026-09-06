@@ -947,7 +947,7 @@ test("later independent stall episodes are observational and do not render slots
   assert.equal(state.stallLogged, true);
   assert.deepEqual(renderSlots, []);
   assert.equal(image.cameraView, "live");
-  assert.equal(image.cameraImage, "camera.lorex_mediaprofile_channel1_substream1_3");
+  assert.equal(image.cameraImage, "camera.garage_sub");
 });
 
 test("hidden document suppresses false stall and source transition resets state", t => {
@@ -1276,7 +1276,7 @@ test("restored maximize uses the normal hui-image maximize source path", t => {
   card.assignCamera("Garage");
   assert.equal(
     harness.getPlayer(card, "Garage").cameraImage,
-    "camera.lorex_mediaprofile_channel1_substream1_3"
+    "camera.garage_sub"
   );
   card.maximizeCameraSlot(0);
 
@@ -1286,7 +1286,7 @@ test("restored maximize uses the normal hui-image maximize source path", t => {
   assert.equal(replacement._maximizedSlot, 0);
   assert.equal(
     restoredImage.cameraImage,
-    "camera.garage_garage_camera_lorex_mediaprofile_channel1_mainstream"
+    "camera.garage_main"
   );
   assert.strictEqual(
     harness.getLogicalCell(replacement, 0)
@@ -1835,7 +1835,7 @@ test("named views preserve independent exact snapshots and load into LAST VIEW",
   assert.equal(card._maximizedSlot, 4);
   assert.equal(
     harness.getPlayer(card, "Garage").cameraImage,
-    "camera.garage_garage_camera_lorex_mediaprofile_channel1_mainstream"
+    "camera.garage_main"
   );
 
   const lastViewAfterLoad =
@@ -3511,36 +3511,11 @@ test("maximize media-session history retains only the latest ten sessions", t =>
 
 test("HA hui-image experiment renders all 11 cameras without provider media or duplicate presentations", t => {
   const harness = setup(t);
-  const substreamEntities = new Map([
-    ["camera.garage", "camera.lorex_mediaprofile_channel1_substream1_3"],
-    ["camera.front_door", "camera.lorex_mediaprofile_channel1_substream1_9"],
-    ["camera.front_entry", "camera.lorex_mediaprofile_channel1_substream1_1"],
-    ["camera.drive_up", "camera.lorex_mediaprofile_channel1_substream1_10"],
-    ["camera.drive_down", "camera.lorex_mediaprofile_channel1_substream1_4"],
-    ["camera.side_gate", "camera.lorex_mediaprofile_channel1_substream1_11"],
-    ["camera.ac", "camera.lorex_mediaprofile_channel1_substream1_6"],
-    ["camera.patio", "camera.lorex_mediaprofile_channel1_substream1_5"],
-    ["camera.backyard", "camera.lorex_mediaprofile_channel1_substream1_2"],
-    ["camera.fireplace", "camera.lorex_mediaprofile_channel1_substream1_8"],
-    ["camera.patio_roof", "camera.lorex_mediaprofile_channel1_substream1_7"]
-  ]);
-  const mainstreamEntities = new Map([
-    ["camera.garage", "camera.garage_garage_camera_lorex_mediaprofile_channel1_mainstream"],
-    ["camera.front_door", "camera.frontyard_front_door_camera_lorex_mediaprofile_channel1_mainstream"],
-    ["camera.front_entry", "camera.frontyard_front_entry_camera_mediaprofile_channel1_mainstream"],
-    ["camera.drive_up", "camera.frontyard_drive_up_camera_lorex_mediaprofile_channel1_mainstream"],
-    ["camera.drive_down", "camera.frontyard_drive_down_camera_lorex_mediaprofile_channel1_mainstream"],
-    ["camera.side_gate", "camera.backyard_side_gate_camera_lorex_mediaprofile_channel1_mainstream"],
-    ["camera.ac", "camera.backyard_ac_camera_lorex_mediaprofile_channel1_mainstream"],
-    ["camera.patio", "camera.backyard_patio_camera_lorex_mediaprofile_channel1_mainstream"],
-    ["camera.backyard", "camera.backyard_backyard_camera_lorex_mediaprofile_channel1_mainstream"],
-    ["camera.fireplace", "camera.backyard_fireplace_camera_lorex_mediaprofile_channel1_mainstream"],
-    ["camera.patio_roof", "camera.backyard_patio_roof_camera_lorex_mediaprofile_channel1_mainstream"]
-  ]);
-  const cameras = [...substreamEntities.keys()].map((entity, index) => ({
+  const cameras = Array.from({ length: 11 }, (_, index) => ({
     name: `Camera ${index + 1}`,
-    entity,
-    active: true
+    entity: `camera.logical_${index + 1}`,
+    active: true,
+    live: { substream: `camera.sub_${index + 1}`, mainstream: `camera.main_${index + 1}` }
   }));
   const hass = {
     states: Object.fromEntries(
@@ -3581,7 +3556,7 @@ test("HA hui-image experiment renders all 11 cameras without provider media or d
       assert.equal(image.localName, "hui-image");
       assert.equal(
         image.cameraImage,
-        substreamEntities.get(camera.entity)
+        camera.live.substream
       );
       assert.equal(image.cameraView, "live");
       assert.equal(image.dataset.entity, camera.entity);
@@ -3604,14 +3579,14 @@ test("HA hui-image experiment renders all 11 cameras without provider media or d
     assert.strictEqual(harness.getPlayer(card, camera.name), image);
     assert.equal(
       image.cameraImage,
-      mainstreamEntities.get(camera.entity)
+      camera.live.mainstream
     );
     assert.notEqual(image.cameraImage, camera.entity);
     card.restoreMaximizedCamera();
     assert.strictEqual(harness.getPlayer(card, camera.name), image);
     assert.equal(
       image.cameraImage,
-      substreamEntities.get(camera.entity)
+      camera.live.substream
     );
   });
 
@@ -3626,14 +3601,14 @@ test("HA hui-image experiment renders all 11 cameras without provider media or d
   assert.strictEqual(harness.getPlayer(card, "Camera 1"), moved.player);
   assert.equal(
     moved.player.cameraImage,
-    mainstreamEntities.get("camera.garage")
+    cameras[0].live.mainstream
   );
   card.restoreMaximizedCamera();
   harness.flushAnimationFrames();
   assert.strictEqual(harness.getPlayer(card, "Camera 1"), moved.player);
   assert.equal(
     moved.player.cameraImage,
-    substreamEntities.get("camera.garage")
+    cameras[0].live.substream
   );
   assertSingleHaPresentationPerCamera();
 
@@ -3654,7 +3629,8 @@ test("ONVIF source switching stays quiet and does not rebuild", t => {
     cameras: [{
       name: "Garage",
       entity: "camera.garage",
-      active: true
+      active: true,
+      live: { substream: "camera.garage_sub", mainstream: "camera.garage_main" }
     }]
   });
 
@@ -3689,7 +3665,7 @@ test("ONVIF source switching stays quiet and does not rebuild", t => {
   assert.strictEqual(card.querySelector(".nvr-sidebar"), sidebar);
   assert.equal(
     image.cameraImage,
-    "camera.garage_garage_camera_lorex_mediaprofile_channel1_mainstream"
+    "camera.garage_main"
   );
   assert.equal(
     card.classifyLivePresentationEntity(image.cameraImage),
@@ -3701,7 +3677,7 @@ test("ONVIF source switching stays quiet and does not rebuild", t => {
   assert.strictEqual(harness.getPlayer(card, "Garage"), image);
   assert.equal(
     image.cameraImage,
-    "camera.lorex_mediaprofile_channel1_substream1_3"
+    "camera.garage_sub"
   );
   assert.deepEqual(transitionLogs, []);
 });
@@ -3712,7 +3688,7 @@ test("ONVIF registry discovery pairs profiles only by authoritative registry ide
   const registry = [
     {
       entity_id:
-        "camera.lorex_mediaprofile_channel1_substream1_3",
+        "camera.garage_sub",
       platform: "onvif",
       device_id: "garage-device",
       config_entry_id: "garage-entry",
@@ -3734,7 +3710,7 @@ test("ONVIF registry discovery pairs profiles only by authoritative registry ide
     },
     {
       entity_id:
-        "camera.lorex_mediaprofile_channel1_substream1_9",
+        "camera.front_door_sub",
       platform: "onvif",
       device_id: "front-door-device",
       config_entry_id: "front-door-entry",
@@ -3751,11 +3727,13 @@ test("ONVIF registry discovery pairs profiles only by authoritative registry ide
   };
   const card = harness.createCard({
     cameras: [
-      { name: "Garage", entity: "camera.garage", active: true },
+      { name: "Garage", entity: "camera.garage", active: true,
+        live: { substream: "camera.garage_sub", mainstream: "camera.garage_main" } },
       {
         name: "Front Door",
         entity: "camera.front_door",
-        active: true
+        active: true,
+        live: { substream: "camera.front_door_sub", mainstream: "camera.front_door_main" }
       }
     ],
     hass

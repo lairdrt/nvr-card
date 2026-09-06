@@ -8,54 +8,6 @@ const NVR_BUILD = "__NVR_BUILD__";
 const USE_HA_HUI_IMAGE_EXPERIMENT = true;
 const NVR_LIVE_TRANSITION_DIAGNOSTICS = false;
 const NVR_GRID_SLOT_CAPACITY = 16;
-const HA_HUI_IMAGE_SUBSTREAM_ENTITIES = Object.freeze({
-  "camera.garage":
-    "camera.lorex_mediaprofile_channel1_substream1_3",
-  "camera.front_door":
-    "camera.lorex_mediaprofile_channel1_substream1_9",
-  "camera.front_entry":
-    "camera.lorex_mediaprofile_channel1_substream1_1",
-  "camera.drive_up":
-    "camera.lorex_mediaprofile_channel1_substream1_10",
-  "camera.drive_down":
-    "camera.lorex_mediaprofile_channel1_substream1_4",
-  "camera.side_gate":
-    "camera.lorex_mediaprofile_channel1_substream1_11",
-  "camera.ac":
-    "camera.lorex_mediaprofile_channel1_substream1_6",
-  "camera.patio":
-    "camera.lorex_mediaprofile_channel1_substream1_5",
-  "camera.backyard":
-    "camera.lorex_mediaprofile_channel1_substream1_2",
-  "camera.fireplace":
-    "camera.lorex_mediaprofile_channel1_substream1_8",
-  "camera.patio_roof":
-    "camera.lorex_mediaprofile_channel1_substream1_7"
-});
-const HA_HUI_IMAGE_MAINSTREAM_ENTITIES = Object.freeze({
-  "camera.garage":
-    "camera.garage_garage_camera_lorex_mediaprofile_channel1_mainstream",
-  "camera.front_door":
-    "camera.frontyard_front_door_camera_lorex_mediaprofile_channel1_mainstream",
-  "camera.front_entry":
-    "camera.frontyard_front_entry_camera_mediaprofile_channel1_mainstream",
-  "camera.drive_up":
-    "camera.frontyard_drive_up_camera_lorex_mediaprofile_channel1_mainstream",
-  "camera.drive_down":
-    "camera.frontyard_drive_down_camera_lorex_mediaprofile_channel1_mainstream",
-  "camera.side_gate":
-    "camera.backyard_side_gate_camera_lorex_mediaprofile_channel1_mainstream",
-  "camera.ac":
-    "camera.backyard_ac_camera_lorex_mediaprofile_channel1_mainstream",
-  "camera.patio":
-    "camera.backyard_patio_camera_lorex_mediaprofile_channel1_mainstream",
-  "camera.backyard":
-    "camera.backyard_backyard_camera_lorex_mediaprofile_channel1_mainstream",
-  "camera.fireplace":
-    "camera.backyard_fireplace_camera_lorex_mediaprofile_channel1_mainstream",
-  "camera.patio_roof":
-    "camera.backyard_patio_roof_camera_lorex_mediaprofile_channel1_mainstream"
-});
 const NVR_MAXIMIZE_DIAGNOSTICS = false;
 const NVR_MAXIMIZE_FLIGHT_RECORDER = true;
 const NVR_DIAGNOSTIC_LIVE_SLOT_LIMIT = 4;
@@ -1161,13 +1113,7 @@ class NVRCard extends HTMLElement {
         const image = cell?.querySelector(
           "hui-image.nvr-live-camera"
         ) ?? null;
-        const expectedEntity = camera
-          ? slot === this._maximizedSlot
-            ? HA_HUI_IMAGE_MAINSTREAM_ENTITIES[camera.entity] ??
-              camera.entity
-            : HA_HUI_IMAGE_SUBSTREAM_ENTITIES[camera.entity] ??
-              camera.entity
-          : null;
+        const expectedEntity = this.getCameraLiveSource(camera, slot === this._maximizedSlot);
         const rememberedImage = cell
           ? this._reconnectNodeIdentity.get(cell)
           : undefined;
@@ -2171,7 +2117,7 @@ class NVRCard extends HTMLElement {
 
     const names = new Set();
     const allowedFields =
-      new Set(["name", "entity", "active"]);
+      new Set(["name", "entity", "active", "live"]);
 
     return cameras.map((camera, index) => {
       const number = index + 1;
@@ -2238,12 +2184,32 @@ class NVRCard extends HTMLElement {
         );
       }
 
+      let live;
+      if (Object.prototype.hasOwnProperty.call(camera, "live")) {
+        if (!camera.live || typeof camera.live !== "object" || Array.isArray(camera.live)) {
+          throw new Error(`Camera ${number} live must be an object.`);
+        }
+        const unsupported = Object.keys(camera.live).find(
+          field => field !== "substream" && field !== "mainstream"
+        );
+        if (unsupported) {
+          throw new Error(`Camera ${number} live has unsupported field "${unsupported}".`);
+        }
+        for (const field of ["substream", "mainstream"]) {
+          if (typeof camera.live[field] !== "string" || camera.live[field].trim().length === 0) {
+            throw new Error(`Camera ${number} live.${field} must be a nonempty string.`);
+          }
+        }
+        live = {
+          substream: camera.live.substream.trim(),
+          mainstream: camera.live.mainstream.trim()
+        };
+      }
       return {
         name: camera.name,
         entity: camera.entity,
-        active: hasActive
-          ? camera.active
-          : true
+        active: hasActive ? camera.active : true,
+        ...(live ? { live } : {})
       };
     });
   }
@@ -4551,30 +4517,16 @@ class NVRCard extends HTMLElement {
   }
 
   
+  getCameraLiveSource(camera, maximized) {
+    return (maximized ? camera?.live?.mainstream : camera?.live?.substream) ?? camera?.entity ?? null;
+  }
+
+
   classifyLivePresentationEntity(entity) {
-    if (
-      Object.values(HA_HUI_IMAGE_MAINSTREAM_ENTITIES)
-        .includes(entity)
-    ) {
-      return "ONVIF_MAIN";
-    }
-
-    if (
-      Object.values(HA_HUI_IMAGE_SUBSTREAM_ENTITIES)
-        .includes(entity)
-    ) {
-      return "ONVIF_SUB1";
-    }
-
-    if (
-      Object.prototype.hasOwnProperty.call(
-        HA_HUI_IMAGE_SUBSTREAM_ENTITIES,
-        entity
-      )
-    ) {
-      return "FRIGATE";
-    }
-
+    const mappedCameras = this._cameras.filter(camera => camera.live);
+    if (mappedCameras.some(camera => this.getCameraLiveSource(camera, true) === entity)) return "ONVIF_MAIN";
+    if (mappedCameras.some(camera => this.getCameraLiveSource(camera, false) === entity)) return "ONVIF_SUB1";
+    if (mappedCameras.some(camera => camera.entity === entity)) return "FRIGATE";
     return "UNKNOWN";
   }
 
@@ -4584,9 +4536,9 @@ class NVRCard extends HTMLElement {
       ? registryEntities
       : [];
 
-    return Object.entries(
-      HA_HUI_IMAGE_SUBSTREAM_ENTITIES
-    ).map(([frigateEntity, sub1Entity]) => {
+    return this._cameras.filter(camera => camera.live).map(camera => {
+      const frigateEntity = camera.entity;
+      const sub1Entity = this.getCameraLiveSource(camera, false);
       const sub1 = entities.find(entity => {
         return entity?.entity_id === sub1Entity;
       });
@@ -4610,10 +4562,7 @@ class NVRCard extends HTMLElement {
         : null;
 
       return {
-        camera:
-          this._cameras.find(camera => {
-            return camera.entity === frigateEntity;
-          })?.name ?? frigateEntity,
+        camera: camera.name,
         frigateEntity,
         sub1Entity,
         mainEntity: main?.entity_id ?? null,
@@ -4661,15 +4610,13 @@ class NVRCard extends HTMLElement {
       return null;
     }
 
-    const configuredEntity = image.dataset.entity;
+    const camera = this.getCameraByName(this._assignedCameras[slot]);
     const transition = {
       startTime: performance.now(),
       camera: this._assignedCameras[slot],
       slot,
       fromEntity: image.cameraImage ?? null,
-      toEntity: HA_HUI_IMAGE_MAINSTREAM_ENTITIES[
-        configuredEntity
-      ] ?? configuredEntity ?? null,
+      toEntity: this.getCameraLiveSource(camera, true),
       presentationState: "maximize"
     };
 
@@ -4684,15 +4631,13 @@ class NVRCard extends HTMLElement {
       return null;
     }
 
-    const configuredEntity = image.dataset.entity;
+    const camera = this.getCameraByName(this._assignedCameras[slot]);
     const transition = {
       startTime: performance.now(),
       camera: this._assignedCameras[slot],
       slot,
       fromEntity: image.cameraImage ?? null,
-      toEntity: HA_HUI_IMAGE_SUBSTREAM_ENTITIES[
-        configuredEntity
-      ] ?? configuredEntity,
+      toEntity: this.getCameraLiveSource(camera, false),
       presentationState: "normal"
     };
 
@@ -4741,13 +4686,9 @@ class NVRCard extends HTMLElement {
       const configuredEntity = image.dataset.entity;
       const targetEntity =
         USE_HA_HUI_IMAGE_EXPERIMENT
-          ? slot === this._maximizedSlot
-            ? HA_HUI_IMAGE_MAINSTREAM_ENTITIES[
-                configuredEntity
-              ] ?? configuredEntity
-            : HA_HUI_IMAGE_SUBSTREAM_ENTITIES[
-                configuredEntity
-              ] ?? configuredEntity
+          ? this.getCameraLiveSource(
+              this.getCameraByName(this._assignedCameras[slot]), slot === this._maximizedSlot
+            )
           : configuredEntity;
       const transition =
         this._pendingLiveTransition?.slot === slot
@@ -4911,14 +4852,7 @@ class NVRCard extends HTMLElement {
 
 
       if (USE_HA_HUI_IMAGE_EXPERIMENT) {
-        const sourceEntity =
-          slot === this._maximizedSlot
-            ? HA_HUI_IMAGE_MAINSTREAM_ENTITIES[
-                camera.entity
-              ] ?? camera.entity
-            : HA_HUI_IMAGE_SUBSTREAM_ENTITIES[
-                camera.entity
-              ] ?? camera.entity;
+        const sourceEntity = this.getCameraLiveSource(camera, slot === this._maximizedSlot);
 
         const image = this.createLiveCameraImage(camera.entity, sourceEntity);
 

@@ -8,7 +8,8 @@ const baseCardSource = readFileSync(
 
 export const defaultCameras = [
   { name: "Front", entity: "camera.front", active: true },
-  { name: "Garage", entity: "camera.garage", active: true },
+  { name: "Garage", entity: "camera.garage", active: true,
+    live: { substream: "camera.garage_sub", mainstream: "camera.garage_main" } },
   { name: "Patio", entity: "camera.patio", active: true },
   { name: "Hall", entity: "camera.hall", active: true }
 ];
@@ -302,7 +303,7 @@ export function createTestHarness({
       `const USE_HA_HUI_IMAGE_EXPERIMENT = ${useHaHuiImageExperiment};`
     )
     .replace(
-      "const NVR_LIVE_TRANSITION_DIAGNOSTICS = true;",
+      /const NVR_LIVE_TRANSITION_DIAGNOSTICS = (?:true|false);/,
       `const NVR_LIVE_TRANSITION_DIAGNOSTICS = ${liveTransitionDiagnostics};`
     );
   window.eval(cardSource);

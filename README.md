@@ -1,6 +1,22 @@
 # nvr-card
 Home Assistant Network Video Recorder control card
 
+## Camera live sources
+
+`camera.entity` remains the logical/Frigate camera identity used by workspace state and Saved Views. Optional `camera.live.substream` selects the normal/grid HA live camera, and `camera.live.mainstream` selects the maximized HA live camera. Production ONVIF configurations use Sub1 for the grid and Main for maximize; Home Assistant still owns playback through the same `hui-image` presentation.
+
+```yaml
+cameras:
+  - name: Garage
+    entity: camera.garage
+    active: true
+    live:
+      substream: camera.lorex_mediaprofile_channel1_substream1_3
+      mainstream: camera.garage_garage_camera_lorex_mediaprofile_channel1_mainstream
+```
+
+`active` remains optional (default true). If `live` is supplied, it must be an object containing exactly both nonempty string fields shown above; surrounding source whitespace is trimmed. Without `live`, both modes fall back to `camera.entity`. There are no installation-specific JavaScript mappings or automatic profile substitutions. Add the corresponding Sub1/Main entities to each production camera's Lovelace YAML before deploying this migration. Live-mapping changes participate in normal camera configuration identity; auto-dim-only changes continue to preserve media.
+
 ## Tablet auto-dim
 
 Auto-dim is optional and configured directly in the card's Lovelace YAML:
