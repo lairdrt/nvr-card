@@ -300,6 +300,12 @@ class NVRCard extends HTMLElement {
       }, AUTO_DIM_WAKE_CLICK_TIMEOUT);
     };
     this._autoDimActivityHandler = event => this.handleAutoDimActivity(event, false);
+    this._autoDimDocumentActivityHandler = event => {
+      const path = event.composedPath?.() ?? [];
+      if (path.includes(this) || path.some(node => node?.localName === "nvr-card")) return;
+      if (event.type === "pointerup" && this._wakeGesture) return;
+      this.handleExternalAutoDimActivity(event);
+    };
 
     this._viewportResizeHandler = event => {
       const source =
@@ -2384,6 +2390,13 @@ class NVRCard extends HTMLElement {
     for (const event of ["mousemove", "dragstart", "dragover", "drop"]) {
       this.addEventListener(event, this._autoDimActivityHandler, true);
     }
+    for (const event of [
+      "pointerdown", "keydown", "beforeinput", "input",
+      "compositionstart", "compositionupdate", "compositionend",
+      "focusin", "focusout", "pointerup", "click"
+    ]) {
+      document.addEventListener(event, this._autoDimDocumentActivityHandler, true);
+    }
     // Release may occur outside the card; only the captured wake gesture is handled.
     document.addEventListener("pointerup", this._autoDimPointerEndHandler, true);
     document.addEventListener("pointercancel", this._autoDimPointerEndHandler, true);
@@ -2396,6 +2409,13 @@ class NVRCard extends HTMLElement {
     this.removeEventListener("click", this._autoDimClickHandler, true);
     for (const event of ["mousemove", "dragstart", "dragover", "drop"]) {
       this.removeEventListener(event, this._autoDimActivityHandler, true);
+    }
+    for (const event of [
+      "pointerdown", "keydown", "beforeinput", "input",
+      "compositionstart", "compositionupdate", "compositionend",
+      "focusin", "focusout", "pointerup", "click"
+    ]) {
+      document.removeEventListener(event, this._autoDimDocumentActivityHandler, true);
     }
     document.removeEventListener("pointerup", this._autoDimPointerEndHandler, true);
     document.removeEventListener("pointercancel", this._autoDimPointerEndHandler, true);
@@ -2587,6 +2607,37 @@ class NVRCard extends HTMLElement {
           this.clearWakeGesture();
         }
       }, AUTO_DIM_WAKE_GESTURE_TIMEOUT);
+    }
+  }
+
+
+  handleExternalAutoDimActivity(event) {
+    if (!this.canUseAutoDim()) return;
+    if (this._autoDimState === "suspended") {
+      if (event.type === "focusin") return;
+      this.establishDisplayOwnership();
+      return;
+    }
+    this.handleAutoDimActivity(event, false);
+  }
+
+
+  runBlockingAutoDimDialog(dialog) {
+    const shouldRearm = this.canUseAutoDim() &&
+      this._displayOwnershipComplete &&
+      this._autoDimState === "awake";
+
+    if (shouldRearm) {
+      if (this._idleTimer !== null) window.clearTimeout(this._idleTimer);
+      this._idleTimer = null;
+    }
+
+    try {
+      return dialog();
+    } finally {
+      if (shouldRearm && this.canUseAutoDim() && this._autoDimState === "awake") {
+        this.resetIdleTimer();
+      }
     }
   }
 
@@ -2910,6 +2961,8 @@ class NVRCard extends HTMLElement {
 
     style.textContent = `
       ha-card {
+        isolation: isolate;
+
         height: calc(
           100vh - var(--nvr-card-top, 0px)
         );
@@ -6921,7 +6974,9 @@ class NVRCard extends HTMLElement {
       const id = button.dataset.savedViewId;
 
       if (action === "create") {
-        const name = window.prompt("Save current view as:");
+        const name = this.runBlockingAutoDimDialog(
+          () => window.prompt("Save current view as:")
+        );
 
         if (name !== null) {
           this.saveCurrentViewAs(name);
@@ -6943,9 +6998,11 @@ class NVRCard extends HTMLElement {
       }
 
       if (action === "rename") {
-        const name = window.prompt(
-          "Rename saved view:",
-          view.name
+        const name = this.runBlockingAutoDimDialog(
+          () => window.prompt(
+            "Rename saved view:",
+            view.name
+          )
         );
 
         if (name !== null) {
@@ -6954,20 +7011,18 @@ class NVRCard extends HTMLElement {
         return;
       }
 
-      if (
-        action === "overwrite" &&
-        window.confirm(
+      if (action === "overwrite" && this.runBlockingAutoDimDialog(
+        () => window.confirm(
           `Update ${view.name} from the current view?`
         )
-      ) {
+      )) {
         this.overwriteSavedView(id);
         return;
       }
 
-      if (
-        action === "delete" &&
-        window.confirm(`Delete ${view.name}?`)
-      ) {
+      if (action === "delete" && this.runBlockingAutoDimDialog(
+        () => window.confirm(`Delete ${view.name}?`)
+      )) {
         this.deleteSavedView(id);
       }
     });

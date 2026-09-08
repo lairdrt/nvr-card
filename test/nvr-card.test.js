@@ -99,6 +99,35 @@ function createAutoDimCard(harness, autoDim, hass = null) {
   return card;
 }
 
+function assertBlockingDialogRearms(harness, invokeDialog, response) {
+  const hass = harness.createHass();
+  const calls = [];
+  hass.callService = (...args) => calls.push(args);
+  const card = createAutoDimCard(harness, enabledAutoDim, hass);
+  card.saveCurrentViewAs("Existing View");
+  calls.length = 0;
+
+  let invoked = false;
+  invokeDialog(card, () => {
+    invoked = true;
+    assert.equal(card._autoDimState, "awake");
+    assert.equal(card._idleTimer, null);
+    harness.advanceTime(2500);
+    assert.equal(calls.length, 0);
+    return response;
+  });
+
+  assert.equal(invoked, true);
+  assert.equal(card._autoDimState, "awake");
+  assert.notEqual(card._idleTimer, null);
+  harness.advanceTime(1999);
+  assert.equal(calls.length, 0);
+  harness.advanceTime(1);
+  assert.equal(calls.length, 1);
+  assert.equal(card._autoDimState, "dimmed");
+  return card;
+}
+
 const enabledAutoDim = {
   enabled: true,
   timeout: 2,
@@ -192,6 +221,137 @@ test("card activity resets the auto-dim timeout", t => {
   assert.equal(calls.length, 0);
   harness.advanceTime(500);
   assert.equal(calls.length, 1);
+});
+
+test("page activity resets auto-dim without consuming HA events", t => {
+  const harness = setup(t);
+  const hass = harness.createHass();
+  const calls = [];
+  hass.callService = (...args) => calls.push(args);
+  const card = createAutoDimCard(harness, enabledAutoDim, hass);
+  const editor = harness.window.document.createElement("input");
+  harness.window.document.body.appendChild(editor);
+  calls.length = 0;
+
+  harness.advanceTime(1500);
+  for (const type of ["keydown", "beforeinput", "input", "compositionupdate", "focusin"]) {
+    editor.dispatchEvent(new harness.window.Event(type, { bubbles: true, cancelable: true }));
+  }
+  harness.advanceTime(1500);
+  assert.equal(calls.length, 0);
+});
+
+for (const type of ["focusout", "pointerup", "click"]) {
+  test(`external ${type} resets auto-dim to a full timeout`, t => {
+    const harness = setup(t);
+    const hass = harness.createHass();
+    const calls = [];
+    hass.callService = (...args) => calls.push(args);
+    const card = createAutoDimCard(harness, enabledAutoDim, hass);
+    const editor = harness.window.document.createElement("input");
+    harness.window.document.body.appendChild(editor);
+    calls.length = 0;
+
+    harness.advanceTime(1500);
+    const event = new harness.window.Event(type, {
+      bubbles: true,
+      cancelable: true
+    });
+    editor.dispatchEvent(event);
+    assert.equal(event.defaultPrevented, false);
+    harness.advanceTime(1999);
+    assert.equal(calls.length, 0);
+    harness.advanceTime(1);
+    assert.equal(calls.length, 1);
+    assert.equal(card._autoDimState, "dimmed");
+  });
+}
+
+test("dialog-like external interaction ending starts a complete timeout", t => {
+  const harness = setup(t);
+  const hass = harness.createHass();
+  const calls = [];
+  hass.callService = (...args) => calls.push(args);
+  const card = createAutoDimCard(harness, enabledAutoDim, hass);
+  const editor = harness.window.document.createElement("input");
+  harness.window.document.body.appendChild(editor);
+  calls.length = 0;
+
+  harness.advanceTime(1000);
+  editor.dispatchEvent(new harness.window.Event("focusin", { bubbles: true }));
+  harness.advanceTime(1500);
+  editor.dispatchEvent(new harness.window.Event("focusout", { bubbles: true }));
+  editor.dispatchEvent(new harness.window.Event("click", {
+    bubbles: true,
+    cancelable: true
+  }));
+  assert.equal(card._autoDimState, "awake");
+  harness.advanceTime(1999);
+  assert.equal(calls.length, 0);
+  harness.advanceTime(1);
+  assert.equal(calls.length, 1);
+});
+
+test("page activity restores dimmed display without consuming the event", t => {
+  const harness = setup(t);
+  const hass = harness.createHass();
+  const calls = [];
+  hass.callService = (...args) => calls.push(args);
+  createAutoDimCard(harness, enabledAutoDim, hass);
+  const editor = harness.window.document.createElement("input");
+  harness.window.document.body.appendChild(editor);
+  calls.length = 0;
+  harness.advanceTime(2000);
+  assert.equal(calls.length, 1);
+
+  const activity = new harness.window.Event("pointerdown", { bubbles: true, cancelable: true });
+  editor.dispatchEvent(activity);
+  assert.equal(activity.defaultPrevented, false);
+  assert.equal(calls.length, 2);
+  assert.equal(calls.at(-1)[2].data.command, 180);
+});
+
+test("activity inside another NVR card is not external activity", t => {
+  const harness = setup(t);
+  const first = createAutoDimCard(harness, enabledAutoDim, harness.createHass());
+  const second = createAutoDimCard(harness, enabledAutoDim, harness.createHass());
+  const before = second._idleTimer;
+  first.dispatchEvent(new harness.window.Event("pointerdown", { bubbles: true }));
+  assert.equal(second._idleTimer, before);
+});
+
+test("card-originating click is not handled by document activity", t => {
+  const harness = setup(t);
+  const card = createAutoDimCard(harness, enabledAutoDim, harness.createHass());
+  let externalActivity = 0;
+  card.handleExternalAutoDimActivity = () => externalActivity += 1;
+
+  const target = card.querySelector(".sidebar-toggle");
+  target.click();
+  assert.equal(externalActivity, 0);
+});
+
+test("document activity listeners follow auto-dim lifecycle", t => {
+  const harness = setup(t);
+  const card = createAutoDimCard(harness, enabledAutoDim, harness.createHass());
+  assert.equal(card._autoDimListenersInstalled, true);
+
+  card.setConfig({ ...card.config, auto_dim: { enabled: false } });
+  assert.equal(card._autoDimListenersInstalled, false);
+
+  card.setConfig({ ...card.config, auto_dim: enabledAutoDim });
+  assert.equal(card._autoDimListenersInstalled, true);
+  card.remove();
+  assert.equal(card._autoDimListenersInstalled, false);
+});
+
+test("camera root isolates internal overlay stacking", t => {
+  const harness = setup(t);
+  const card = harness.createCard();
+  const style = card.querySelector("style").textContent;
+  assert.match(style, /ha-card\s*\{[\s\S]*isolation:\s*isolate/);
+  assert.match(style, /\.cell-camera-name\s*\{[\s\S]*z-index:\s*5/);
+  assert.match(style, /\.camera-context-menu\s*\{[\s\S]*z-index:\s*20/);
 });
 
 test("auto-dim normalization clamps brightness and rejects invalid notify actions", t => {
@@ -1974,6 +2134,124 @@ test("saved-view actions preserve the sidebar container", t => {
     '[data-saved-view-action="delete"]'
   ).click();
   assert.equal(card.querySelector(".nvr-sidebar"), sidebar);
+});
+
+for (const response of [null, "Saved View"]) {
+  test(`save-current prompt ${response === null ? "cancel" : "OK"} pauses and rearms auto-dim`, t => {
+    const harness = setup(t);
+    assertBlockingDialogRearms(
+      harness,
+      (card, dialog) => {
+        harness.window.prompt = dialog;
+        card.querySelector(".saved-view-save-current").click();
+      },
+      response
+    );
+  });
+}
+
+test("rename prompt pauses and rearms auto-dim", t => {
+  const harness = setup(t);
+  assertBlockingDialogRearms(
+    harness,
+    (card, dialog) => {
+      harness.window.prompt = dialog;
+      card.querySelector('[data-saved-view-action="rename"]').click();
+    },
+    "Renamed View"
+  );
+});
+
+for (const response of [false, true]) {
+  test(`overwrite confirm ${response ? "true" : "false"} pauses and rearms auto-dim`, t => {
+    const harness = setup(t);
+    assertBlockingDialogRearms(
+      harness,
+      (card, dialog) => {
+        harness.window.confirm = dialog;
+        card.querySelector('[data-saved-view-action="overwrite"]').click();
+      },
+      response
+    );
+  });
+
+  test(`delete confirm ${response ? "true" : "false"} pauses and rearms auto-dim`, t => {
+    const harness = setup(t);
+    assertBlockingDialogRearms(
+      harness,
+      (card, dialog) => {
+        harness.window.confirm = dialog;
+        card.querySelector('[data-saved-view-action="delete"]').click();
+      },
+      response
+    );
+  });
+}
+
+test("blocking dialog wrapper preserves results and rethrows exceptions", t => {
+  const harness = setup(t);
+  const hass = harness.createHass();
+  hass.callService = () => {};
+  const card = createAutoDimCard(harness, enabledAutoDim, hass);
+  const result = { confirmed: true };
+  assert.strictEqual(
+    card.runBlockingAutoDimDialog(() => result),
+    result
+  );
+
+  const error = new Error("dialog failed");
+  assert.throws(
+    () => card.runBlockingAutoDimDialog(() => { throw error; }),
+    caught => caught === error
+  );
+  assert.equal(card._autoDimState, "awake");
+  assert.notEqual(card._idleTimer, null);
+});
+
+test("blocking dialog wrapper does not alter non-awake or unusable states", t => {
+  const harness = setup(t);
+  const hass = harness.createHass();
+  hass.callService = () => {};
+  const card = createAutoDimCard(harness, enabledAutoDim, hass);
+
+  for (const state of ["dimming", "dimmed", "restoring", "suspended"]) {
+    card._autoDimState = state;
+    card._idleTimer = null;
+    assert.equal(card.runBlockingAutoDimDialog(() => "result"), "result");
+    assert.equal(card._autoDimState, state);
+    assert.equal(card._idleTimer, null);
+  }
+
+  card.setConfig({ ...card.config, auto_dim: { enabled: false } });
+  assert.equal(card.runBlockingAutoDimDialog(() => "disabled"), "disabled");
+  assert.equal(card._autoDimState, "disabled");
+  assert.equal(card._idleTimer, null);
+});
+
+test("blocking dialog timing is isolated per NVR card instance", t => {
+  const harness = setup(t);
+  const firstHass = harness.createHass();
+  const secondHass = harness.createHass();
+  const firstCalls = [];
+  const secondCalls = [];
+  firstHass.callService = (...args) => firstCalls.push(args);
+  secondHass.callService = (...args) => secondCalls.push(args);
+  const first = createAutoDimCard(harness, enabledAutoDim, firstHass);
+  const second = createAutoDimCard(harness, enabledAutoDim, secondHass);
+  firstCalls.length = 0;
+  secondCalls.length = 0;
+
+  first.runBlockingAutoDimDialog(() => {
+    assert.equal(first._idleTimer, null);
+    assert.notEqual(second._idleTimer, null);
+    harness.advanceTime(2500);
+    assert.equal(firstCalls.length, 0);
+    assert.equal(secondCalls.length, 1);
+    return "first";
+  });
+
+  assert.equal(first._autoDimState, "awake");
+  assert.notEqual(first._idleTimer, null);
 });
 
 test("loading stale saved state preserves slots and clears invalid maximize", t => {
