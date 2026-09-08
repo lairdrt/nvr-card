@@ -7648,18 +7648,26 @@ class NVRCard extends HTMLElement {
     const viewportTop =
       viewport ? viewport.offsetTop : 0;
 
+    const pageTop =
+      viewport?.pageTop ?? window.scrollY ?? 0;
+
     const cardTop =
       card.getBoundingClientRect().top;
+
+    // Deliberately normalizes document/visual-viewport scrolling only. Nested
+    // scroll-container compensation is outside this narrow correction.
+    const stableCardTop =
+      cardTop - viewportTop + pageTop;
 
     const availableHeight = Math.max(
       0,
       viewportHeight -
-        Math.max(0, cardTop - viewportTop)
+        Math.max(0, stableCardTop)
     );
 
     card.style.setProperty(
       "--nvr-card-top",
-      `${Math.max(0, cardTop)}px`
+      `${Math.max(0, stableCardTop)}px`
     );
 
     card.style.setProperty(

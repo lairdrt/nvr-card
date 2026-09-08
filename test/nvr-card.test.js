@@ -354,6 +354,176 @@ test("camera root isolates internal overlay stacking", t => {
   assert.match(style, /\.camera-context-menu\s*\{[\s\S]*z-index:\s*20/);
 });
 
+function setGeometryViewport(harness, {
+  height,
+  offsetTop = 0,
+  pageTop,
+  scrollY = 0
+}) {
+  Object.defineProperty(harness.window, "scrollY", {
+    configurable: true,
+    value: scrollY
+  });
+  Object.defineProperty(harness.window, "visualViewport", {
+    configurable: true,
+    value: height === null
+      ? undefined
+      : {
+          height,
+          offsetTop,
+          ...(pageTop === undefined ? {} : { pageTop }),
+          addEventListener() {},
+          removeEventListener() {}
+        }
+  });
+  if (height === null) {
+    Object.defineProperty(harness.window, "innerHeight", {
+      configurable: true,
+      value: 919
+    });
+  }
+}
+
+
+test("available height uses stable document origin across scrolling", t => {
+  const harness = setup(t);
+  const card = harness.createCard();
+  const haCard = card.querySelector("ha-card");
+
+  setGeometryViewport(harness, {
+    height: 919,
+    scrollY: 0
+  });
+  harness.setCardRect(card, { top: 56 });
+  card.updateAvailableHeight();
+  assert.equal(
+    haCard.style.getPropertyValue("--nvr-card-available-height"),
+    "863px"
+  );
+  assert.equal(
+    haCard.style.getPropertyValue("--nvr-card-top"),
+    "56px"
+  );
+
+  setGeometryViewport(harness, {
+    height: 919,
+    pageTop: 56,
+    scrollY: 56
+  });
+  harness.setCardRect(card, { top: 0 });
+  card.updateAvailableHeight();
+  assert.equal(
+    haCard.style.getPropertyValue("--nvr-card-available-height"),
+    "863px"
+  );
+  assert.equal(
+    haCard.style.getPropertyValue("--nvr-card-top"),
+    "56px"
+  );
+
+  setGeometryViewport(harness, {
+    height: 919,
+    scrollY: 100
+  });
+  harness.setCardRect(card, { top: 80 });
+  card.updateAvailableHeight();
+  assert.equal(
+    haCard.style.getPropertyValue("--nvr-card-available-height"),
+    "739px"
+  );
+
+  setGeometryViewport(harness, {
+    height: 919,
+    scrollY: 100
+  });
+  harness.setCardRect(card, { top: -44 });
+  card.updateAvailableHeight();
+  assert.equal(
+    haCard.style.getPropertyValue("--nvr-card-available-height"),
+    "863px"
+  );
+});
+
+
+test("visual viewport origin and height changes remain geometry-stable", t => {
+  const harness = setup(t);
+  const card = harness.createCard();
+  const haCard = card.querySelector("ha-card");
+
+  setGeometryViewport(harness, {
+    height: 700,
+    offsetTop: 20,
+    pageTop: 76,
+    scrollY: 56
+  });
+  harness.setCardRect(card, { top: 0 });
+  card.updateAvailableHeight();
+  assert.equal(
+    haCard.style.getPropertyValue("--nvr-card-available-height"),
+    "644px"
+  );
+  assert.equal(
+    haCard.style.getPropertyValue("--nvr-card-top"),
+    "56px"
+  );
+
+  setGeometryViewport(harness, {
+    height: 800,
+    offsetTop: 20,
+    pageTop: 76,
+    scrollY: 56
+  });
+  card.updateAvailableHeight();
+  assert.equal(
+    haCard.style.getPropertyValue("--nvr-card-available-height"),
+    "744px"
+  );
+});
+
+
+test("available height falls back to window scroll without visual viewport", t => {
+  const harness = setup(t);
+  const card = harness.createCard();
+  const haCard = card.querySelector("ha-card");
+
+  setGeometryViewport(harness, {
+    height: null,
+    scrollY: 56
+  });
+  harness.setCardRect(card, { top: 0 });
+  card.updateAvailableHeight();
+  assert.equal(
+    haCard.style.getPropertyValue("--nvr-card-available-height"),
+    "863px"
+  );
+  assert.equal(
+    haCard.style.getPropertyValue("--nvr-card-top"),
+    "56px"
+  );
+});
+
+
+test("height correction preserves player and cell identity", t => {
+  const harness = setup(t);
+  const card = harness.createCard();
+  card.assignCamera("Front");
+  const before = harness.capturePlayerIdentity(card, "Front");
+
+  setGeometryViewport(harness, {
+    height: 919,
+    pageTop: 56,
+    scrollY: 56
+  });
+  harness.setCardRect(card, { top: 0 });
+  card.updateAvailableHeight();
+
+  const after = harness.capturePlayerIdentity(card, "Front");
+  assert.strictEqual(after.player, before.player);
+  assert.strictEqual(after.cell, before.cell);
+  assert.equal(after.player.connectedCount, 1);
+  assert.equal(after.player.disconnectedCount, 0);
+});
+
 test("auto-dim normalization clamps brightness and rejects invalid notify actions", t => {
   const harness = setup(t);
   const card = harness.window.document.createElement("nvr-card");
