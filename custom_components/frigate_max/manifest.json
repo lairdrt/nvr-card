@@ -1,0 +1,10 @@
+{
+  "domain": "frigate_max",
+  "name": "FrigateMax Prototype 0",
+  "codeowners": [],
+  "config_flow": false,
+  "dependencies": ["websocket_api"],
+  "documentation": "https://github.com/laird/nvr-card",
+  "iot_class": "local_polling",
+  "version": "0.0.0"
+}
