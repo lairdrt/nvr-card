@@ -6,13 +6,19 @@ $SourceFile = Join-Path $PSScriptRoot "nvr-card.js"
 $LoaderSourceFile = Join-Path $PSScriptRoot "loader.js"
 $LiveSourceDirectory = Join-Path $PSScriptRoot "src\live"
 $ProviderSourceDirectory = Join-Path $PSScriptRoot "src\providers"
+$ReviewSourceDirectory = Join-Path $PSScriptRoot "src\review"
 $Go2RtcVendorSourceDirectory = Join-Path $PSScriptRoot "src\vendor\go2rtc"
+$HlsSourceFile = Join-Path $PSScriptRoot "src\vendor\hls.min.js"
+$HlsLicenseSourceFile = Join-Path $PSScriptRoot "src\vendor\hls.js.LICENSE"
 $HaWwwDirectory = Join-Path $HaConfigShare "www\nvr-card"
 $DestinationFile = Join-Path $HaWwwDirectory "nvr-card.js"
 $LoaderDestinationFile = Join-Path $HaWwwDirectory "loader.js"
 $LiveDestinationDirectory = Join-Path $HaWwwDirectory "src\live"
 $ProviderDestinationDirectory = Join-Path $HaWwwDirectory "src\providers"
+$ReviewDestinationDirectory = Join-Path $HaWwwDirectory "src\review"
 $Go2RtcVendorDestinationDirectory = Join-Path $HaWwwDirectory "src\vendor\go2rtc"
+$HlsDestinationFile = Join-Path $HaWwwDirectory "src\vendor\hls.min.js"
+$HlsLicenseDestinationFile = Join-Path $HaWwwDirectory "src\vendor\hls.js.LICENSE"
 
 Write-Host "Local source: $SourceFile"
 Write-Host "HA destination: $DestinationFile"
@@ -36,6 +42,17 @@ if (-not (Test-Path -LiteralPath $LiveSourceDirectory -PathType Container)) {
 
 if (-not (Test-Path -LiteralPath $ProviderSourceDirectory -PathType Container)) {
     Write-Error "Provider source directory does not exist: $ProviderSourceDirectory"
+    exit 1
+}
+
+if (-not (Test-Path -LiteralPath $ReviewSourceDirectory -PathType Container)) {
+    Write-Error "Review source directory does not exist: $ReviewSourceDirectory"
+    exit 1
+}
+
+if (-not (Test-Path -LiteralPath $HlsSourceFile -PathType Leaf) -or
+    -not (Test-Path -LiteralPath $HlsLicenseSourceFile -PathType Leaf)) {
+    Write-Error "Vendored hls.js or its license is missing."
     exit 1
 }
 
@@ -76,7 +93,10 @@ try {
         Get-Item -LiteralPath $LoaderSourceFile -ErrorAction Stop
         Get-ChildItem -LiteralPath $LiveSourceDirectory -File -Filter "*.js" -ErrorAction Stop
         Get-ChildItem -LiteralPath $ProviderSourceDirectory -File -Filter "*.js" -ErrorAction Stop
+        Get-ChildItem -LiteralPath $ReviewSourceDirectory -File -Filter "*.js" -ErrorAction Stop
         Get-ChildItem -LiteralPath $Go2RtcVendorSourceDirectory -File -ErrorAction Stop
+        Get-Item -LiteralPath $HlsSourceFile -ErrorAction Stop
+        Get-Item -LiteralPath $HlsLicenseSourceFile -ErrorAction Stop
     ) | Sort-Object FullName
 
     $SourceRoot = (Resolve-Path -LiteralPath $PSScriptRoot).Path.TrimEnd("\") + "\"
@@ -114,8 +134,12 @@ try {
     Copy-Item -Path (Join-Path $LiveSourceDirectory "*.js") -Destination $LiveDestinationDirectory -Force -ErrorAction Stop
     New-Item -ItemType Directory -Path $ProviderDestinationDirectory -Force -ErrorAction Stop | Out-Null
     Copy-Item -Path (Join-Path $ProviderSourceDirectory "*.js") -Destination $ProviderDestinationDirectory -Force -ErrorAction Stop
+    New-Item -ItemType Directory -Path $ReviewDestinationDirectory -Force -ErrorAction Stop | Out-Null
+    Copy-Item -Path (Join-Path $ReviewSourceDirectory "*.js") -Destination $ReviewDestinationDirectory -Force -ErrorAction Stop
     New-Item -ItemType Directory -Path $Go2RtcVendorDestinationDirectory -Force -ErrorAction Stop | Out-Null
     Copy-Item -Path (Join-Path $Go2RtcVendorSourceDirectory "*") -Destination $Go2RtcVendorDestinationDirectory -Force -ErrorAction Stop
+    Copy-Item -LiteralPath $HlsSourceFile -Destination $HlsDestinationFile -Force -ErrorAction Stop
+    Copy-Item -LiteralPath $HlsLicenseSourceFile -Destination $HlsLicenseDestinationFile -Force -ErrorAction Stop
 }
 catch {
     Write-Error "Failed to deploy NVR card files: $($_.Exception.Message)"
@@ -139,6 +163,17 @@ if (-not (Test-Path -LiteralPath (Join-Path $LiveDestinationDirectory "nvr-live-
 
 if (-not (Test-Path -LiteralPath (Join-Path $ProviderDestinationDirectory "frigate-provider.js") -PathType Leaf)) {
     Write-Error "Frigate provider module was not deployed."
+    exit 1
+}
+
+if (-not (Test-Path -LiteralPath (Join-Path $ReviewDestinationDirectory "review-controller.js") -PathType Leaf)) {
+    Write-Error "Review controller module was not deployed."
+    exit 1
+}
+
+if (-not (Test-Path -LiteralPath $HlsDestinationFile -PathType Leaf) -or
+    -not (Test-Path -LiteralPath $HlsLicenseDestinationFile -PathType Leaf)) {
+    Write-Error "Vendored hls.js or its license was not deployed."
     exit 1
 }
 

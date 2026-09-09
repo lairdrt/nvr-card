@@ -27,3 +27,18 @@ The estimated absolute delta was approximately 27 ms early and approximately
 especially near the beginning. No continuous correction loop was running.
 
 **HARD GATE PASSED:** synchronized multi-camera historical playback is viable.
+
+## Review v0 runtime checkpoint
+
+Review v0 was runtime-proven on the real system through the sequence Live ->
+Review live -> synchronized historical playback -> Review live -> Live. The
+known target was `2026-09-08T14:00:00-07:00`; Drive Up and Drive Down
+independently sought to approximately 21 s and 22 s. The reconstructed
+absolute delta observed during validation was approximately 0.217 s, and
+playback appeared tightly synchronized. No continuous correction loop was
+running. The exact prior Live workspace and state were restored after leaving
+Review, with no observed Live regression.
+
+The current Review v0 controls are intentionally developer-oriented and are
+**NOT the final Review UI**. This checkpoint protects the proven architecture
+and behavior before UI redesign.

@@ -5,6 +5,10 @@ const baseCardSource = readFileSync(
   new URL("../../nvr-card.js", import.meta.url),
   "utf8"
 );
+const baseReviewSource = readFileSync(
+  new URL("../../src/review/review-controller.js", import.meta.url),
+  "utf8"
+);
 
 export const defaultCameras = [
   { name: "Front", entity: "camera.front", active: true },
@@ -293,10 +297,18 @@ export function createTestHarness({
     MockProviderPlayer
   );
   window.FrigateProvider = MockFrigateProvider;
+  const reviewSource = baseReviewSource
+    .replaceAll("export ", "") +
+    "\nwindow.ReviewController = ReviewController; window.ReviewClock = ReviewClock;";
+  window.eval(reviewSource);
   const cardSource = baseCardSource
     .replace(
       'import { FrigateProvider } from "./src/providers/frigate-provider.js";',
       "const FrigateProvider = window.FrigateProvider;"
+    )
+    .replace(
+      'import { ReviewController } from "./src/review/review-controller.js";',
+      "const ReviewController = window.ReviewController;"
     )
     .replace(
       "const USE_HA_HUI_IMAGE_EXPERIMENT = true;",

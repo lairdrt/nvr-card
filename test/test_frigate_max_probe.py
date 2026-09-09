@@ -20,6 +20,37 @@ SPEC.loader.exec_module(probe)
 
 
 class FrigateMaxProbeTests(unittest.TestCase):
+    def test_v1_prepare_accepts_safe_camera_ids_without_a_two_camera_cap(self) -> None:
+        self.assertEqual(
+            probe.validate_prepare_request("back_yard-2", 1000, 1120, 1015),
+            ("back_yard-2", 1000.0, 1120.0, 1015.0),
+        )
+        for camera in ("", "front/door", "front door", "../front"):
+            with self.assertRaises(probe.ProbeDataError):
+                probe.validate_prepare_request(camera, 1000, 1120, 1015)
+
+    def test_v1_prepare_normalization_drops_paths_credentials_and_unknowns(self) -> None:
+        result = probe.normalize_prepare_result(
+            {
+                "camera": "drive_up",
+                "requested_start": 1000,
+                "requested_end": 1120,
+                "recording_start": 990,
+                "requested_clip_from_ms": 10000,
+                "adjusted_clip_from_ms": 7000,
+                "effective_absolute_origin": 997,
+                "calculated_target_seek": 18,
+                "path": "/media/private/recording.mp4",
+                "password": "synthetic-secret",
+                "mapping": {"clips": []},
+            },
+            "drive_up",
+        )
+        self.assertEqual(set(result), set(probe.PREPARED_TIMING_FIELDS))
+        self.assertNotIn("path", result)
+        self.assertNotIn("password", result)
+        self.assertNotIn("synthetic-secret", repr(result))
+
     def test_websocket_semantic_input_validation_is_bounded(self) -> None:
         self.assertEqual(
             probe.validate_probe_request("drive_up", 1000, 1120, 1015),

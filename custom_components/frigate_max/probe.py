@@ -3,17 +3,46 @@
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Iterator, Mapping, Sequence
 from typing import Any
 
 ALLOWED_CAMERAS = frozenset({"drive_up", "drive_down"})
 MAX_RANGE_SECONDS = 300.0
 ISOLATION_EPSILON_SECONDS = 0.001
+PREPARED_TIMING_FIELDS = (
+    "camera",
+    "requested_start",
+    "requested_end",
+    "recording_start",
+    "requested_clip_from_ms",
+    "adjusted_clip_from_ms",
+    "effective_absolute_origin",
+    "calculated_target_seek",
+)
 MIN_CLIP_SECONDS = 0.101
+FRIGATE_CAMERA_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
 
 class ProbeDataError(ValueError):
     """Raised when probe input or Frigate data cannot be associated safely."""
+
+
+def normalize_prepare_result(result: Any, expected_camera: str) -> dict[str, Any]:
+    """Return only the safe, versioned VOD preparation response fields."""
+    if not isinstance(result, Mapping) or result.get("camera") != expected_camera:
+        raise ProbeDataError("Prepared VOD timing did not match the requested camera.")
+
+    normalized: dict[str, Any] = {"camera": expected_camera}
+    for field in PREPARED_TIMING_FIELDS[1:]:
+        value = result.get(field)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ProbeDataError("Prepared VOD timing was incomplete.")
+        numeric = float(value)
+        if not math.isfinite(numeric):
+            raise ProbeDataError("Prepared VOD timing was invalid.")
+        normalized[field] = numeric
+    return normalized
 
 
 def _finite_number(value: Any, field: str) -> float:
@@ -34,6 +63,24 @@ def validate_probe_request(
     """Validate and normalize the deliberately bounded probe request."""
     if not isinstance(camera, str) or camera not in ALLOWED_CAMERAS:
         raise ProbeDataError("camera must be drive_up or drive_down.")
+    start = _finite_number(requested_start, "requested_start")
+    end = _finite_number(requested_end, "requested_end")
+    target_epoch = _finite_number(target, "target")
+    if end <= start:
+        raise ProbeDataError("requested_end must be after requested_start.")
+    if end - start > MAX_RANGE_SECONDS:
+        raise ProbeDataError("requested range must not exceed 300 seconds.")
+    if target_epoch < start or target_epoch > end:
+        raise ProbeDataError("target must be inside the requested range.")
+    return camera, start, end, target_epoch
+
+
+def validate_prepare_request(
+    camera: Any, requested_start: Any, requested_end: Any, target: Any
+) -> tuple[str, float, float, float]:
+    """Validate the v1 request without imposing a fixed camera inventory."""
+    if not isinstance(camera, str) or not FRIGATE_CAMERA_ID.fullmatch(camera):
+        raise ProbeDataError("camera must be a safe Frigate camera identifier.")
     start = _finite_number(requested_start, "requested_start")
     end = _finite_number(requested_end, "requested_end")
     target_epoch = _finite_number(target, "target")

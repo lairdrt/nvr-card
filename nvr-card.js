@@ -3,6 +3,7 @@
 */
 
 import { FrigateProvider } from "./src/providers/frigate-provider.js";
+import { ReviewController } from "./src/review/review-controller.js";
 
 const NVR_BUILD = "__NVR_BUILD__";
 const USE_HA_HUI_IMAGE_EXPERIMENT = true;
@@ -350,6 +351,8 @@ class NVRCard extends HTMLElement {
     this._activeMaximizeMediaSession = null;
     this._frigateProvider = new FrigateProvider();
     this._providerPresentations = new Map();
+    this._applicationMode = "live";
+    this._reviewController = new ReviewController();
     this._legacyViewStateStore = NVR_LEGACY_VIEW_STATE_STORE;
     this._userStateStore = new HomeAssistantUserStateStore(
       () => this._hass
@@ -2286,6 +2289,7 @@ class NVRCard extends HTMLElement {
     this._lastObservedConnection = nextConnection;
     this._lastObservedConnectionConnected = nextConnected;
     this._hass = hass;
+    this._reviewController.setHass(hass);
     this.syncAutoDimConnection();
 
     if (
@@ -2326,6 +2330,7 @@ class NVRCard extends HTMLElement {
 
 
   connectedCallback() {
+    this._reviewController.resume();
     this.querySelectorAll("hui-image.nvr-live-camera").forEach(image => {
       if (!this._reconnectPresentationSources.has(image)) return;
       const slot = Number(image.closest(".video-cell")?.dataset.slot);
@@ -2353,6 +2358,7 @@ class NVRCard extends HTMLElement {
 
 
   disconnectedCallback() {
+    this._reviewController.suspend();
     this._maximizedSwipe = null;
     this._swipeClick = null;
     this.logReconnect("card-disconnected");
@@ -2762,6 +2768,7 @@ class NVRCard extends HTMLElement {
 
 
   render(reason = "direct-call") {
+    this._reviewController.unmount();
     this.cleanupAllReconnectPresentationDiagnostics();
     this.logCardLifecycle("render-entry", {
       reason,
@@ -2808,6 +2815,10 @@ class NVRCard extends HTMLElement {
             <span class="build-identifier">
               ${NVR_BUILD}
             </span>
+            <div class="application-mode-control" role="group" aria-label="NVR mode">
+              <button type="button" data-application-mode="live">Live</button>
+              <button type="button" data-application-mode="review">Review</button>
+            </div>
           </header>
 
           <aside class="camera-list nvr-sidebar">
@@ -2937,6 +2948,8 @@ class NVRCard extends HTMLElement {
 
           </main>
 
+          <section class="review-surface" hidden></section>
+
 
           <div
             class="camera-context-menu"
@@ -3044,6 +3057,118 @@ class NVRCard extends HTMLElement {
 
         text-overflow: ellipsis;
         white-space: nowrap;
+      }
+
+      .application-mode-control {
+        display: flex;
+        gap: 3px;
+        margin-left: 14px;
+      }
+
+      .application-mode-control button,
+      .review-toolbar button,
+      .review-toolbar input,
+      .review-toolbar select {
+        border: 1px solid #3b4954;
+        border-radius: 3px;
+        background: #1a2229;
+        color: #dce6ec;
+        padding: 5px 8px;
+      }
+
+      .application-mode-control button.selected {
+        border-color: #56a7d8;
+        background: #24475b;
+      }
+
+      .review-surface {
+        grid-column: 1 / -1;
+        grid-row: 2;
+        min-width: 0;
+        min-height: 0;
+        padding: 10px;
+        overflow: auto;
+        background: #090c0f;
+        box-sizing: border-box;
+      }
+
+      .review-surface[hidden],
+      .nvr-sidebar[hidden],
+      .main-area[hidden] {
+        display: none !important;
+      }
+
+      .review-toolbar,
+      .review-selection {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .review-target {
+        min-width: 245px;
+      }
+
+      .review-status {
+        margin: 8px 0;
+        color: #aebbc4;
+        white-space: pre-wrap;
+        font: 12px/1.4 monospace;
+      }
+
+      .review-status.error,
+      .review-camera-status.unavailable {
+        color: #ef7770;
+      }
+
+      .review-primary {
+        max-width: 1100px;
+        margin: 0 auto;
+      }
+
+      .review-secondary-strip {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+        gap: 8px;
+        margin-top: 8px;
+      }
+
+      .review-camera-panel {
+        min-width: 0;
+        border: 1px solid #26313b;
+        background: #11161c;
+      }
+
+      .review-camera-heading {
+        padding: 5px 7px;
+        color: #dce6ec;
+        font-size: 12px;
+      }
+
+      .review-camera-media {
+        position: relative;
+        aspect-ratio: 16 / 9;
+        overflow: hidden;
+        background: #000;
+      }
+
+      .review-live-camera,
+      .review-historical-video {
+        display: block;
+        width: 100%;
+        height: 100%;
+        object-fit: contain;
+      }
+
+      .review-camera-status {
+        position: absolute;
+        left: 6px;
+        bottom: 6px;
+        padding: 3px 5px;
+        background: rgba(0, 0, 0, 0.72);
+        color: #dce6ec;
+        font: 11px/1.3 monospace;
       }
 
 
@@ -3919,6 +4044,7 @@ class NVRCard extends HTMLElement {
     this.attachSidebarHandlers();
     this.attachSavedViewHandlers();
     this.attachSidebarToggleHandler();
+    this.attachApplicationModeHandlers();
     this.attachLayoutHandlers();
     this.attachLayoutDragHandlers();
     this.attachSlotHandlers();
@@ -3936,6 +4062,11 @@ class NVRCard extends HTMLElement {
 
     this.updateAvailableHeight();
     this.updateResponsiveShell();
+
+    this._reviewController.configure(this._cameras);
+    this._reviewController.setHass(this._hass);
+    this._reviewController.mount(this.querySelector(".review-surface"));
+    this.setApplicationMode(this._applicationMode, true);
 
     this.installResizeObserver();
     this.logCardLifecycle("render-complete", {
@@ -7674,6 +7805,45 @@ class NVRCard extends HTMLElement {
       "--nvr-card-available-height",
       `${Math.floor(availableHeight)}px`
     );
+  }
+
+
+  attachApplicationModeHandlers() {
+    this.querySelectorAll("[data-application-mode]").forEach(button => {
+      button.addEventListener("click", () => {
+        this.setApplicationMode(button.dataset.applicationMode);
+      });
+    });
+  }
+
+
+  setApplicationMode(mode, force = false) {
+    if (mode !== "live" && mode !== "review") return false;
+    if (!force && mode === this._applicationMode) return true;
+
+    this._applicationMode = mode;
+    const reviewActive = mode === "review";
+    const sidebar = this.querySelector(".nvr-sidebar");
+    const main = this.querySelector(".main-area");
+    const sidebarToggle = this.querySelector(".sidebar-toggle");
+
+    if (sidebar) sidebar.hidden = reviewActive;
+    if (main) main.hidden = reviewActive;
+    if (sidebarToggle) sidebarToggle.hidden = reviewActive;
+
+    if (reviewActive) {
+      this._reviewController.activate();
+    } else {
+      this._reviewController.deactivate();
+      this.scheduleCameraFit();
+    }
+
+    this.querySelectorAll("[data-application-mode]").forEach(button => {
+      const selected = button.dataset.applicationMode === mode;
+      button.classList.toggle("selected", selected);
+      button.setAttribute("aria-pressed", String(selected));
+    });
+    return true;
   }
 
   installResizeObserver() {

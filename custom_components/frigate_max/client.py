@@ -105,14 +105,14 @@ class FrigateProbeClient:
             f"/api/vod/{quote(camera, safe='')}/start/{start:.3f}/end/{end:.3f}"
         )
 
-    async def probe_vod_timing(
+    async def prepare_vod(
         self,
         camera: str,
         requested_start: float,
         requested_end: float,
         target: float,
     ) -> dict[str, Any]:
-        """Return authoritative timing without exposing Frigate mapping paths."""
+        """Prepare authoritative VOD timing without exposing Frigate internals."""
         encoded_camera = quote(camera, safe="")
         recordings = await self._get_json(
             f"/api/{encoded_camera}/recordings",
@@ -151,3 +151,13 @@ class FrigateProbeClient:
         raise FrigateProbeError(
             "No Frigate recording could be associated with the VOD mapping."
         )
+
+    async def probe_vod_timing(
+        self,
+        camera: str,
+        requested_start: float,
+        requested_end: float,
+        target: float,
+    ) -> dict[str, Any]:
+        """Retain the Prototype 0 command while Review migrates to the v1 API."""
+        return await self.prepare_vod(camera, requested_start, requested_end, target)
