@@ -256,7 +256,7 @@ export class ReviewController {
     this._debugEnabled = false;
     this._rhsMode = "timeline";
     this._selectedFilters = new Set();
-    this._sectionExpanded = { cameras: true, when: true, filters: true, diagnostics: true };
+    this._sectionExpanded = { cameras: false, when: false, filters: false, diagnostics: false };
     this._selectedDay = null;
     this.clock = new ReviewClock(now);
   }

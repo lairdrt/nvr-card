@@ -74,6 +74,8 @@ test("rail shell shares large icons, clean rows, footer, and collapsed treatment
   assert.match(source, /\.sidebar-toggle svg\s*{[\s\S]*?width:\s*var\(--nvr-sidebar-icon-size\)/);
   assert.match(source, /\.section-title ha-icon\s*{[\s\S]*?--mdc-icon-size:\s*var\(--nvr-sidebar-icon-size\)/);
   assert.match(source, /\.sidebar-section-header\s*{[\s\S]*?min-height:\s*var\(--nvr-sidebar-touch-target\)/);
+  assert.match(source, /\.nvr-shell\.sidebar-collapsed\s+\.camera-list\s*{[\s\S]*?padding:\s*0 var\(--nvr-sidebar-collapsed-padding\) 0 5px/);
+  assert.doesNotMatch(source, /\.nvr-shell\.sidebar-collapsed\s*> \.camera-list/);
   assert.match(source, /\.sidebar-rail-footer\s*{[\s\S]*?grid-column:\s*1;[\s\S]*?align-self:\s*end/);
   assert.match(source, /\.nvr-shell\.sidebar-collapsed \.sidebar-rail-footer\s*{\s*display:\s*none/);
   assert.doesNotMatch(source, /sidebar-rail-title/);
@@ -362,13 +364,13 @@ test("one global sidebar state collapses and expands Live and Review without med
     reviewImage
   );
   card.querySelector(".review-when-section .sidebar-section-header").click();
-  assert.equal(card.querySelector(".review-when-section").classList.contains("expanded"), false);
+  assert.equal(card.querySelector(".review-when-section").classList.contains("expanded"), true);
   toggle.click();
   assert.strictEqual(
     card.querySelector('hui-image.review-live-camera[data-entity="camera.front"]'),
     reviewImage
   );
-  assert.equal(card.querySelector(".review-when-section").classList.contains("expanded"), false);
+  assert.equal(card.querySelector(".review-when-section").classList.contains("expanded"), true);
 
   card.setApplicationMode("live");
   assert.equal(shell.classList.contains("sidebar-collapsed"), true);
@@ -377,7 +379,7 @@ test("one global sidebar state collapses and expands Live and Review without med
   assert.equal(shell.classList.contains("sidebar-collapsed"), false);
   card.setApplicationMode("review");
   assert.equal(shell.classList.contains("sidebar-collapsed"), false);
-  assert.equal(card.querySelector(".review-when-section").classList.contains("expanded"), false);
+  assert.equal(card.querySelector(".review-when-section").classList.contains("expanded"), true);
 });
 
 test("rail toggle and native section titles retain one structure in both states", t => {
@@ -431,6 +433,35 @@ test("rail toggle and native section titles retain one structure in both states"
   assert.ok(reviewHeaders.every(header => header.querySelector(".section-title > span")));
 });
 
+test("fresh Review sections start closed and share the collapsed rail inset contract", t => {
+  const harness = createTestHarness();
+  t.after(() => harness.close());
+  const card = harness.createCard();
+  card.setApplicationMode("review");
+  const sections = [...card.querySelectorAll(
+    ".review-control-rail > .sidebar-section"
+  )];
+
+  assert.equal(sections.length, 3);
+  for (const section of sections) {
+    const header = section.querySelector(".sidebar-section-header");
+    const body = section.querySelector(".sidebar-section-body");
+    assert.equal(section.classList.contains("expanded"), false);
+    assert.equal(header.getAttribute("aria-expanded"), "false");
+    assert.equal(body.hidden, true);
+    assert.equal(body.style.display, "none");
+    assert.equal(body.getAttribute("aria-hidden"), "true");
+  }
+
+  card._reviewController.setSectionExpanded("cameras", true);
+  card._reviewController.setSectionExpanded("filters", true);
+  card.setApplicationMode("live");
+  card.setApplicationMode("review");
+  assert.equal(card.querySelector(".review-cameras-section").classList.contains("expanded"), true);
+  assert.equal(card.querySelector(".review-when-section").classList.contains("expanded"), false);
+  assert.equal(card.querySelector(".review-filters-section").classList.contains("expanded"), true);
+});
+
 test("collapsed Live section activation expands the rail and ensures the target open", t => {
   const harness = createTestHarness();
   t.after(() => harness.close());
@@ -475,7 +506,6 @@ test("collapsed Review section activation ensures content open without media or 
   const cameras = card.querySelector(".review-cameras-section");
   const when = card.querySelector(".review-when-section");
 
-  controller.setSectionExpanded("filters", false);
   controller.clock.setAbsolute(1800000000);
   controller.clock.start();
   const clock = {
@@ -490,8 +520,8 @@ test("collapsed Review section activation ensures content open without media or 
   assert.equal(filters.classList.contains("expanded"), true);
   assert.equal(filters.querySelector(".sidebar-section-body").hidden, false);
   assert.equal(filters.querySelector(".sidebar-section-body").style.display, "");
-  assert.equal(cameras.classList.contains("expanded"), true);
-  assert.equal(when.classList.contains("expanded"), true);
+  assert.equal(cameras.classList.contains("expanded"), false);
+  assert.equal(when.classList.contains("expanded"), false);
   assert.strictEqual(
     card.querySelector('hui-image.review-live-camera[data-entity="camera.front"]'),
     image
@@ -510,6 +540,12 @@ test("collapsed Review section activation ensures content open without media or 
     card.querySelector('hui-image.review-live-camera[data-entity="camera.front"]'),
     image
   );
+
+  card.setApplicationMode("live");
+  card.setApplicationMode("review");
+  assert.equal(card.querySelector(".review-filters-section").classList.contains("expanded"), true);
+  assert.equal(card.querySelector(".review-cameras-section").classList.contains("expanded"), false);
+  assert.equal(card.querySelector(".review-when-section").classList.contains("expanded"), false);
 });
 
 test("mode controls are equal-class icon labels with correct active semantics", t => {
@@ -544,7 +580,7 @@ test("historical players use independent origins and start as one orchestration"
   assert.equal(calculateHistoricalSeek(target, prepared("drive_up", target - 21)), 21);
 });
 
-test("all Review sections hide and restore content without changing state", t => {
+test("all Review sections start hidden and toggle open and closed without changing Review state", t => {
   const harness = createHistoricalHarness();
   t.after(() => harness.close());
   harness.controller.setFilter("person", true);
@@ -554,18 +590,20 @@ test("all Review sections hide and restore content without changing state", t =>
     const section = harness.root.querySelector(`.review-${name}-section`);
     const header = section.querySelector(".sidebar-section-header");
     const body = section.querySelector(".sidebar-section-body");
-    header.querySelector("ha-icon").click();
     assert.equal(section.classList.contains("expanded"), false);
-    assert.equal(header.getAttribute("aria-expanded"), "false");
     assert.equal(body.hidden, true);
-    assert.equal(body.style.display, "none");
-    assert.equal(body.getAttribute("aria-hidden"), "true");
-    header.querySelector(".section-title span").click();
+    header.querySelector("ha-icon").click();
     assert.equal(section.classList.contains("expanded"), true);
     assert.equal(header.getAttribute("aria-expanded"), "true");
     assert.equal(body.hidden, false);
     assert.equal(body.style.display, "");
     assert.equal(body.getAttribute("aria-hidden"), "false");
+    header.querySelector(".section-title span").click();
+    assert.equal(section.classList.contains("expanded"), false);
+    assert.equal(header.getAttribute("aria-expanded"), "false");
+    assert.equal(body.hidden, true);
+    assert.equal(body.style.display, "none");
+    assert.equal(body.getAttribute("aria-hidden"), "true");
   }
   assert.deepEqual(harness.controller.state, before);
 });

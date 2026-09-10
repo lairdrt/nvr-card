@@ -3662,7 +3662,7 @@ class NVRCard extends HTMLElement {
 
 
       .nvr-shell.sidebar-collapsed
-      > .camera-list {
+      .camera-list {
         padding: 0 var(--nvr-sidebar-collapsed-padding) 0 5px;
       }
 
