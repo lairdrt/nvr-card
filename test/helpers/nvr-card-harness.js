@@ -298,6 +298,7 @@ export function createTestHarness({
   );
   window.FrigateProvider = MockFrigateProvider;
   const reviewSource = baseReviewSource
+    .replace('import "../vendor/flatpickr/flatpickr-4.6.13.min.js";', "")
     .replaceAll("export ", "") +
     "\nwindow.ReviewController = ReviewController; window.ReviewClock = ReviewClock;";
   window.eval(reviewSource);
@@ -307,7 +308,7 @@ export function createTestHarness({
       "const FrigateProvider = window.FrigateProvider;"
     )
     .replace(
-      'import { ReviewController } from "./src/review/review-controller.js";',
+      'import { ReviewController } from "./src/review/review-controller.js?v=__NVR_BUILD__";',
       "const ReviewController = window.ReviewController;"
     )
     .replace(

@@ -8,6 +8,7 @@ $LiveSourceDirectory = Join-Path $PSScriptRoot "src\live"
 $ProviderSourceDirectory = Join-Path $PSScriptRoot "src\providers"
 $ReviewSourceDirectory = Join-Path $PSScriptRoot "src\review"
 $Go2RtcVendorSourceDirectory = Join-Path $PSScriptRoot "src\vendor\go2rtc"
+$FlatpickrVendorSourceDirectory = Join-Path $PSScriptRoot "src\vendor\flatpickr"
 $HlsSourceFile = Join-Path $PSScriptRoot "src\vendor\hls.min.js"
 $HlsLicenseSourceFile = Join-Path $PSScriptRoot "src\vendor\hls.js.LICENSE"
 $HaWwwDirectory = Join-Path $HaConfigShare "www\nvr-card"
@@ -17,6 +18,7 @@ $LiveDestinationDirectory = Join-Path $HaWwwDirectory "src\live"
 $ProviderDestinationDirectory = Join-Path $HaWwwDirectory "src\providers"
 $ReviewDestinationDirectory = Join-Path $HaWwwDirectory "src\review"
 $Go2RtcVendorDestinationDirectory = Join-Path $HaWwwDirectory "src\vendor\go2rtc"
+$FlatpickrVendorDestinationDirectory = Join-Path $HaWwwDirectory "src\vendor\flatpickr"
 $HlsDestinationFile = Join-Path $HaWwwDirectory "src\vendor\hls.min.js"
 $HlsLicenseDestinationFile = Join-Path $HaWwwDirectory "src\vendor\hls.js.LICENSE"
 
@@ -61,6 +63,11 @@ if (-not (Test-Path -LiteralPath $Go2RtcVendorSourceDirectory -PathType Containe
     exit 1
 }
 
+if (-not (Test-Path -LiteralPath $FlatpickrVendorSourceDirectory -PathType Container)) {
+    Write-Error "flatpickr vendor source directory does not exist: $FlatpickrVendorSourceDirectory"
+    exit 1
+}
+
 if (-not (Test-Path -LiteralPath $HaConfigShare -PathType Container)) {
     Write-Error "Home Assistant Samba share is not accessible: $HaConfigShare"
     exit 1
@@ -95,6 +102,7 @@ try {
         Get-ChildItem -LiteralPath $ProviderSourceDirectory -File -Filter "*.js" -ErrorAction Stop
         Get-ChildItem -LiteralPath $ReviewSourceDirectory -File -Filter "*.js" -ErrorAction Stop
         Get-ChildItem -LiteralPath $Go2RtcVendorSourceDirectory -File -ErrorAction Stop
+        Get-ChildItem -LiteralPath $FlatpickrVendorSourceDirectory -File -ErrorAction Stop
         Get-Item -LiteralPath $HlsSourceFile -ErrorAction Stop
         Get-Item -LiteralPath $HlsLicenseSourceFile -ErrorAction Stop
     ) | Sort-Object FullName
@@ -138,6 +146,8 @@ try {
     Copy-Item -Path (Join-Path $ReviewSourceDirectory "*.js") -Destination $ReviewDestinationDirectory -Force -ErrorAction Stop
     New-Item -ItemType Directory -Path $Go2RtcVendorDestinationDirectory -Force -ErrorAction Stop | Out-Null
     Copy-Item -Path (Join-Path $Go2RtcVendorSourceDirectory "*") -Destination $Go2RtcVendorDestinationDirectory -Force -ErrorAction Stop
+    New-Item -ItemType Directory -Path $FlatpickrVendorDestinationDirectory -Force -ErrorAction Stop | Out-Null
+    Copy-Item -Path (Join-Path $FlatpickrVendorSourceDirectory "*") -Destination $FlatpickrVendorDestinationDirectory -Force -ErrorAction Stop
     Copy-Item -LiteralPath $HlsSourceFile -Destination $HlsDestinationFile -Force -ErrorAction Stop
     Copy-Item -LiteralPath $HlsLicenseSourceFile -Destination $HlsLicenseDestinationFile -Force -ErrorAction Stop
 }
@@ -180,6 +190,21 @@ if (-not (Test-Path -LiteralPath $HlsDestinationFile -PathType Leaf) -or
 if (-not (Test-Path -LiteralPath (Join-Path $Go2RtcVendorDestinationDirectory "video-rtc.js") -PathType Leaf)) {
     Write-Error "Vendored go2rtc VideoRTC module was not deployed."
     exit 1
+}
+
+$FlatpickrExpectedFiles = @(
+    "flatpickr-4.6.13.min.js"
+    "flatpickr-4.6.13.min.css"
+    "LICENSE.md"
+    "UPSTREAM.md"
+)
+
+foreach ($FlatpickrExpectedFile in $FlatpickrExpectedFiles) {
+    $FlatpickrDestinationFile = Join-Path $FlatpickrVendorDestinationDirectory $FlatpickrExpectedFile
+    if (-not (Test-Path -LiteralPath $FlatpickrDestinationFile -PathType Leaf)) {
+        Write-Error "Vendored flatpickr file was not deployed: $FlatpickrDestinationFile"
+        exit 1
+    }
 }
 
 $DestinationSize = (Get-Item -LiteralPath $DestinationFile).Length

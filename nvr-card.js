@@ -3,7 +3,7 @@
 */
 
 import { FrigateProvider } from "./src/providers/frigate-provider.js";
-import { ReviewController } from "./src/review/review-controller.js";
+import { ReviewController } from "./src/review/review-controller.js?v=__NVR_BUILD__";
 
 const NVR_BUILD = "__NVR_BUILD__";
 const USE_HA_HUI_IMAGE_EXPERIMENT = true;
@@ -1985,6 +1985,7 @@ class NVRCard extends HTMLElement {
     });
 
     this.config = config;
+    this._reviewController.setDebug(config.review_debug === true);
     if (JSON.stringify(this._autoDimConfig) !== JSON.stringify(normalized.autoDim)) {
       this.applyAutoDimConfig(normalized.autoDim);
     }
@@ -2788,7 +2789,7 @@ class NVRCard extends HTMLElement {
       <ha-card>
         <div class="nvr-shell">
 
-          <header class="card-title-bar">
+          <div class="sidebar-rail-top">
             <button
               type="button"
               class="sidebar-toggle"
@@ -2796,29 +2797,25 @@ class NVRCard extends HTMLElement {
               title="Collapse sidebar"
               aria-expanded="true"
             >
-              <svg
-                viewBox="0 0 24 24"
-                aria-hidden="true"
-              >
-                <rect
-                  x="3.5"
-                  y="4.5"
-                  width="17"
-                  height="15"
-                  rx="2"
-                ></rect>
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <rect x="3.5" y="4.5" width="17" height="15" rx="2"></rect>
                 <path d="M9 5v14"></path>
               </svg>
             </button>
+          </div>
 
-            <div class="card-title">NVR Card</div>
-            <span class="build-identifier">
-              ${NVR_BUILD}
-            </span>
+          <header class="card-title-bar">
             <div class="application-mode-control" role="group" aria-label="NVR mode">
-              <button type="button" data-application-mode="live">Live</button>
-              <button type="button" data-application-mode="review">Review</button>
+              <button type="button" data-application-mode="live">
+                <ha-icon icon="mdi:cctv" aria-hidden="true"></ha-icon>
+                <span>Live</span>
+              </button>
+              <button type="button" data-application-mode="review">
+                <ha-icon icon="mdi:history" aria-hidden="true"></ha-icon>
+                <span>Review</span>
+              </button>
             </div>
+            <div class="review-header-transport" hidden></div>
           </header>
 
           <aside class="camera-list nvr-sidebar">
@@ -2832,6 +2829,8 @@ class NVRCard extends HTMLElement {
                 type="button"
                 class="sidebar-section-header"
                 data-section="cameras"
+                aria-label="Cameras"
+                title="Cameras"
                 aria-expanded="${this._sidebarSections.cameras}"
               >
                 <span class="section-title">
@@ -2867,6 +2866,8 @@ class NVRCard extends HTMLElement {
                 type="button"
                 class="sidebar-section-header"
                 data-section="layouts"
+                aria-label="Layouts"
+                title="Layouts"
                 aria-expanded="${this._sidebarSections.layouts}"
               >
                 <span class="section-title">
@@ -2900,6 +2901,8 @@ class NVRCard extends HTMLElement {
                 type="button"
                 class="sidebar-section-header"
                 data-section="views"
+                aria-label="Views"
+                title="Views"
                 aria-expanded="${this._sidebarSections.views}"
               >
                 <span class="section-title">
@@ -2951,6 +2954,11 @@ class NVRCard extends HTMLElement {
           <section class="review-surface" hidden></section>
 
 
+          <footer class="sidebar-rail-footer">
+            <span class="build-identifier">${NVR_BUILD}</span>
+          </footer>
+
+
           <div
             class="camera-context-menu"
             hidden
@@ -2973,6 +2981,8 @@ class NVRCard extends HTMLElement {
 
 
     style.textContent = `
+      @import url("/local/nvr-card/src/vendor/flatpickr/flatpickr-4.6.13.min.css");
+
       ha-card {
         isolation: isolate;
 
@@ -2999,13 +3009,25 @@ class NVRCard extends HTMLElement {
 
 
       .nvr-shell {
+        --nvr-sidebar-width: 240px;
+        --nvr-sidebar-icon-size: 26px;
+        --nvr-sidebar-touch-target: 44px;
+        --nvr-sidebar-collapsed-padding: 6px;
+        --nvr-sidebar-collapsed-width: calc(
+          var(--nvr-sidebar-touch-target) +
+          (2 * var(--nvr-sidebar-collapsed-padding))
+        );
+        --nvr-sidebar-current-width: var(--nvr-sidebar-width);
+        --nvr-sidebar-divider: #52606b;
+        --nvr-content-padding: 4px;
+
         width: 100%;
         height: 100%;
 
         display: grid;
 
         grid-template-columns:
-          190px
+          var(--nvr-sidebar-current-width)
           minmax(0, 1fr);
 
         grid-template-rows:
@@ -3013,17 +3035,38 @@ class NVRCard extends HTMLElement {
           minmax(0, 1fr);
 
         grid-template-areas:
-          "title title"
+          "rail-title title"
           "cameras video";
 
         position: relative;
+        transition: grid-template-columns 160ms ease;
       }
 
 
       .nvr-shell.sidebar-collapsed {
+        --nvr-sidebar-current-width: var(--nvr-sidebar-collapsed-width);
         grid-template-columns:
-          0
+          var(--nvr-sidebar-current-width)
           minmax(0, 1fr);
+      }
+
+
+      .sidebar-rail-top {
+        grid-area: rail-title;
+        min-width: 0;
+        display: flex;
+        align-items: center;
+        justify-content: flex-start;
+        padding: 0 6px 0 5px;
+        background: #11161c;
+        border-right: 1px solid var(--nvr-sidebar-divider);
+        box-sizing: border-box;
+      }
+
+
+      .nvr-shell.sidebar-collapsed .sidebar-rail-top {
+        justify-content: flex-start;
+        padding: 0 var(--nvr-sidebar-collapsed-padding) 0 5px;
       }
 
 
@@ -3042,43 +3085,70 @@ class NVRCard extends HTMLElement {
         border-bottom: 1px solid #26313b;
 
         box-sizing: border-box;
-      }
-
-
-      .card-title {
-        margin-left: 4px;
-
-        overflow: hidden;
-
-        color: #e4e9ed;
-
-        font-size: 15px;
-        font-weight: 600;
-
-        text-overflow: ellipsis;
-        white-space: nowrap;
+        position: relative;
       }
 
       .application-mode-control {
         display: flex;
         gap: 3px;
-        margin-left: 14px;
+        margin-left: auto;
+        position: relative;
+        z-index: 2;
       }
 
-      .application-mode-control button,
-      .review-toolbar button,
-      .review-toolbar input,
-      .review-toolbar select {
+      .application-mode-control button {
+        display: inline-flex;
+        width: 92px;
+        min-height: 34px;
+        padding: 0 10px;
+        align-items: center;
+        justify-content: center;
+        gap: 7px;
         border: 1px solid #3b4954;
         border-radius: 3px;
-        background: #1a2229;
-        color: #dce6ec;
-        padding: 5px 8px;
+        background: #171f26;
+        color: #aebbc4;
+        box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.015);
+        font-size: 12px;
+        font-weight: 600;
+        letter-spacing: 0.02em;
+        cursor: pointer;
       }
 
       .application-mode-control button.selected {
         border-color: #56a7d8;
         background: #24475b;
+        color: #fff;
+        box-shadow: inset 0 -2px 0 #6bbce9;
+      }
+
+      .application-mode-control button:hover:not(.selected),
+      .application-mode-control button:focus-visible {
+        border-color: #587083;
+        background: #1c2831;
+        color: #e5f2fa;
+        outline: none;
+      }
+
+      .application-mode-control ha-icon {
+        --mdc-icon-size: 18px;
+      }
+
+      .review-header-transport {
+        position: absolute;
+        top: 0;
+        right: clamp(310px, 27vw, 410px);
+        bottom: 0;
+        left: 0;
+        z-index: 1;
+        display: grid;
+        min-width: 0;
+        place-items: center;
+        pointer-events: none;
+      }
+
+      .review-header-transport[hidden] {
+        display: none !important;
       }
 
       .review-surface {
@@ -3086,8 +3156,8 @@ class NVRCard extends HTMLElement {
         grid-row: 2;
         min-width: 0;
         min-height: 0;
-        padding: 10px;
-        overflow: auto;
+        padding: 0;
+        overflow: hidden;
         background: #090c0f;
         box-sizing: border-box;
       }
@@ -3098,59 +3168,348 @@ class NVRCard extends HTMLElement {
         display: none !important;
       }
 
-      .review-toolbar,
-      .review-selection {
-        display: flex;
-        flex-wrap: wrap;
-        align-items: center;
-        gap: 8px;
-      }
-
-      .review-target {
-        min-width: 245px;
-      }
-
-      .review-status {
-        margin: 8px 0;
-        color: #aebbc4;
-        white-space: pre-wrap;
-        font: 12px/1.4 monospace;
-      }
-
-      .review-status.error,
-      .review-camera-status.unavailable {
-        color: #ef7770;
-      }
-
-      .review-primary {
-        max-width: 1100px;
-        margin: 0 auto;
-      }
-
-      .review-secondary-strip {
+      .review-product {
         display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-        gap: 8px;
-        margin-top: 8px;
+        grid-template-columns: var(--nvr-sidebar-current-width) minmax(360px, 1fr) clamp(310px, 27vw, 410px);
+        width: 100%;
+        height: 100%;
+        min-height: 0;
+        overflow: hidden;
+        color: #dce6ec;
+        transition: grid-template-columns 160ms ease;
       }
 
-      .review-camera-panel {
+      .review-when-controls button,
+      .review-when-controls input,
+      .review-filter-controls input,
+      .review-diagnostics button,
+      .review-transport button,
+      .review-rhs-modes button {
+        min-height: 44px;
+        border: 1px solid #3b4954;
+        border-radius: 4px;
+        background: #171f26;
+        color: #dce6ec;
+        box-sizing: border-box;
+      }
+
+      .review-control-rail,
+      .review-rhs {
         min-width: 0;
-        border: 1px solid #26313b;
+        min-height: 0;
         background: #11161c;
       }
 
-      .review-camera-heading {
-        padding: 5px 7px;
+      .review-control-rail {
+        overflow: auto;
+        box-sizing: border-box;
+      }
+
+      .review-product > .review-control-rail {
+        grid-area: auto;
+      }
+
+      .review-section-content {
+        padding: 8px 0 2px;
+        color: #cbd2d7;
+        font-family: inherit;
+        font-size: 14px;
+      }
+
+      .review-control-rail .sidebar-section:not(.expanded)
+      > .sidebar-section-body {
+        display: none !important;
+      }
+
+      .review-filter-controls label {
+        display: flex;
+        min-height: 44px;
+        align-items: center;
+        gap: 8px;
+        color: #cbd2d7;
+        font-size: 14px;
+      }
+
+      .review-filter-controls input {
+        min-height: auto;
+        width: 18px;
+        height: 18px;
+        margin: 0;
+      }
+
+      .review-camera-control .review-participation {
+        width: 14px;
+        height: 14px;
+        min-height: 14px;
+        flex: 0 0 14px;
+        margin: 0 0 0 auto;
+        accent-color: #4caf70;
+        cursor: pointer;
+      }
+
+      .review-when-controls {
+        display: grid;
+        grid-template-columns: 44px minmax(0, 1fr) 44px;
+        gap: 5px;
+      }
+
+      .review-date-picker-field {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) 30px;
+        min-width: 0;
+        gap: 4px;
+      }
+
+      .review-date-picker-field .review-day-picker {
+        min-width: 0;
+        padding: 0 6px;
+        background: #171f26;
         color: #dce6ec;
+        caret-color: #fff;
+        -webkit-text-fill-color: #dce6ec;
+        text-align: center;
+      }
+
+      .review-date-picker-field .review-day-picker:focus {
+        border-color: #568db3;
+        outline: none;
+      }
+
+      .review-when-controls .review-calendar-button {
+        width: 30px;
+        min-height: 44px;
+        padding: 0;
+        display: grid;
+        place-items: center;
+      }
+
+      .review-calendar-button ha-icon {
+        --mdc-icon-size: 18px;
+      }
+
+      .review-surface .flatpickr-calendar {
+        border: 1px solid #3b4954;
+        background: #171f26;
+        color: #dce6ec;
+        box-shadow: 0 6px 18px rgba(0, 0, 0, 0.55);
+      }
+
+      .review-surface .flatpickr-months,
+      .review-surface .flatpickr-current-month,
+      .review-surface .flatpickr-weekday,
+      .review-surface .flatpickr-day {
+        color: #dce6ec;
+        fill: #dce6ec;
+      }
+
+      .review-surface .flatpickr-prev-month,
+      .review-surface .flatpickr-next-month {
+        color: #dce6ec;
+        fill: #dce6ec;
+      }
+
+      .review-surface .flatpickr-day:hover,
+      .review-surface .flatpickr-day:focus {
+        border-color: #315b78;
+        background: #20384a;
+      }
+
+      .review-surface .flatpickr-day.selected,
+      .review-surface .flatpickr-day.selected:hover,
+      .review-surface .flatpickr-day.selected:focus {
+        border-color: #003a70;
+        background: #003a70;
+        color: #fff;
+      }
+
+      .review-surface .flatpickr-day.flatpickr-disabled,
+      .review-surface .flatpickr-day.prevMonthDay,
+      .review-surface .flatpickr-day.nextMonthDay {
+        color: #667681;
+      }
+
+      .review-surface .flatpickr-current-month input.cur-year,
+      .review-surface .flatpickr-current-month .flatpickr-monthDropdown-months {
+        background: #171f26;
+        color: #dce6ec;
+      }
+
+      .review-when-controls button {
+        color: #cbd2d7;
+      }
+
+      .review-when-controls button:disabled {
+        color: #70808c;
+        -webkit-text-fill-color: #70808c;
+      }
+
+      .review-filter-controls {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+      }
+
+      .review-diagnostics button {
+        width: 100%;
+        padding: 0 8px;
+      }
+
+      .review-diagnostic-output {
+        margin: 8px 0 0;
+        overflow-wrap: anywhere;
+        white-space: pre-wrap;
+        color: #9fb0ba;
+        font: 11px/1.4 monospace;
+      }
+
+      .review-media-workspace {
+        display: block;
+        height: 100%;
+        min-width: 0;
+        min-height: 0;
+        padding: var(--nvr-content-padding);
+        overflow: hidden;
+        background: #090c0f;
+        box-sizing: border-box;
+      }
+
+      .review-transport {
+        display: flex;
+        min-width: 0;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        pointer-events: auto;
+      }
+
+      .review-transport-controls {
+        display: flex;
+        gap: 2px;
+      }
+
+      .review-transport button {
+        width: 32px;
+        min-height: 30px;
+        height: 30px;
+        padding: 0;
+        display: grid;
+        place-items: center;
+        border: 1px solid #3b5263;
+        border-radius: 3px;
+        background: #172029;
+        color: #c7d6df;
+        cursor: pointer;
+      }
+
+      .review-transport button:hover:not(:disabled),
+      .review-transport button:focus-visible,
+      .review-transport button.selected {
+        border-color: #568db3;
+        background: #1c303e;
+        color: #fff;
+      }
+
+      .review-transport button:disabled {
+        border-color: #293640;
+        background: #12191f;
+        color: #53616b;
+        cursor: default;
+      }
+
+      .review-transport button ha-icon {
+        --mdc-icon-size: 18px;
+      }
+
+      .review-transport .review-now {
+        width: 32px;
+      }
+
+      .review-clock-display {
+        max-width: 190px;
+        overflow: hidden;
+        color: #c8d3da;
+        text-align: center;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-size: 13px;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .review-camera-wall {
+        display: grid;
+        grid-template-rows: minmax(0, 58fr) minmax(0, 42fr);
+        width: 100%;
+        height: 100%;
+        min-width: 0;
+        min-height: 0;
+        gap: 1px;
+        border: 1px solid #fff;
+        background: #fff;
+        overflow: hidden;
+        box-sizing: border-box;
+      }
+
+      .review-primary {
+        min-width: 0;
+        min-height: 0;
+        overflow: hidden;
+      }
+
+      .review-mini-grid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        grid-template-rows: repeat(3, minmax(0, 1fr));
+        min-width: 0;
+        min-height: 0;
+        gap: 1px;
+        background: #fff;
+        overflow: hidden;
+      }
+
+      .review-camera-panel {
+        position: relative;
+        min-width: 0;
+        min-height: 0;
+        background: #000;
+        overflow: hidden;
+        box-sizing: border-box;
+      }
+
+      .review-camera-panel.primary {
+        width: 100%;
+        height: 100%;
+      }
+
+      .review-camera-panel.secondary {
+        cursor: pointer;
+      }
+
+      .review-camera-heading {
+        position: absolute;
+        top: 6px;
+        left: 7px;
+        z-index: 5;
+        padding: 3px 6px;
+        background: rgba(0, 0, 0, 0.68);
+        color: #fff;
         font-size: 12px;
+        font-weight: 500;
+        line-height: 1.2;
+        pointer-events: none;
       }
 
       .review-camera-media {
         position: relative;
-        aspect-ratio: 16 / 9;
+        width: 100%;
+        height: 100%;
         overflow: hidden;
         background: #000;
+      }
+
+      .review-mini-blank {
+        min-width: 0;
+        min-height: 0;
+        background: #000;
+        box-sizing: border-box;
       }
 
       .review-live-camera,
@@ -3158,7 +3517,12 @@ class NVRCard extends HTMLElement {
         display: block;
         width: 100%;
         height: 100%;
+        min-width: 0;
+        min-height: 0;
+        max-width: 100%;
+        max-height: 100%;
         object-fit: contain;
+        overflow: hidden;
       }
 
       .review-camera-status {
@@ -3169,6 +3533,99 @@ class NVRCard extends HTMLElement {
         background: rgba(0, 0, 0, 0.72);
         color: #dce6ec;
         font: 11px/1.3 monospace;
+      }
+
+      .review-camera-status.unavailable {
+        color: #ef7770;
+      }
+
+      .review-empty-state {
+        display: grid;
+        width: 100%;
+        height: 100%;
+        min-height: 0;
+        place-items: center;
+        border: 1px dashed #34414b;
+        color: #8fa0aa;
+      }
+
+      .review-rhs {
+        display: grid;
+        grid-template-rows: auto 1fr;
+        border-left: 1px solid #26313b;
+        overflow: hidden;
+      }
+
+      .review-rhs-modes {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 3px;
+        padding: 8px;
+        border-bottom: 1px solid #26313b;
+      }
+
+      .review-rhs-modes button.selected {
+        border-color: #56a7d8;
+        background: #24475b;
+      }
+
+      .review-rhs-content {
+        min-height: 0;
+        overflow: auto;
+      }
+
+      .review-placeholder {
+        display: flex;
+        min-height: 240px;
+        padding: 26px;
+        align-items: center;
+        flex-direction: column;
+        justify-content: center;
+        gap: 8px;
+        color: #8fa0aa;
+        text-align: center;
+      }
+
+      .review-placeholder strong {
+        color: #dce6ec;
+        font-size: 16px;
+      }
+
+      @media (max-width: 1099px) {
+        .review-product {
+          grid-template-columns: var(--nvr-sidebar-current-width) minmax(360px, 1fr) minmax(280px, 38vw);
+        }
+
+        .review-rhs {
+          grid-column: 3;
+        }
+      }
+
+      @media (max-width: 699px) {
+        .review-surface {
+          overflow: auto;
+        }
+
+        .review-product {
+          display: flex;
+          height: auto;
+          flex-direction: column;
+          overflow: visible;
+        }
+
+        .review-product > .review-control-rail {
+          display: block;
+        }
+
+        .review-media-workspace {
+          min-height: 620px;
+          overflow: visible;
+        }
+
+        .review-rhs {
+          border-top: 1px solid #26313b;
+          border-left: 0;
+        }
       }
 
 
@@ -3186,9 +3643,9 @@ class NVRCard extends HTMLElement {
 
         background: #11161c;
 
-        border-right: 1px solid #26313b;
+        border-right: 1px solid var(--nvr-sidebar-divider);
 
-        padding: 14px;
+        padding: 0 14px 44px;
 
         overflow-x: hidden;
         overflow-y: auto;
@@ -3199,24 +3656,22 @@ class NVRCard extends HTMLElement {
         overscroll-behavior-y: contain;
         -webkit-overflow-scrolling: touch;
 
-        transition: transform 160ms ease;
+        box-sizing: border-box;
+        transition: width 160ms ease;
       }
 
 
       .nvr-shell.sidebar-collapsed
       > .camera-list {
-        visibility: hidden;
-        pointer-events: none;
-
-        transform: translateX(-100%);
+        padding: 0 var(--nvr-sidebar-collapsed-padding) 0 5px;
       }
 
 
       .sidebar-toggle {
-        width: 42px;
-        height: 42px;
+        width: var(--nvr-sidebar-touch-target);
+        height: var(--nvr-sidebar-touch-target);
 
-        flex: 0 0 42px;
+        flex: 0 0 var(--nvr-sidebar-touch-target);
 
         padding: 0;
 
@@ -3224,10 +3679,11 @@ class NVRCard extends HTMLElement {
         place-items: center;
 
         background: transparent;
-        color: #aab8c2;
+        color: #6faed9;
 
         border: 0;
         border-radius: 4px;
+        text-decoration: none;
 
         cursor: pointer;
       }
@@ -3243,8 +3699,8 @@ class NVRCard extends HTMLElement {
 
 
       .sidebar-toggle svg {
-        width: 22px;
-        height: 22px;
+        width: var(--nvr-sidebar-icon-size);
+        height: var(--nvr-sidebar-icon-size);
 
         fill: none;
         stroke: currentColor;
@@ -3268,8 +3724,31 @@ class NVRCard extends HTMLElement {
 
 
       .nvr-shell.phone-layout
+      > .sidebar-rail-top {
+        width: var(--nvr-sidebar-current-width);
+        height: 44px;
+        position: absolute;
+        top: 0;
+        left: 0;
+        z-index: 101;
+      }
+
+
+      .nvr-shell.phone-layout
+      > .sidebar-rail-footer {
+        width: var(--nvr-sidebar-current-width);
+      }
+
+
+      .nvr-shell.phone-layout
+      > .card-title-bar {
+        padding-left: calc(var(--nvr-sidebar-current-width) + 4px);
+      }
+
+
+      .nvr-shell.phone-layout
       > .camera-list {
-        width: 190px;
+        width: var(--nvr-sidebar-current-width);
         height: calc(100% - 44px);
 
         position: absolute;
@@ -3317,7 +3796,7 @@ class NVRCard extends HTMLElement {
 
       .sidebar-section-header {
         width: 100%;
-        min-height: 42px;
+        min-height: var(--nvr-sidebar-touch-target);
 
         display: flex;
         align-items: center;
@@ -3328,7 +3807,6 @@ class NVRCard extends HTMLElement {
         background: transparent;
 
         border: 0;
-        border-bottom: 1px solid #26313b;
 
         color: #6faed9;
 
@@ -3339,6 +3817,7 @@ class NVRCard extends HTMLElement {
         letter-spacing: 0.08em;
 
         text-align: left;
+        text-decoration: none;
 
         cursor: pointer;
       }
@@ -3370,9 +3849,29 @@ class NVRCard extends HTMLElement {
 
 
       .section-title ha-icon {
-        --mdc-icon-size: 17px;
+        --mdc-icon-size: var(--nvr-sidebar-icon-size);
 
         flex: 0 0 auto;
+      }
+
+
+      .nvr-shell.sidebar-collapsed .camera-list .sidebar-section-body,
+      .nvr-shell.sidebar-collapsed .camera-list .section-title > span,
+      .nvr-shell.sidebar-collapsed .camera-list .section-indicator {
+        display: none !important;
+      }
+
+
+      .nvr-shell.sidebar-collapsed .camera-list .sidebar-section-header {
+        width: var(--nvr-sidebar-touch-target);
+        min-height: var(--nvr-sidebar-touch-target);
+        justify-content: center;
+      }
+
+
+      .nvr-shell.sidebar-collapsed .camera-list .section-title {
+        justify-content: center;
+        gap: 0;
       }
 
 
@@ -3380,9 +3879,9 @@ class NVRCard extends HTMLElement {
         width: 0;
         height: 0;
 
-        border-top: 4.375px solid transparent;
-        border-bottom: 4.375px solid transparent;
-        border-left: 7.5px solid #6f8798;
+        border-top: 6px solid transparent;
+        border-bottom: 6px solid transparent;
+        border-left: 10px solid #6f8798;
 
         transform-origin: center;
       }
@@ -3710,7 +4209,7 @@ class NVRCard extends HTMLElement {
 
         background: #000;
 
-        padding: 4px;
+        padding: var(--nvr-content-padding);
       }
 
 
@@ -3945,8 +4444,6 @@ class NVRCard extends HTMLElement {
       .build-identifier {
         flex: 0 0 auto;
 
-        margin-left: 8px;
-
         color: #808080;
 
         font-size: 11.25px;
@@ -3954,6 +4451,28 @@ class NVRCard extends HTMLElement {
         white-space: nowrap;
 
         pointer-events: none;
+      }
+
+
+      .sidebar-rail-footer {
+        grid-column: 1;
+        grid-row: 2;
+        align-self: end;
+        z-index: 3;
+        min-width: 0;
+        min-height: 36px;
+        display: flex;
+        align-items: center;
+        padding: 0 14px;
+        overflow: hidden;
+        background: #11161c;
+        border-right: 1px solid var(--nvr-sidebar-divider);
+        box-sizing: border-box;
+      }
+
+
+      .nvr-shell.sidebar-collapsed .sidebar-rail-footer {
+        display: none;
       }
 
 
@@ -4065,7 +4584,10 @@ class NVRCard extends HTMLElement {
 
     this._reviewController.configure(this._cameras);
     this._reviewController.setHass(this._hass);
-    this._reviewController.mount(this.querySelector(".review-surface"));
+    this._reviewController.mount(
+      this.querySelector(".review-surface"),
+      this.querySelector(".review-header-transport")
+    );
     this.setApplicationMode(this._applicationMode, true);
 
     this.installResizeObserver();
@@ -6865,28 +7387,60 @@ class NVRCard extends HTMLElement {
 
 
   attachSidebarHandlers() {
-    const sidebar =
-      this.querySelector(".nvr-sidebar");
+    const shell =
+      this.querySelector(".nvr-shell");
 
-    if (!sidebar) {
+    if (!shell) {
       return;
     }
 
-    sidebar.addEventListener(
+    shell.addEventListener(
       "click",
       event => {
         const header =
-          event.target.closest(
-            ".sidebar-section-header"
+          event.composedPath().find(
+            node => node?.classList?.contains(
+              "sidebar-section-header"
+            )
           );
 
-        if (!header) {
+        if (!header || !shell.contains(header)) {
           return;
         }
 
-        this.toggleSidebarSection(
-          header.dataset.section
+        const liveSection = header.dataset.section;
+        const reviewSection = header.dataset.reviewSection;
+        const collapsed = shell.classList.contains(
+          "sidebar-collapsed"
         );
+
+        if (collapsed) {
+          this._sidebarCollapsed = false;
+
+          if (reviewSection) {
+            this._reviewController.setSectionExpanded(
+              reviewSection,
+              true
+            );
+          } else if (liveSection) {
+            this.setSidebarSectionExpanded(
+              liveSection,
+              true
+            );
+          }
+
+          this.updateResponsiveShell();
+          this.scheduleCameraFit();
+          return;
+        }
+
+        if (reviewSection) {
+          this._reviewController.toggleSection(
+            reviewSection
+          );
+        } else if (liveSection) {
+          this.toggleSidebarSection(liveSection);
+        }
       }
     );
   }
@@ -6923,13 +7477,13 @@ class NVRCard extends HTMLElement {
     const shell =
       this.querySelector(".nvr-shell");
 
-    const sidebar =
-      this.querySelector(".nvr-sidebar");
+    const sidebars =
+      this.querySelectorAll(".nvr-sidebar");
 
     const button =
       this.querySelector(".sidebar-toggle");
 
-    if (!shell || !sidebar || !button) {
+    if (!shell || sidebars.length === 0 || !button) {
       return;
     }
 
@@ -6951,10 +7505,13 @@ class NVRCard extends HTMLElement {
       collapsed
     );
 
-    sidebar.setAttribute(
-      "aria-hidden",
-      String(collapsed)
-    );
+    sidebars.forEach(sidebar => {
+      const reviewSurface = sidebar.closest(".review-surface");
+      sidebar.setAttribute(
+        "aria-hidden",
+        String(sidebar.hidden || reviewSurface?.hidden === true)
+      );
+    });
 
     button.setAttribute(
       "aria-expanded",
@@ -6978,20 +7535,25 @@ class NVRCard extends HTMLElement {
 
 
   toggleSidebarSection(sectionName) {
+    return this.setSidebarSectionExpanded(
+      sectionName,
+      !this._sidebarSections[sectionName]
+    );
+  }
+
+
+  setSidebarSectionExpanded(sectionName, expanded) {
     if (
       !Object.prototype.hasOwnProperty.call(
         this._sidebarSections,
         sectionName
       )
     ) {
-      return;
+      return false;
     }
 
-    const expanded =
-      !this._sidebarSections[sectionName];
-
     this._sidebarSections[sectionName] =
-      expanded;
+      Boolean(expanded);
 
     const section =
       this.querySelector(
@@ -6999,7 +7561,7 @@ class NVRCard extends HTMLElement {
       );
 
     if (!section) {
-      return;
+      return false;
     }
 
     const header =
@@ -7014,19 +7576,21 @@ class NVRCard extends HTMLElement {
 
     section.classList.toggle(
       "expanded",
-      expanded
+      this._sidebarSections[sectionName]
     );
 
     if (header) {
       header.setAttribute(
         "aria-expanded",
-        String(expanded)
+        String(this._sidebarSections[sectionName])
       );
     }
 
     if (body) {
-      body.hidden = !expanded;
+      body.hidden = !this._sidebarSections[sectionName];
     }
+
+    return true;
 
   }
 
@@ -7825,11 +8389,9 @@ class NVRCard extends HTMLElement {
     const reviewActive = mode === "review";
     const sidebar = this.querySelector(".nvr-sidebar");
     const main = this.querySelector(".main-area");
-    const sidebarToggle = this.querySelector(".sidebar-toggle");
 
     if (sidebar) sidebar.hidden = reviewActive;
     if (main) main.hidden = reviewActive;
-    if (sidebarToggle) sidebarToggle.hidden = reviewActive;
 
     if (reviewActive) {
       this._reviewController.activate();
@@ -7837,6 +8399,7 @@ class NVRCard extends HTMLElement {
       this._reviewController.deactivate();
       this.scheduleCameraFit();
     }
+    this.updateResponsiveShell();
 
     this.querySelectorAll("[data-application-mode]").forEach(button => {
       const selected = button.dataset.applicationMode === mode;

@@ -2490,15 +2490,18 @@ test("malformed saved-view storage does not affect LAST VIEW restoration", t => 
   );
 });
 
-test("title keeps the build identifier adjacent and omits Clear Grid", t => {
+test("rail omits a title and retains its build footer outside the application header", t => {
   const harness = setup(t);
   const card = harness.createCard();
-  const title = card.querySelector(".card-title");
   const build = card.querySelector(".build-identifier");
 
-  assert.equal(title?.textContent, "NVR Card");
-  assert.strictEqual(build?.previousElementSibling, title);
-  assert.strictEqual(build?.parentElement, title?.parentElement);
+  assert.equal(card.querySelector(".sidebar-rail-title"), null);
+  assert.strictEqual(
+    card.querySelector(".sidebar-rail-top")?.firstElementChild,
+    card.querySelector(".sidebar-toggle")
+  );
+  assert.strictEqual(build?.parentElement, card.querySelector(".sidebar-rail-footer"));
+  assert.equal(card.querySelector(".card-title-bar .build-identifier"), null);
   assert.equal(card.querySelector(".clear-button"), null);
 });
 
@@ -3398,7 +3401,7 @@ test("sidebar and 600px responsive transitions preserve every player and cell", 
   assert.equal(shell.classList.contains("phone-layout"), true);
   assert.equal(shell.classList.contains("sidebar-collapsed"), true);
   assert.equal(toggle.getAttribute("aria-expanded"), "false");
-  assert.equal(sidebar.getAttribute("aria-hidden"), "true");
+  assert.equal(sidebar.getAttribute("aria-hidden"), "false");
   assertIdentitiesUnchanged(harness, card, cameraNames, before);
 
   harness.setShellWidth(card, 601);
@@ -3414,7 +3417,7 @@ test("sidebar and 600px responsive transitions preserve every player and cell", 
 
   assert.equal(shell.classList.contains("sidebar-collapsed"), true);
   assert.equal(toggle.getAttribute("aria-expanded"), "false");
-  assert.equal(sidebar.getAttribute("aria-hidden"), "true");
+  assert.equal(sidebar.getAttribute("aria-hidden"), "false");
   assertIdentitiesUnchanged(harness, card, cameraNames, before);
 
   toggle.click();

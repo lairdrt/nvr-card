@@ -5,6 +5,17 @@ The original NVR Card project code is separately intended to be distributed
 under GPL-3.0-or-later. The components below retain their applicable upstream
 licenses.
 
+## flatpickr
+
+- Upstream project: [flatpickr/flatpickr](https://github.com/flatpickr/flatpickr)
+- Repository components: `src/vendor/flatpickr/flatpickr-4.6.13.min.js` and
+  `src/vendor/flatpickr/flatpickr-4.6.13.min.css`
+- Version: 4.6.13
+- License: MIT
+
+The upstream license and package provenance are retained in
+`src/vendor/flatpickr/LICENSE.md` and `src/vendor/flatpickr/UPSTREAM.md`.
+
 ## go2rtc VideoRTC
 
 - Upstream project: [AlexxIT/go2rtc](https://github.com/AlexxIT/go2rtc)
