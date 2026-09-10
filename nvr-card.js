@@ -395,218 +395,7 @@ class NVRCard extends HTMLElement {
       reason: "constructor-initialization"
     });
 
-    this.layouts = {
-      "1x1": {
-        label: "1x1",
-        columns: "1fr",
-        rows: "1fr",
-        cells: [
-          { slot: 0 }
-        ]
-      },
-
-      "2x2": {
-        label: "2x2",
-        columns: "repeat(2, 1fr)",
-        rows: "repeat(2, 1fr)",
-        cells: [
-          { slot: 0 },
-          { slot: 1 },
-          { slot: 2 },
-          { slot: 3 }
-        ]
-      },
-
-      "3x3": {
-        label: "3x3",
-        columns: "repeat(3, 1fr)",
-        rows: "repeat(3, 1fr)",
-        cells: Array.from(
-          { length: 9 },
-          (_, i) => ({ slot: i })
-        )
-      },
-
-      "4x4": {
-        label: "4x4",
-        columns: "repeat(4, 1fr)",
-        rows: "repeat(4, 1fr)",
-        cells: Array.from(
-          { length: NVR_GRID_SLOT_CAPACITY },
-          (_, i) => ({ slot: i })
-        )
-      },
-
-      "large3": {
-        label: "Large+3",
-        columns: "repeat(2, 1fr)",
-        rows: "repeat(3, 1fr)",
-        cells: [
-          {
-            slot: 0,
-            column: "1",
-            row: "1 / span 2"
-          },
-          {
-            slot: 1,
-            column: "2",
-            row: "1"
-          },
-          {
-            slot: 2,
-            column: "2",
-            row: "2"
-          },
-          {
-            slot: 3,
-            column: "1 / span 2",
-            row: "3"
-          }
-        ]
-      },
-
-      "large5": {
-        label: "Large+5",
-        columns: "repeat(3, 1fr)",
-        rows: "repeat(3, 1fr)",
-        cells: [
-          {
-            slot: 0,
-            column: "1 / span 2",
-            row: "1 / span 2"
-          },
-          {
-            slot: 1,
-            column: "3",
-            row: "1"
-          },
-          {
-            slot: 2,
-            column: "3",
-            row: "2"
-          },
-          {
-            slot: 3,
-            column: "1",
-            row: "3"
-          },
-          {
-            slot: 4,
-            column: "2",
-            row: "3"
-          },
-          {
-            slot: 5,
-            column: "3",
-            row: "3"
-          }
-        ]
-      },
-
-      "large7": {
-        label: "Large+7",
-        columns: "repeat(4, 1fr)",
-        rows: "repeat(4, 1fr)",
-        cells: [
-          {
-            slot: 0,
-            column: "1 / span 3",
-            row: "1 / span 3"
-          },
-          {
-            slot: 1,
-            column: "4",
-            row: "1"
-          },
-          {
-            slot: 2,
-            column: "4",
-            row: "2"
-          },
-          {
-            slot: 3,
-            column: "4",
-            row: "3"
-          },
-          {
-            slot: 4,
-            column: "1",
-            row: "4"
-          },
-          {
-            slot: 5,
-            column: "2",
-            row: "4"
-          },
-          {
-            slot: 6,
-            column: "3",
-            row: "4"
-          },
-          {
-            slot: 7,
-            column: "4",
-            row: "4"
-          }
-        ]
-      },
-
-      "topwide": {
-        label: "Top Wide",
-        columns: "repeat(3, 1fr)",
-        rows: "repeat(3, 1fr)",
-        cells: [
-          {
-            slot: 0,
-            column: "1 / span 3",
-            row: "1 / span 2"
-          },
-          {
-            slot: 1,
-            column: "1",
-            row: "3"
-          },
-          {
-            slot: 2,
-            column: "2",
-            row: "3"
-          },
-          {
-            slot: 3,
-            column: "3",
-            row: "3"
-          }
-        ]
-      },
-
-      "leftwide": {
-        label: "Left Wide",
-        columns: "repeat(3, 1fr)",
-        rows: "repeat(3, 1fr)",
-        cells: [
-          {
-            slot: 0,
-            column: "1 / span 2",
-            row: "1 / span 3"
-          },
-          {
-            slot: 1,
-            column: "3",
-            row: "1"
-          },
-          {
-            slot: 2,
-            column: "3",
-            row: "2"
-          },
-          {
-            slot: 3,
-            column: "3",
-            row: "3"
-          }
-        ]
-      }
-    };
+    this.layouts = ReviewController.VIEWER_LAYOUTS;
   }
 
 
@@ -3210,7 +2999,7 @@ class NVRCard extends HTMLElement {
       }
 
       .review-section-content {
-        padding: 8px 0 2px;
+        padding: 8px 6px 2px;
         color: #cbd2d7;
         font-family: inherit;
         font-size: 14px;
@@ -3237,54 +3026,37 @@ class NVRCard extends HTMLElement {
         margin: 0;
       }
 
-      .review-camera-control .review-participation {
-        width: 14px;
-        height: 14px;
-        min-height: 14px;
-        flex: 0 0 14px;
-        margin: 0 0 0 auto;
-        accent-color: #4caf70;
-        cursor: pointer;
-      }
-
       .review-when-controls {
         display: grid;
-        grid-template-columns: 44px minmax(0, 1fr) 44px;
-        gap: 5px;
+        grid-template-columns: minmax(0, 1fr);
+        gap: 8px;
+        padding-top: 8px;
       }
 
-      .review-date-picker-field {
+      .review-range-field {
         display: grid;
-        grid-template-columns: minmax(0, 1fr) 30px;
+        grid-template-columns: 36px minmax(0, 1fr);
+        align-items: center;
         min-width: 0;
-        gap: 4px;
+        gap: 6px;
+        color: #9fb0ba;
+        font-size: 12px;
       }
 
-      .review-date-picker-field .review-day-picker {
+      .review-range-field .review-range-picker {
+        width: 100%;
         min-width: 0;
         padding: 0 6px;
         background: #171f26;
         color: #dce6ec;
         caret-color: #fff;
         -webkit-text-fill-color: #dce6ec;
-        text-align: center;
+        text-align: left;
       }
 
-      .review-date-picker-field .review-day-picker:focus {
+      .review-range-field .review-range-picker:focus {
         border-color: #568db3;
         outline: none;
-      }
-
-      .review-when-controls .review-calendar-button {
-        width: 30px;
-        min-height: 44px;
-        padding: 0;
-        display: grid;
-        place-items: center;
-      }
-
-      .review-calendar-button ha-icon {
-        --mdc-icon-size: 18px;
       }
 
       .review-surface .flatpickr-calendar {
@@ -3334,8 +3106,66 @@ class NVRCard extends HTMLElement {
         color: #dce6ec;
       }
 
+      .review-surface .flatpickr-time,
+      .review-surface .flatpickr-time input,
+      .review-surface .flatpickr-time .flatpickr-am-pm {
+        border-color: #3b4954;
+        background: #171f26;
+        color: #dce6ec;
+      }
+
+      .review-surface .flatpickr-time .numInputWrapper > .arrowUp,
+      .review-surface .flatpickr-time .numInputWrapper > .arrowDown {
+        display: none !important;
+      }
+
+      .review-direct-time {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 6px;
+        width: 100%;
+      }
+
+      .review-direct-time-field {
+        display: grid;
+        gap: 3px;
+        color: #9fb0ba;
+        font-size: 11px;
+      }
+
+      .review-direct-time select {
+        width: 100%;
+        min-height: 44px;
+        padding: 0 6px;
+        border: 1px solid #3b4954;
+        border-radius: 4px;
+        background: #171f26;
+        color: #dce6ec;
+        font: inherit;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .review-direct-time select:focus-visible {
+        border-color: #568db3;
+        outline: 2px solid #7bb5dc;
+        outline-offset: 1px;
+      }
+
       .review-when-controls button {
         color: #cbd2d7;
+      }
+
+      .review-when-apply {
+        width: 100%;
+        min-height: 44px;
+        margin-top: 2px;
+        font-weight: 600;
+      }
+
+      .review-when-apply.dirty {
+        border-color: #568db3;
+        background: #1c303e;
+        color: #fff;
       }
 
       .review-when-controls button:disabled {
@@ -3383,7 +3213,10 @@ class NVRCard extends HTMLElement {
 
       .review-transport-controls {
         display: flex;
+        min-width: 0;
+        align-items: center;
         gap: 2px;
+        white-space: nowrap;
       }
 
       .review-transport button {
@@ -3421,6 +3254,22 @@ class NVRCard extends HTMLElement {
 
       .review-transport .review-now {
         width: 32px;
+        margin-left: 4px;
+      }
+
+      .review-speed-select {
+        width: 58px;
+        height: 30px;
+        min-height: 30px;
+        margin-left: 6px;
+        padding: 0 5px;
+        border: 1px solid #3b5263;
+        border-radius: 3px;
+        background: #172029;
+        color: #dce6ec;
+        font-family: inherit;
+        font-size: 12px;
+        cursor: pointer;
       }
 
       .review-clock-display {
@@ -3436,7 +3285,6 @@ class NVRCard extends HTMLElement {
 
       .review-camera-wall {
         display: grid;
-        grid-template-rows: minmax(0, 58fr) minmax(0, 42fr);
         width: 100%;
         height: 100%;
         min-width: 0;
@@ -3448,21 +3296,17 @@ class NVRCard extends HTMLElement {
         box-sizing: border-box;
       }
 
-      .review-primary {
+      .review-layout-cell {
+        position: relative;
         min-width: 0;
         min-height: 0;
+        background: #000;
         overflow: hidden;
+        box-sizing: border-box;
       }
 
-      .review-mini-grid {
-        display: grid;
-        grid-template-columns: repeat(4, minmax(0, 1fr));
-        grid-template-rows: repeat(3, minmax(0, 1fr));
-        min-width: 0;
-        min-height: 0;
-        gap: 1px;
-        background: #fff;
-        overflow: hidden;
+      .review-layout-cell[hidden] {
+        display: none !important;
       }
 
       .review-camera-panel {
@@ -3503,13 +3347,6 @@ class NVRCard extends HTMLElement {
         height: 100%;
         overflow: hidden;
         background: #000;
-      }
-
-      .review-mini-blank {
-        min-width: 0;
-        min-height: 0;
-        background: #000;
-        box-sizing: border-box;
       }
 
       .review-live-camera,
@@ -3590,6 +3427,48 @@ class NVRCard extends HTMLElement {
         color: #dce6ec;
         font-size: 16px;
       }
+
+      .review-timeline {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr);
+        gap: 6px;
+        height: 100%;
+        min-height: 260px;
+        padding: 10px 8px;
+        box-sizing: border-box;
+      }
+
+      .review-timeline-axis {
+        position: relative;
+        min-height: 220px;
+        border-left: 2px solid #526675;
+      }
+
+      .review-timeline-tick {
+        position: absolute;
+        left: -5px;
+        width: calc(100% + 5px);
+        border-top: 1px solid #3b4954;
+        color: #9fb0ba;
+        font-size: 11px;
+      }
+
+      .review-timeline-tick span { position: absolute; left: 8px; top: -8px; }
+      .review-timeline-marker {
+        position: absolute;
+        left: 0;
+        width: 100%;
+        min-height: 18px;
+        padding-left: 10px;
+        box-sizing: border-box;
+        border-left: 4px solid #6db4de;
+        color: #dce6ec;
+        font-size: 11px;
+      }
+      .review-timeline-marker span { background: #1c303e; padding: 2px 4px; }
+      .review-timeline-message { align-self: center; justify-self: center; color: #9fb0ba; font-size: 13px; }
+      .review-timeline-message.error { color: #e59a9a; }
+      .review-timeline-endpoints { display: flex; justify-content: space-between; color: #9fb0ba; font-size: 11px; }
 
       @media (max-width: 1099px) {
         .review-product {
@@ -4637,76 +4516,15 @@ class NVRCard extends HTMLElement {
 
 
   buildCameraList() {
-    return this.getEnabledCameras()
-      .map(camera => {
-
-        const liveClass =
-          camera.entity
-            ? "live-capable"
-            : "";
-
-        const online =
-          this.isCameraOnline(camera);
-
-        const statusLabel =
-          online ? "Online" : "Offline";
-
-        return `
-          <button
-            type="button"
-            class="camera-item ${liveClass}"
-            data-camera="${camera.name}"
-            draggable="true"
-          >
-
-            <ha-icon
-              class="camera-row-icon"
-              icon="mdi:cctv"
-              aria-hidden="true"
-            ></ha-icon>
-
-            <span class="camera-name">
-              ${camera.name}
-            </span>
-
-            <span
-              class="camera-status ${online ? "online" : "offline"}"
-              role="img"
-              aria-label="${statusLabel}"
-              title="${statusLabel}"
-            ></span>
-
-          </button>
-        `;
-      })
-      .join("");
+    return ReviewController.buildViewerCameraMenuMarkup(
+      this.getEnabledCameras(),
+      camera => this.isCameraOnline(camera)
+    );
   }
 
 
   buildSidebarLayouts() {
-    return Object
-      .entries(this.layouts)
-      .map(([key, layout]) => {
-
-        return `
-          <button
-            type="button"
-            class="sidebar-layout-item"
-            data-layout="${key}"
-            aria-label="${layout.label} layout"
-            draggable="true"
-          >
-
-            ${this.buildMiniature(layout)}
-
-            <div class="sidebar-layout-label">
-              ${layout.label}
-            </div>
-
-          </button>
-        `;
-      })
-      .join("");
+    return ReviewController.buildViewerLayoutMenuMarkup(this.layouts);
   }
 
 
@@ -4784,45 +4602,6 @@ class NVRCard extends HTMLElement {
     if (message) {
       message.textContent = this._savedViewsMessage;
     }
-  }
-
-
-  buildMiniature(layout) {
-    const cells =
-      layout.cells
-        .map(cell => {
-
-          const column =
-            cell.column
-              ? `grid-column:${cell.column};`
-              : "";
-
-          const row =
-            cell.row
-              ? `grid-row:${cell.row};`
-              : "";
-
-          return `
-            <span
-              class="layout-icon-cell"
-              style="${column}${row}"
-            ></span>
-          `;
-        })
-        .join("");
-
-
-    return `
-      <div
-        class="layout-icon"
-        style="
-          grid-template-columns:${layout.columns};
-          grid-template-rows:${layout.rows};
-        "
-      >
-        ${cells}
-      </div>
-    `;
   }
 
 
@@ -7032,7 +6811,7 @@ class NVRCard extends HTMLElement {
   attachCameraHandlers() {
     this
       .querySelectorAll(
-        ".camera-item"
+        ".nvr-shell > .camera-list .camera-item"
       )
       .forEach(button => {
 
@@ -7108,7 +6887,7 @@ class NVRCard extends HTMLElement {
 
   attachCameraDragHandlers() {
     this
-      .querySelectorAll(".camera-item")
+      .querySelectorAll(".nvr-shell > .camera-list .camera-item")
       .forEach(item => {
         item.addEventListener(
           "dragstart",
@@ -7598,7 +7377,7 @@ class NVRCard extends HTMLElement {
   attachLayoutHandlers() {
     this
       .querySelectorAll(
-        ".sidebar-layout-item"
+        ".nvr-shell > .camera-list .sidebar-layout-item"
       )
       .forEach(button => {
 
@@ -7727,7 +7506,7 @@ class NVRCard extends HTMLElement {
   attachLayoutDragHandlers() {
     this
       .querySelectorAll(
-        ".sidebar-layout-item"
+        ".nvr-shell > .camera-list .sidebar-layout-item"
       )
       .forEach(item => {
         item.addEventListener(
@@ -8460,7 +8239,7 @@ class NVRCard extends HTMLElement {
 
   updateCameraStatuses() {
     this
-      .querySelectorAll(".camera-item")
+      .querySelectorAll(".nvr-shell > .camera-list .camera-item")
       .forEach(button => {
         const camera =
           this.getCameraByName(
@@ -8508,7 +8287,7 @@ class NVRCard extends HTMLElement {
   updateCameraListState() {
     this
       .querySelectorAll(
-        ".camera-item"
+        ".nvr-shell > .camera-list .camera-item"
       )
       .forEach(button => {
 
@@ -8537,7 +8316,7 @@ class NVRCard extends HTMLElement {
   updateSelectedButton() {
     this
       .querySelectorAll(
-        ".sidebar-layout-item"
+        ".nvr-shell > .camera-list .sidebar-layout-item"
       )
       .forEach(button => {
 

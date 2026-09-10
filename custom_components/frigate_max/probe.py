@@ -9,6 +9,7 @@ from typing import Any
 
 ALLOWED_CAMERAS = frozenset({"drive_up", "drive_down"})
 MAX_RANGE_SECONDS = 300.0
+MAX_REVIEW_RANGE_SECONDS = 7 * 24 * 60 * 60.0
 ISOLATION_EPSILON_SECONDS = 0.001
 PREPARED_TIMING_FIELDS = (
     "camera",
@@ -22,10 +23,63 @@ PREPARED_TIMING_FIELDS = (
 )
 MIN_CLIP_SECONDS = 0.101
 FRIGATE_CAMERA_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+REVIEW_EVENT_FIELDS = ("camera_id", "start_time", "end_time", "type", "labels")
 
 
 class ProbeDataError(ValueError):
     """Raised when probe input or Frigate data cannot be associated safely."""
+
+
+def validate_review_request(cameras: Any, from_epoch: Any, to_epoch: Any) -> tuple[list[str], float, float]:
+    """Validate a bounded, safe multi-camera Review metadata request."""
+    if not isinstance(cameras, list) or not cameras or len(cameras) > 16:
+        raise ProbeDataError("cameras must contain 1 to 16 identifiers.")
+    normalized = []
+    for camera in cameras:
+        if not isinstance(camera, str) or not FRIGATE_CAMERA_ID.fullmatch(camera):
+            raise ProbeDataError("cameras must contain safe Frigate identifiers.")
+        if camera not in normalized:
+            normalized.append(camera)
+    start = _finite_number(from_epoch, "from")
+    end = _finite_number(to_epoch, "to")
+    if end <= start:
+        raise ProbeDataError("to must be after from.")
+    if end - start > MAX_REVIEW_RANGE_SECONDS:
+        raise ProbeDataError("Review range is too large.")
+    return normalized, start, end
+
+
+def normalize_review_event(item: Any, expected_camera: str) -> dict[str, Any]:
+    """Allowlist the event fields needed by the Review Timeline."""
+    if not isinstance(item, Mapping):
+        raise ProbeDataError("Frigate returned a malformed event.")
+    camera = item.get("camera", expected_camera)
+    if camera != expected_camera:
+        raise ProbeDataError("Frigate event camera did not match the request.")
+    start = _finite_number(item.get("start_time"), "event start_time")
+    raw_end = item.get("end_time")
+    end = None if raw_end is None else _finite_number(raw_end, "event end_time")
+    if end is not None and end < start:
+        raise ProbeDataError("Frigate event end_time preceded start_time.")
+    label = item.get("label")
+    sub_label = item.get("sub_label")
+    labels = [value for value in (label, sub_label) if isinstance(value, str) and value]
+    result: dict[str, Any] = {
+        "camera_id": expected_camera,
+        "start_time": start,
+        "type": label if isinstance(label, str) and label else "event",
+        "labels": labels,
+    }
+    if end is not None:
+        result["end_time"] = end
+    return result
+
+
+def normalize_review_events(items: Any, expected_camera: str) -> list[dict[str, Any]]:
+    """Normalize a Frigate event list without exposing raw payload fields."""
+    if not isinstance(items, list):
+        raise ProbeDataError("Frigate events response must be a list.")
+    return [normalize_review_event(item, expected_camera) for item in items]
 
 
 def normalize_prepare_result(result: Any, expected_camera: str) -> dict[str, Any]:

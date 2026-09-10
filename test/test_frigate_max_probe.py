@@ -20,6 +20,32 @@ SPEC.loader.exec_module(probe)
 
 
 class FrigateMaxProbeTests(unittest.TestCase):
+    def test_review_request_and_event_normalization_are_allowlisted(self) -> None:
+        self.assertEqual(
+            probe.validate_review_request(["drive_up", "drive_down"], 1000, 4600),
+            (["drive_up", "drive_down"], 1000.0, 4600.0),
+        )
+        result = probe.normalize_review_events(
+            [{
+                "camera": "drive_up", "start_time": 1200, "end_time": 1300,
+                "label": "person", "sub_label": "alice", "id": "private-id",
+                "thumbnail": "/private/path.jpg",
+            }],
+            "drive_up",
+        )
+        self.assertEqual(result, [{
+            "camera_id": "drive_up", "start_time": 1200.0, "end_time": 1300.0,
+            "type": "person", "labels": ["person", "alice"],
+        }])
+        self.assertNotIn("private-id", repr(result))
+        self.assertNotIn("private/path", repr(result))
+
+    def test_review_request_rejects_unsafe_or_unbounded_ranges(self) -> None:
+        for cameras, start, end in (([], 1000, 1100), (["front/door"], 1000, 1100),
+                                     (["drive_up"], 1000, 1000 + probe.MAX_REVIEW_RANGE_SECONDS + 1)):
+            with self.assertRaises(probe.ProbeDataError):
+                probe.validate_review_request(cameras, start, end)
+
     def test_v1_prepare_accepts_safe_camera_ids_without_a_two_camera_cap(self) -> None:
         self.assertEqual(
             probe.validate_prepare_request("back_yard-2", 1000, 1120, 1015),

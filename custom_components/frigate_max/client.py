@@ -13,6 +13,7 @@ from .probe import (
     candidate_probe_windows,
     derive_timing_result,
     mapping_clips,
+    normalize_review_events,
 )
 
 
@@ -161,3 +162,21 @@ class FrigateProbeClient:
     ) -> dict[str, Any]:
         """Retain the Prototype 0 command while Review migrates to the v1 API."""
         return await self.prepare_vod(camera, requested_start, requested_end, target)
+
+    async def get_review_events(
+        self, cameras: list[str], from_epoch: float, to_epoch: float
+    ) -> list[dict[str, Any]]:
+        """Return normalized Frigate events for the requested Review window."""
+        events: list[dict[str, Any]] = []
+        for camera in cameras:
+            result = await self._get_json(
+                "/api/events",
+                params={
+                    "camera": camera,
+                    "after": str(from_epoch),
+                    "before": str(to_epoch),
+                    "limit": "1000",
+                },
+            )
+            events.extend(normalize_review_events(result, camera))
+        return events

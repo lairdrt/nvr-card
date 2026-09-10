@@ -4,12 +4,16 @@ import { readFileSync } from "node:fs";
 import { Window } from "happy-dom";
 
 import {
+  VIEWER_LAYOUTS,
+  REVIEW_PLAYBACK_SPEEDS,
   ReviewClock,
   ReviewController,
   calculateHistoricalSeek,
   getCivilDayBounds,
   getCivilDayKey,
-  normalizePreparedTiming
+  normalizePreparedTiming,
+  normalizeReviewTimelineItems,
+  reviewTimelineMarkerTop
 } from "../src/review/review-controller.js";
 import { createTestHarness } from "./helpers/nvr-card-harness.js";
 
@@ -90,14 +94,20 @@ test("Review wall reuses Live content padding and has no media toolbar row", () 
   assert.match(source, /\.application-mode-control button\s*{[\s\S]*?width:\s*92px/);
 });
 
-test("Review date picker retains the accepted dark field and selected-day contrast", () => {
+test("Review date-time pickers retain the accepted dark field and selected-day contrast", () => {
   const source = readFileSync(new URL("../nvr-card.js", import.meta.url), "utf8");
   assert.match(source, /flatpickr-4\.6\.13\.min\.css/);
-  assert.match(source, /\.review-date-picker-field \.review-day-picker\s*{[\s\S]*?background:\s*#171f26;[\s\S]*?color:\s*#dce6ec;/);
+  assert.match(source, /\.review-range-field \.review-range-picker\s*{[\s\S]*?background:\s*#171f26;[\s\S]*?color:\s*#dce6ec;/);
   assert.match(source, /\.flatpickr-day\.selected,[\s\S]*?background:\s*#003a70;[\s\S]*?color:\s*#fff;/);
+  assert.match(source, /\.flatpickr-time \.numInputWrapper > \.arrowUp,[\s\S]*?display:\s*none !important;/);
+  assert.match(source, /\.review-direct-time\s*{[\s\S]*?grid-template-columns:\s*1fr 1fr/);
+  assert.match(source, /\.review-direct-time select\s*{[\s\S]*?min-height:\s*44px/);
+  assert.match(source, /\.review-when-controls\s*{[\s\S]*?grid-template-columns:\s*minmax\(0, 1fr\)/);
+  assert.match(source, /\.review-section-content\s*{[\s\S]*?padding:\s*8px 6px 2px/);
+  assert.match(source, /\.review-when-apply\s*{/);
 });
 
-function createHistoricalHarness({ unavailable = new Set(), prepareGate = null } = {}) {
+function createHistoricalHarness({ unavailable = new Set(), prepareGate = null, reviewEvents = [], reviewError = false } = {}) {
   const window = new Window({ url: "http://localhost/" });
   const starts = [];
   const instances = [];
@@ -110,9 +120,19 @@ function createHistoricalHarness({ unavailable = new Set(), prepareGate = null }
     altInput.className = options.altInputClass;
     input.type = "hidden";
     input.after(altInput);
-    const display = dayKey => {
-      const [year, month, day] = dayKey.split("-");
-      return `${month}/${day}/${year}`;
+    const normalize = value => value instanceof Date
+      ? new Date(value.getTime())
+      : new Date(value);
+    const pad = value => String(value).padStart(2, "0");
+    const display = value => {
+      const date = normalize(value);
+      return `${pad(date.getMonth() + 1)}/${pad(date.getDate())}/${date.getFullYear()} ` +
+        `${pad(date.getHours())}:${pad(date.getMinutes())}`;
+    };
+    const canonical = value => {
+      const date = normalize(value);
+      return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ` +
+        `${pad(date.getHours())}:${pad(date.getMinutes())}`;
     };
     const instance = {
       input,
@@ -124,14 +144,14 @@ function createHistoricalHarness({ unavailable = new Set(), prepareGate = null }
       set(name, value) {
         options[name] = value;
       },
-      setDate(dayKey, triggerChange = false) {
-        this.current = dayKey;
-        input.value = dayKey;
-        altInput.value = display(dayKey);
-        if (triggerChange) options.onChange([], dayKey, this);
+      setDate(value, triggerChange = false) {
+        this.current = normalize(value);
+        input.value = canonical(this.current);
+        altInput.value = display(this.current);
+        if (triggerChange) options.onChange([this.current], input.value, this);
       },
-      select(dayKey) {
-        this.setDate(dayKey, true);
+      select(value) {
+        this.setDate(value, true);
       },
       open() {
         this.openCount += 1;
@@ -208,6 +228,7 @@ function createHistoricalHarness({ unavailable = new Set(), prepareGate = null }
   }
 
   const hass = {
+    config: { time_zone: "America/Los_Angeles" },
     states: {
       "camera.drive_up": { attributes: { camera_name: "drive_up" } },
       "camera.drive_down": { attributes: { camera_name: "drive_down" } },
@@ -225,6 +246,10 @@ function createHistoricalHarness({ unavailable = new Set(), prepareGate = null }
         const result = prepared(message.camera, origin, message.target);
         return prepareGate ? prepareGate.then(() => result) : Promise.resolve(result);
       }
+      if (message.type === "frigate_max/v1/review/get") {
+        if (reviewError) return Promise.reject(new Error("synthetic timeline failure"));
+        return Promise.resolve(reviewEvents);
+      }
       if (message.type === "auth/sign_path") {
         return Promise.resolve({ path: `/signed/${calls.length}.m3u8` });
       }
@@ -241,6 +266,7 @@ function createHistoricalHarness({ unavailable = new Set(), prepareGate = null }
   const controller = new ReviewController({
     documentRef: window.document,
     loadHls: () => Promise.resolve(MockHls),
+    wallClock: () => Date.parse("2026-09-10T12:00:00-07:00"),
     datePickerFactory
   });
   controller.configure(cameras());
@@ -272,9 +298,12 @@ test("ReviewClock remains an absolute clock independent of player currentTime", 
   clock.start();
   now = 2750;
   assert.equal(clock.absoluteTime, 1800000001.75);
+  clock.setRate(4);
+  now = 3750;
+  assert.equal(clock.absoluteTime, 1800000005.75);
   clock.pause();
   now = 9000;
-  assert.equal(clock.absoluteTime, 1800000001.75);
+  assert.equal(clock.absoluteTime, 1800000005.75);
 });
 
 test("Review selection defaults to enabled order and is not capped at two", () => {
@@ -293,6 +322,115 @@ test("Review selection defaults to enabled order and is not capped at two", () =
   assert.equal(controller.setPrimaryCamera("Back"), true);
   assert.equal(controller.state.primaryCameraName, "Back");
   window.close();
+});
+
+test("Live and Review expose the same shared layouts with independent state", t => {
+  const harness = createTestHarness();
+  t.after(() => harness.close());
+  const card = harness.createCard();
+  const liveLayout = card._layout;
+  const liveAssignments = [...card._assignedCameras];
+  card.setApplicationMode("review");
+  const controller = card._reviewController;
+
+  const expectedLayouts = [
+    "1x1", "2x2", "3x3", "4x4", "Large+3", "Large+5", "Large+7",
+    "Top Wide", "Left Wide", "Primary+12"
+  ];
+  assert.strictEqual(card.layouts, harness.window.ReviewController.VIEWER_LAYOUTS);
+  assert.deepEqual(Object.values(VIEWER_LAYOUTS).map(layout => layout.label), expectedLayouts);
+  assert.equal(controller.state.reviewLayout, "primary12");
+  const liveButtons = [...card.querySelectorAll(".nvr-shell > .camera-list .sidebar-layout-item")];
+  const reviewButtons = [...card.querySelectorAll(".review-layout-controls .sidebar-layout-item")];
+  assert.deepEqual(liveButtons.map(button => button.textContent.trim()), expectedLayouts);
+  assert.deepEqual(reviewButtons.map(button => button.textContent.trim()), expectedLayouts);
+  assert.equal(reviewButtons.at(-1).dataset.layout, "primary12");
+  const image = card.querySelector("hui-image.review-live-camera");
+  card.querySelector('.review-layout-controls [data-layout="2x2"]').click();
+  assert.equal(
+    card.querySelector('.review-layout-controls [data-layout="2x2"]').classList.contains("target-selected"),
+    true
+  );
+  card.querySelector('[data-review-slot="0"]').click();
+  assert.equal(controller.state.reviewLayout, "2x2");
+  assert.equal(card.querySelectorAll(".review-layout-cell:not([hidden])").length, 4);
+  assert.strictEqual(card.querySelector("hui-image.review-live-camera"), image);
+  assert.equal(card._layout, liveLayout);
+  assert.equal(JSON.stringify(card._assignedCameras), JSON.stringify(liveAssignments));
+
+  const reviewState = controller.state;
+  card.querySelector('.camera-list [data-layout="primary12"]').click();
+  card.querySelector('[data-slot="0"]').click();
+  assert.equal(card._layout, "primary12");
+  assert.equal(controller.state.reviewLayout, reviewState.reviewLayout);
+  assert.deepEqual(controller.state.reviewAssignments, reviewState.reviewAssignments);
+});
+
+test("Live and Review camera rows share one rendered structure with scoped hooks", t => {
+  const harness = createTestHarness();
+  t.after(() => harness.close());
+  const card = harness.createCard({ hass: harness.createHass() });
+  card.setApplicationMode("review");
+  const liveRows = [...card.querySelectorAll(".camera-items .camera-item")];
+  const reviewRows = [...card.querySelectorAll(".review-camera-controls .camera-item")];
+  const signature = row => ({
+    tag: row.tagName,
+    camera: row.dataset.camera,
+    baseClasses: [...row.classList].filter(name => !["assigned", "target-selected"].includes(name)),
+    draggable: row.getAttribute("draggable"),
+    children: [...row.children].map(child => `${child.tagName}.${child.className}`),
+    icon: row.querySelector("ha-icon")?.getAttribute("icon"),
+    label: row.querySelector(".camera-name")?.textContent,
+    status: row.querySelector(".camera-status")?.getAttribute("aria-label")
+  });
+  assert.deepEqual(reviewRows.map(signature), liveRows.map(signature));
+  assert.ok(reviewRows.every(row => row.querySelector('input[type="checkbox"]') === null));
+});
+
+test("Review target placement and drag/drop mutate only Review assignments", t => {
+  const harness = createTestHarness();
+  t.after(() => harness.close());
+  const card = harness.createCard();
+  card.assignCamera("Front");
+  card.assignCamera("Garage");
+  const liveLayout = card._layout;
+  const liveAssignments = [...card._assignedCameras];
+  card.setApplicationMode("review");
+  const controller = card._reviewController;
+  controller.setReviewLayout("2x2");
+  const frontPanel = card.querySelector('[data-camera="Front"].review-camera-panel');
+  const frontImage = frontPanel.querySelector("hui-image");
+
+  card.querySelector('.review-camera-controls [data-camera="Patio"]').click();
+  card.querySelector('[data-review-slot="3"]').click();
+  assert.equal(controller.state.reviewAssignments[3], "Patio");
+
+  const data = new Map([["application/x-nvr-camera", "Front"]]);
+  const transfer = {
+    types: [...data.keys()],
+    getData: type => data.get(type) ?? "",
+    setData: (type, value) => data.set(type, value),
+    effectAllowed: "", dropEffect: ""
+  };
+  const drop = new harness.window.Event("drop", { bubbles: true, cancelable: true });
+  Object.defineProperty(drop, "dataTransfer", { value: transfer });
+  card.querySelector('[data-review-slot="2"]').dispatchEvent(drop);
+  assert.equal(controller.state.reviewAssignments[2], "Front");
+  assert.strictEqual(card.querySelector('[data-review-slot="2"] .review-camera-panel'), frontPanel);
+  assert.strictEqual(frontPanel.querySelector("hui-image"), frontImage);
+  assert.equal(card._layout, liveLayout);
+  assert.equal(JSON.stringify(card._assignedCameras), JSON.stringify(liveAssignments));
+
+  const reviewState = controller.state;
+  card.setApplicationMode("live");
+  card.querySelector('.camera-items [data-camera="Patio"]').click();
+  card.querySelector('[data-slot="3"]').click();
+  assert.equal(card._assignedCameras[3], "Patio");
+  assert.equal(controller.state.reviewLayout, reviewState.reviewLayout);
+  assert.deepEqual(controller.state.reviewAssignments, reviewState.reviewAssignments);
+  card.setApplicationMode("review");
+  assert.equal(controller.state.reviewLayout, reviewState.reviewLayout);
+  assert.deepEqual(controller.state.reviewAssignments, reviewState.reviewAssignments);
 });
 
 test("Live to Review to Live preserves exact Live workspace and player identity", t => {
@@ -419,10 +557,10 @@ test("rail toggle and native section titles retain one structure in both states"
   const reviewRail = card.querySelector(".review-control-rail");
   const reviewHeaders = [...reviewRail.querySelectorAll(".sidebar-section-header")];
   assert.deepEqual(reviewHeaders.map(header => header.getAttribute("aria-label")), [
-    "Cameras", "When", "Filters"
+    "Cameras", "Layouts", "When", "Filters"
   ]);
   assert.deepEqual(reviewHeaders.map(header => header.title), [
-    "Cameras", "When", "Filters"
+    "Cameras", "Layouts", "When", "Filters"
   ]);
   assert.ok(reviewHeaders.every(header => header.querySelector("ha-icon")));
 
@@ -442,7 +580,7 @@ test("fresh Review sections start closed and share the collapsed rail inset cont
     ".review-control-rail > .sidebar-section"
   )];
 
-  assert.equal(sections.length, 3);
+  assert.equal(sections.length, 4);
   for (const section of sections) {
     const header = section.querySelector(".sidebar-section-header");
     const body = section.querySelector(".sidebar-section-body");
@@ -454,10 +592,12 @@ test("fresh Review sections start closed and share the collapsed rail inset cont
   }
 
   card._reviewController.setSectionExpanded("cameras", true);
+  card._reviewController.setSectionExpanded("layouts", true);
   card._reviewController.setSectionExpanded("filters", true);
   card.setApplicationMode("live");
   card.setApplicationMode("review");
   assert.equal(card.querySelector(".review-cameras-section").classList.contains("expanded"), true);
+  assert.equal(card.querySelector(".review-layouts-section").classList.contains("expanded"), true);
   assert.equal(card.querySelector(".review-when-section").classList.contains("expanded"), false);
   assert.equal(card.querySelector(".review-filters-section").classList.contains("expanded"), true);
 });
@@ -548,6 +688,24 @@ test("collapsed Review section activation ensures content open without media or 
   assert.equal(card.querySelector(".review-when-section").classList.contains("expanded"), false);
 });
 
+test("collapsed Layouts activation expands the shared rail and remembers the subsection", t => {
+  const harness = createTestHarness();
+  t.after(() => harness.close());
+  const card = harness.createCard();
+  card.setApplicationMode("review");
+  const shell = card.querySelector(".nvr-shell");
+  const layouts = card.querySelector(".review-layouts-section");
+  const image = card.querySelector("hui-image.review-live-camera");
+  card.querySelector(".sidebar-toggle").click();
+  layouts.querySelector("ha-icon").click();
+  assert.equal(shell.classList.contains("sidebar-collapsed"), false);
+  assert.equal(layouts.classList.contains("expanded"), true);
+  assert.strictEqual(card.querySelector("hui-image.review-live-camera"), image);
+  card.setApplicationMode("live");
+  card.setApplicationMode("review");
+  assert.equal(card.querySelector(".review-layouts-section").classList.contains("expanded"), true);
+});
+
 test("mode controls are equal-class icon labels with correct active semantics", t => {
   const harness = createTestHarness();
   t.after(() => harness.close());
@@ -584,9 +742,9 @@ test("all Review sections start hidden and toggle open and closed without changi
   const harness = createHistoricalHarness();
   t.after(() => harness.close());
   harness.controller.setFilter("person", true);
-  harness.controller.setSelectedDay("2026-09-07");
+  harness.controller.setReviewRangeEndpoint("from", Date.parse("2026-09-07T10:00:00-07:00") / 1000);
   const before = harness.controller.state;
-  for (const name of ["cameras", "when", "filters"]) {
+  for (const name of ["cameras", "layouts", "when", "filters"]) {
     const section = harness.root.querySelector(`.review-${name}-section`);
     const header = section.querySelector(".sidebar-section-header");
     const body = section.querySelector(".sidebar-section-body");
@@ -642,16 +800,19 @@ test("participation permits zero cameras and promotes the first remaining primar
   harness.controller.setSelectedCameraNames([]);
   assert.deepEqual(harness.controller.state.selectedCameraNames, []);
   assert.equal(harness.controller.state.primaryCameraName, null);
-  assert.match(harness.root.querySelector(".review-empty-state").textContent, /Select cameras/);
+  assert.match(harness.root.querySelector(".review-empty-state").textContent, /cameras/);
 });
 
-test("Review camera rows match logical order and expose participation only", t => {
+test("Review camera rows reuse the Live presentation while assignments drive participation", t => {
   const harness = createHistoricalHarness();
   t.after(() => harness.close());
   const rows = [...harness.root.querySelectorAll(".review-camera-controls .camera-item")];
   assert.deepEqual(rows.map(row => row.dataset.camera), ["Drive Up", "Drive Down", "Back"]);
   assert.ok(rows.every(row => row.querySelector("ha-icon.camera-row-icon")));
-  assert.ok(rows.every(row => row.querySelector('input[type="checkbox"].review-participation')));
+  assert.ok(rows.every(row => row.tagName === "BUTTON"));
+  assert.ok(rows.every(row => row.getAttribute("draggable") === "true"));
+  assert.ok(rows.every(row => row.querySelector(".camera-status")));
+  assert.equal(harness.root.querySelectorAll('.review-camera-controls input[type="checkbox"]').length, 0);
   assert.equal(harness.root.querySelectorAll('.review-camera-controls input[type="radio"]').length, 0);
   assert.equal(harness.controller.state.primaryCameraName, "Drive Up");
 });
@@ -679,15 +840,18 @@ test("only double-click promotes a secondary and preserves historical identity/s
   assert.equal(harness.controller.state.primaryCameraName, "Drive Up");
   down.dispatchEvent(new harness.window.MouseEvent("dblclick", { bubbles: true }));
   assert.equal(harness.controller.state.primaryCameraName, "Drive Down");
-  assert.strictEqual(harness.root.querySelector('.review-primary [data-camera="Drive Down"]'), down);
+  assert.strictEqual(harness.root.querySelector('[data-review-slot="0"] [data-camera="Drive Down"]'), down);
   assert.strictEqual(down.querySelector("video"), downVideo);
   assert.strictEqual(up.querySelector("video"), upVideo);
   assert.equal(harness.controller.clock.absoluteTime, beforeClock);
   assert.equal(harness.controller.clock.running, true);
-  assert.deepEqual(harness.controller.state.selectedCameraNames, before.selectedCameraNames);
-  assert.equal(harness.controller.state.selectedDay, before.selectedDay);
   assert.deepEqual(
-    [...harness.root.querySelectorAll(".review-mini-grid .review-camera-panel")]
+    [...harness.controller.state.selectedCameraNames].sort(),
+    [...before.selectedCameraNames].sort()
+  );
+  assert.deepEqual(harness.controller.state.reviewRange, before.reviewRange);
+  assert.deepEqual(
+    [...harness.root.querySelectorAll('[data-review-slot]:not([data-review-slot="0"]) .review-camera-panel')]
       .map(panel => panel.dataset.camera),
     ["Drive Up", "Back"]
   );
@@ -713,6 +877,16 @@ test("movement-bounded double-tap promotes a secondary without handling one tap"
   touch("pointerdown", 300);
   touch("pointerup", 350);
   assert.equal(harness.controller.state.primaryCameraName, "Drive Down");
+});
+
+test("ordinary grids keep slot zero as an internal primary without promotion chrome", t => {
+  const harness = createHistoricalHarness();
+  t.after(() => harness.close());
+  harness.controller.setReviewLayout("2x2");
+  const down = harness.root.querySelector('.review-camera-panel[data-camera="Drive Down"]');
+  down.dispatchEvent(new harness.window.MouseEvent("dblclick", { bubbles: true }));
+  assert.equal(harness.controller.state.primaryCameraName, "Drive Up");
+  assert.equal(harness.controller.state.reviewAssignments[0], "Drive Up");
 });
 
 test("historical participation removal retires only the removed player", async t => {
@@ -746,77 +920,234 @@ test("RHS and provisional filters preserve clock, media, cameras, and primary", 
   assert.deepEqual(harness.controller.state.selectedFilters, ["person"]);
 });
 
-test("When omits Today while preserving a selected day and Now returns live", async t => {
+test("When owns one valid From/To interval and Now retains it", async t => {
   const harness = createHistoricalHarness();
   t.after(() => harness.close());
-  assert.equal(harness.root.querySelector(".review-day-today"), null);
-  assert.equal(harness.datePickerInstances.at(-1).current, harness.controller.todayKey);
-  harness.controller.setSelectedDay("2026-09-07");
+  assert.equal(harness.root.querySelectorAll(".review-range-picker").length, 4);
+  assert.equal(harness.root.querySelector(".review-day-picker"), null);
+  const initial = harness.controller.state.reviewRange;
+  assert.equal(initial.to - initial.from, 3600);
   await harness.controller.playHistorical(1800000000);
-  assert.equal(harness.controller.state.selectedDay, "2026-09-07");
+  const activeRange = harness.controller.state.reviewRange;
+  assert.ok(activeRange.from <= 1800000000 && activeRange.to >= 1800000000);
   assert.equal(harness.controller.state.presentationMode, "historical");
   harness.root.querySelector(".review-now").click();
   assert.equal(harness.controller.state.presentationMode, "live");
+  assert.deepEqual(harness.controller.state.reviewRange, activeRange);
   assert.equal(harness.root.querySelectorAll("hui-image.review-live-camera").length, 2);
 });
 
-test("first Review entry uses local today and a chosen day survives a mode round trip", t => {
+test("Review From/To edits stay draft-only until one atomic Apply", t => {
   const harness = createHistoricalHarness();
   t.after(() => harness.close());
-  assert.equal(harness.controller.state.selectedDay, harness.controller.todayKey);
-  const chosen = "2026-09-07";
-  assert.equal(harness.controller.setSelectedDay(chosen), true);
-  const previousPicker = harness.datePickerInstances.at(-1);
-  harness.controller.deactivate();
-  assert.equal(previousPicker.destroyCount, 1);
-  harness.controller.activate();
-  assert.equal(harness.controller.state.selectedDay, chosen);
-  assert.equal(harness.datePickerInstances.at(-1).current, chosen);
-  assert.equal(harness.datePickerInstances.at(-1).altInput.value, "09/07/2026");
-  assert.equal(harness.root.querySelector(".review-day-today"), null);
+  const controller = harness.controller;
+  const initial = controller.state.activeReviewRange;
+  const clockValue = initial.from + 720;
+  controller.clock.setAbsolute(clockValue);
+  const from = initial.from + 600;
+  const to = initial.to + 600;
+  assert.equal(controller.state.reviewRangeDirty, false);
+  assert.equal(harness.root.querySelector(".review-when-apply").disabled, true);
+  assert.equal(controller.setReviewRangeEndpoint("from", from), true);
+  assert.equal(controller.setReviewRangeEndpoint("to", to), true);
+  assert.deepEqual(controller.state.activeReviewRange, initial);
+  assert.deepEqual(controller.state.reviewRange, initial);
+  assert.deepEqual(controller.state.draftReviewRange, { from, to });
+  assert.equal(controller.state.reviewRangeDirty, true);
+  assert.equal(harness.root.querySelector(".review-when-apply").disabled, false);
+  assert.equal(harness.starts.length, 0);
+  assert.equal(controller.applyReviewRange(), true);
+  assert.deepEqual(controller.state.activeReviewRange, { from, to });
+  assert.deepEqual(controller.state.draftReviewRange, { from, to });
+  assert.equal(controller.state.reviewRangeDirty, false);
+  assert.equal(controller._rangeRefreshCount, 1);
+  assert.equal(controller.clock.absoluteTime, clockValue);
+  assert.equal(controller.applyReviewRange(), false);
+  assert.equal(controller._rangeRefreshCount, 1);
 });
 
-test("Review date picker integration keeps canonical state and media identity", t => {
+test("Review direct hour and minute selectors edit exact draft time only", t => {
   const harness = createHistoricalHarness();
   t.after(() => harness.close());
-  harness.controller.setSelectedDay("2024-03-01");
+  const controller = harness.controller;
+  const active = controller.state.activeReviewRange;
+  const hour = harness.root.querySelector(".review-from-picker").closest(".review-range-field")
+    .nextElementSibling.querySelector(".review-time-hour");
+  const minute = harness.root.querySelector(".review-from-picker").closest(".review-range-field")
+    .nextElementSibling.querySelector(".review-time-minute");
+  assert.equal(harness.root.querySelectorAll(".review-direct-time select").length, 4);
+  hour.value = "12";
+  hour.dispatchEvent(new harness.window.Event("change", { bubbles: true }));
+  minute.value = "38";
+  minute.dispatchEvent(new harness.window.Event("change", { bubbles: true }));
+  const draft = controller.state.draftReviewRange;
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/Los_Angeles", hour: "2-digit", minute: "2-digit", hourCycle: "h23"
+  }).formatToParts(new Date(draft.from * 1000));
+  assert.equal(parts.find(part => part.type === "hour").value, "12");
+  assert.equal(parts.find(part => part.type === "minute").value, "38");
+  assert.deepEqual(controller.state.activeReviewRange, active);
+  assert.equal(controller.state.reviewRangeDirty, true);
+  assert.equal(controller._rangeRefreshCount, 0);
+  assert.equal(controller.applyReviewRange(), true);
+  assert.equal(controller.state.reviewRangeDirty, false);
+});
+
+test("Apply clamps ReviewClock to the active range without starting playback", t => {
+  const harness = createHistoricalHarness();
+  t.after(() => harness.close());
+  const controller = harness.controller;
+  const initial = controller.state.activeReviewRange;
+  const from = initial.from + 1200;
+  const to = initial.to + 1200;
+  controller.clock.setAbsolute(initial.from - 60);
+  controller.setReviewRangeEndpoint("from", from);
+  controller.setReviewRangeEndpoint("to", to);
+  assert.equal(controller.applyReviewRange(), true);
+  assert.equal(controller.clock.absoluteTime, from);
+  assert.equal(harness.starts.length, 0);
+  controller.clock.setAbsolute(to + 60);
+  controller.setReviewRangeEndpoint("from", from + 60);
+  controller.setReviewRangeEndpoint("to", to + 60);
+  assert.equal(controller.applyReviewRange(), true);
+  assert.equal(controller.clock.absoluteTime, to + 60);
+  assert.equal(controller._rangeRefreshCount, 2);
+});
+
+test("Review Timeline refresh queries active range and renders newest at top", async t => {
+  const harness = createHistoricalHarness({ reviewEvents: [
+    { camera_id: "drive_up", start_time: 1789065000, end_time: 1789065060, type: "person", labels: ["person"] },
+    { camera_id: "drive_down", start_time: 1789066800, type: "car", labels: ["car"] }
+  ] });
+  t.after(() => harness.close());
+  const controller = harness.controller;
+  const active = controller.state.activeReviewRange;
+  const draft = { from: active.from + 600, to: active.to };
+  controller.setReviewRangeEndpoint("from", draft.from);
+  controller.setReviewRangeEndpoint("to", draft.to);
+  assert.deepEqual(controller.state.activeReviewRange, active);
+  controller.applyReviewRange();
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const request = harness.calls.find(call => call.type === "frigate_max/v1/review/get");
+  assert.deepEqual(request.cameras, ["drive_up", "drive_down"]);
+  assert.deepEqual({ from: request.from, to: request.to }, draft);
+  assert.equal(controller.state.timeline.status, "loaded");
+  assert.equal(controller.state.timeline.items.length, 2);
+  const markers = [...harness.root.querySelectorAll(".review-timeline-marker")];
+  assert.match(markers[0].getAttribute("style"), new RegExp(`top:${reviewTimelineMarkerTop(1789065000, draft) * 100}%`));
+  assert.match(markers[1].getAttribute("style"), /top:0%/);
+  assert.equal(harness.root.querySelector(".review-timeline-endpoints").firstElementChild.textContent,
+    new Intl.DateTimeFormat(undefined, { timeZone: "America/Los_Angeles", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(new Date(draft.to * 1000)));
+});
+
+test("Review Timeline exposes clean empty and error states", async t => {
+  const empty = createHistoricalHarness();
+  t.after(() => empty.close());
+  empty.controller.setReviewRangeEndpoint("to", empty.controller.state.activeReviewRange.to + 60);
+  empty.controller.applyReviewRange();
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.match(empty.root.querySelector(".review-timeline-message").textContent, /No activity/);
+
+  const failed = createHistoricalHarness({ reviewError: true });
+  t.after(() => failed.close());
+  failed.controller.setReviewRangeEndpoint("to", failed.controller.state.activeReviewRange.to + 60);
+  failed.controller.applyReviewRange();
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(failed.controller.state.timeline.status, "error");
+  assert.match(failed.root.querySelector(".review-timeline-message").textContent, /Unable to load activity/);
+});
+
+test("Review metadata clamps only the query end while preserving full active Timeline range", async t => {
+  const harness = createHistoricalHarness({ reviewEvents: [
+    { camera_id: "drive_up", start_time: 1789065000, type: "person", labels: ["person"] }
+  ] });
+  t.after(() => harness.close());
+  const controller = harness.controller;
+  controller.setReviewRangeEndpoint("from", 1789063200);
+  controller.setReviewRangeEndpoint("to", 1789070400);
+  controller.applyReviewRange();
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const request = harness.calls.find(call => call.type === "frigate_max/v1/review/get");
+  assert.deepEqual({ from: request.from, to: request.to }, { from: 1789063200, to: 1789066800 });
+  assert.deepEqual(controller.state.activeReviewRange, { from: 1789063200, to: 1789070400 });
+  const marker = harness.root.querySelector(".review-timeline-marker");
+  assert.match(marker.getAttribute("style"), /top:75%/);
+
+  const future = createHistoricalHarness();
+  t.after(() => future.close());
+  future.controller.setReviewRangeEndpoint("from", 1789070400);
+  future.controller.setReviewRangeEndpoint("to", 1789074000);
+  future.controller.applyReviewRange();
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(future.calls.some(call => call.type === "frigate_max/v1/review/get"), false);
+  assert.equal(future.controller.state.timeline.status, "loaded");
+  assert.deepEqual(future.controller.state.activeReviewRange, { from: 1789070400, to: 1789074000 });
+  assert.match(future.root.querySelector(".review-timeline-message").textContent, /No activity/);
+});
+
+test("From/To survive a mode round trip and both picker instances are destroyed", t => {
+  const harness = createHistoricalHarness();
+  t.after(() => harness.close());
+  const from = Date.parse("2026-09-07T10:15:00-07:00") / 1000;
+  const to = Date.parse("2026-09-07T11:45:00-07:00") / 1000;
+  assert.equal(harness.controller.setReviewRangeEndpoint("from", from), true);
+  assert.equal(harness.controller.setReviewRangeEndpoint("to", to), true);
+  assert.deepEqual(harness.controller.state.activeReviewRange, harness.controller.state.reviewRange);
+  assert.deepEqual(harness.controller.state.draftReviewRange, { from, to });
+  const previousPickers = harness.datePickerInstances.slice(-2);
+  harness.controller.deactivate();
+  assert.ok(previousPickers.every(picker => picker.destroyCount === 1));
+  harness.controller.activate();
+  assert.deepEqual(harness.controller.state.draftReviewRange, { from, to });
+  assert.deepEqual(harness.controller.state.activeReviewRange, harness.controller.state.reviewRange);
+  assert.equal(harness.datePickerInstances.at(-2).altInput.value, "09/07/2026 10:15");
+  assert.equal(harness.datePickerInstances.at(-1).altInput.value, "09/07/2026 11:45");
+});
+
+test("flatpickr From/To integration enforces order and preserves media identity", t => {
+  const harness = createHistoricalHarness();
+  t.after(() => harness.close());
   const panel = harness.root.querySelector('.review-camera-panel[data-camera="Drive Up"]');
   const image = panel.querySelector("hui-image");
-  const picker = harness.datePickerInstances.at(-1);
-  assert.deepEqual(
-    {
-      altInput: picker.options.altInput,
-      altFormat: picker.options.altFormat,
-      dateFormat: picker.options.dateFormat,
-      allowInput: picker.options.allowInput,
-      disableMobile: picker.options.disableMobile,
-      maxDate: picker.options.maxDate
-    },
-    {
-      altInput: true,
-      altFormat: "m/d/Y",
-      dateFormat: "Y-m-d",
-      allowInput: true,
-      disableMobile: true,
-      maxDate: harness.controller.todayKey
-    }
-  );
-  harness.root.querySelector(".review-day-previous").click();
-  assert.equal(harness.controller.state.selectedDay, "2024-02-29");
-  assert.equal(picker.current, "2024-02-29");
-  assert.equal(picker.altInput.value, "02/29/2024");
-  harness.root.querySelector(".review-day-next").click();
-  assert.equal(harness.controller.state.selectedDay, "2024-03-01");
-  picker.select("2024-04-02");
-  assert.equal(harness.controller.state.selectedDay, "2024-04-02");
-  assert.equal(picker.altInput.value, "04/02/2024");
-  harness.root.querySelector(".review-calendar-button").click();
-  assert.equal(picker.openCount, 1);
+  const [fromPicker, toPicker] = harness.datePickerInstances.slice(-2);
+  for (const picker of [fromPicker, toPicker]) {
+    assert.equal(picker.options.enableTime, true);
+    assert.equal(picker.options.time_24hr, true);
+    assert.equal(picker.options.altFormat, "m/d/Y H:i");
+    assert.equal(picker.options.dateFormat, "Y-m-d H:i");
+    assert.equal(picker.options.allowInput, true);
+    assert.equal(picker.options.disableMobile, true);
+  }
+  const oldDuration = harness.controller.state.reviewRange.to -
+    harness.controller.state.reviewRange.from;
+  fromPicker.select(new Date((harness.controller.state.reviewRange.to + 60) * 1000));
+  const adjusted = harness.controller.state.reviewRange;
+  assert.ok(adjusted.from < adjusted.to);
+  assert.equal(adjusted.to - adjusted.from, oldDuration);
+  toPicker.select(new Date((adjusted.from - 60) * 1000));
+  assert.ok(harness.controller.state.reviewRange.from < harness.controller.state.reviewRange.to);
   assert.strictEqual(
     harness.root.querySelector('.review-camera-panel[data-camera="Drive Up"]'),
     panel
   );
   assert.strictEqual(panel.querySelector("hui-image"), image);
+});
+
+test("Review range clamps its absolute clock without exposing ISO input", t => {
+  const harness = createHistoricalHarness();
+  t.after(() => harness.close());
+  const range = harness.controller.state.reviewRange;
+  harness.controller.clock.setAbsolute(range.from - 300);
+  harness.controller.setReviewRangeEndpoint("from", range.from);
+  assert.equal(harness.controller.clock.absoluteTime, range.from - 300);
+  harness.controller.setReviewRangeEndpoint("to", range.to + 60);
+  harness.controller.applyReviewRange();
+  assert.equal(harness.controller.clock.absoluteTime, range.from);
+  assert.ok(harness.root.querySelectorAll(".review-range-field").length >= 2);
+  assert.equal(harness.root.querySelector(".review-day-previous"), null);
+  assert.equal(harness.root.querySelector(".review-day-next"), null);
+  assert.equal(harness.root.querySelector(".review-day-picker"), null);
+  assert.equal(harness.root.textContent.includes("T12:00:00"), false);
 });
 
 test("transport is in the shell header above one uninterrupted camera wall", t => {
@@ -832,8 +1163,8 @@ test("transport is in the shell header above one uninterrupted camera wall", t =
   );
   assert.deepEqual(
     [...workspace.querySelector(".review-camera-wall").children]
-      .map(child => child.className),
-    ["review-primary", "review-mini-grid"]
+      .map(child => child.classList.contains("review-layout-cell")),
+    new Array(16).fill(true)
   );
   assert.equal(harness.root.querySelector(".review-previous-event").disabled, true);
   assert.equal(harness.root.querySelector(".review-next-event").disabled, true);
@@ -850,12 +1181,56 @@ test("transport is in the shell header above one uninterrupted camera wall", t =
   }
   assert.equal(harness.root.querySelector(".review-return-live"), null);
   const controls = harness.root.querySelector(".review-transport-controls");
+  const speed = harness.root.querySelector(".review-speed-select");
   const now = harness.root.querySelector(".review-now");
   assert.strictEqual(now.parentElement, controls);
+  assert.strictEqual(speed.nextElementSibling, now);
+  assert.deepEqual([...speed.options].map(option => option.textContent), [
+    "1x", "2x", "4x", "8x", "16x"
+  ]);
   assert.equal(now.textContent, "");
+  assert.equal(now.disabled, false);
+  assert.equal(harness.root.querySelectorAll(".review-transport-controls button").length, 7);
   assert.equal(now.querySelector("ha-icon").getAttribute("icon"), "mdi:clock-fast");
-  assert.equal(workspace.querySelector(".review-mini-grid").children.length, 12);
+  assert.equal(workspace.querySelectorAll(".review-layout-cell:not([hidden])").length, 13);
   assert.equal(harness.root.textContent.includes("Review live"), false);
+});
+
+test("historical speed is shared, rate-aware, and retained through Now and re-entry", async t => {
+  const harness = createHistoricalHarness();
+  t.after(() => harness.close());
+  assert.deepEqual(REVIEW_PLAYBACK_SPEEDS, [1, 2, 4, 8, 16]);
+  assert.equal(harness.controller.state.playbackSpeed, 1);
+  const assignments = [...harness.controller.state.reviewAssignments];
+  await harness.controller.playHistorical(1800000000);
+  const before = harness.controller.clock.absoluteTime;
+  assert.equal(harness.controller.setPlaybackSpeed(8), true);
+  const after = harness.controller.clock.absoluteTime;
+  assert.ok(after >= before && after - before < 0.1);
+  assert.equal(harness.controller.clock.rate, 8);
+  assert.ok([...harness.controller._historicalPlayers.values()].every(
+    player => player.video.playbackRate === 8
+  ));
+  harness.controller.returnToLive();
+  assert.equal(harness.controller.state.playbackSpeed, 8);
+  assert.deepEqual(harness.controller.state.reviewAssignments, assignments);
+  assert.ok([...harness.root.querySelectorAll("hui-image.review-live-camera")].every(
+    image => !Object.hasOwn(image, "playbackRate")
+  ));
+  harness.controller.deactivate();
+  harness.controller.activate();
+  assert.equal(harness.controller.state.playbackSpeed, 8);
+  assert.equal(harness.root.querySelector(".review-speed-select").value, "8");
+});
+
+test("ReviewClock advances at the selected historical speed", () => {
+  let now = 1000;
+  const clock = new ReviewClock(() => now);
+  clock.setAbsolute(100);
+  clock.setRate(16);
+  clock.start();
+  now = 2250;
+  assert.equal(clock.absoluteTime, 120);
 });
 
 test("historical Pause and Play preserve and resume the shared ReviewClock", async t => {
@@ -918,21 +1293,22 @@ test("skip crossing the prepared range uses the existing VOD preparation path", 
   );
 });
 
-test("mini wall occupancy and blanks remain stable for zero and one participant", t => {
+test("Primary+12 physical cells retain legitimate blanks", t => {
   const harness = createHistoricalHarness();
   t.after(() => harness.close());
-  const mini = harness.root.querySelector(".review-mini-grid");
-  assert.deepEqual(
-    [...mini.querySelectorAll(".review-camera-panel")].map(panel => panel.dataset.camera),
-    ["Drive Down"]
+  const wall = harness.root.querySelector(".review-camera-wall");
+  assert.equal(wall.querySelectorAll(".review-layout-cell:not([hidden])").length, 13);
+  assert.strictEqual(
+    wall.querySelector('[data-review-slot="1"] .review-camera-panel').dataset.camera,
+    "Drive Down"
   );
-  assert.equal(mini.querySelectorAll(".review-mini-blank").length, 11);
+  assert.equal(wall.querySelectorAll(".review-layout-cell:not([hidden]):empty").length, 11);
   harness.controller.setSelectedCameraNames(["Drive Up"]);
-  assert.equal(mini.querySelectorAll(".review-camera-panel").length, 0);
-  assert.equal(mini.querySelectorAll(".review-mini-blank").length, 12);
+  assert.equal(wall.querySelectorAll('[data-review-slot]:not([data-review-slot="0"]) .review-camera-panel').length, 0);
+  assert.equal(wall.querySelectorAll(".review-layout-cell:not([hidden]):empty").length, 12);
   harness.controller.setSelectedCameraNames([]);
   assert.ok(harness.root.querySelector(".review-empty-state"));
-  assert.equal(mini.querySelectorAll(".review-mini-blank").length, 12);
+  assert.equal(wall.querySelectorAll(".review-camera-panel").length, 0);
 });
 
 test("civil days use the requested timezone and retain DST day lengths", () => {
@@ -953,7 +1329,7 @@ test("diagnostics and raw timestamp controls are gated out by default", () => {
   controller.mount(root);
   controller.activate();
   assert.equal(root.querySelector(".review-diagnostics"), null);
-  assert.ok(root.querySelector("input.review-day-picker"));
+  assert.equal(root.querySelectorAll("input.review-range-picker").length, 2);
   assert.equal(root.querySelector(".review-target"), null);
   assert.equal(root.textContent.includes("2026-09-08T14:00:00-07:00"), false);
   controller.setDebug(true);

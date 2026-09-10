@@ -13,6 +13,7 @@ from .probe import (
     normalize_prepare_result,
     validate_prepare_request,
     validate_probe_request,
+    validate_review_request,
 )
 
 DOMAIN = "frigate_max"
@@ -79,3 +80,30 @@ def async_register(hass: HomeAssistant) -> None:
     """Register the Prototype 0 compatibility command and Review v1 API."""
     websocket_api.async_register_command(hass, websocket_probe_vod_timing)
     websocket_api.async_register_command(hass, websocket_prepare_vod_v1)
+    websocket_api.async_register_command(hass, websocket_review_events_v1)
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "frigate_max/v1/review/get",
+        vol.Required("cameras"): [str],
+        vol.Required("from"): vol.Coerce(float),
+        vol.Required("to"): vol.Coerce(float),
+    }
+)
+@websocket_api.async_response
+async def websocket_review_events_v1(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict,
+) -> None:
+    """Return allowlisted event markers for an active Review range."""
+    try:
+        cameras, from_epoch, to_epoch = validate_review_request(
+            msg["cameras"], msg["from"], msg["to"]
+        )
+        result = await hass.data[DOMAIN].get_review_events(cameras, from_epoch, to_epoch)
+    except (ProbeDataError, FrigateProbeError) as err:
+        connection.send_error(msg["id"], "frigate_max_review_unavailable", str(err))
+        return
+    connection.send_result(msg["id"], result)
