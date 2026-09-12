@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  createTestHarness
+  createTestHarness,
+  defaultCameras
 } from "./helpers/nvr-card-harness.js";
 
 function setup(t, options) {
@@ -935,7 +936,7 @@ test("reconnect diagnostic card IDs are unique and do not affect persistence key
   );
 });
 
-test("setConfig reconnect diagnostic reports equivalent calls without changing identity", t => {
+test("equivalent setConfig stays reconnect-quiet without changing identity", t => {
   const harness = setup(t);
   const card = harness.createCard();
   const cells = harness.getPhysicalCells(card);
@@ -954,16 +955,11 @@ test("setConfig reconnect diagnostic reports equivalent calls without changing i
     cameras: card.config.cameras.map(camera => ({ ...camera }))
   });
 
-  const event = logs.find(entry => {
-    return entry.event === "set-config-called";
-  });
-  assert.equal(event.equivalent, true);
-  assert.equal(event.layout, "2x2");
-  assert.equal(event.assignedCameraCount, 0);
+  assert.deepEqual(logs, []);
   assert.deepEqual(harness.getPhysicalCells(card), cells);
 });
 
-test("card disconnect and reconnect diagnostics preserve state and hui-image identity", t => {
+test("card disconnect and reconnect stay quiet while preserving state and hui-image identity", t => {
   const harness = setup(t);
   const reconnectEvents = [];
   const originalInfo = harness.window.console.info;
@@ -989,16 +985,7 @@ test("card disconnect and reconnect diagnostics preserve state and hui-image ide
   assert.deepEqual(assignments(card), assignmentsBefore);
   assert.equal(card._maximizedSlot, 4);
   assert.strictEqual(harness.getPlayer(card, "Garage"), image);
-  assert.ok(reconnectEvents.some(entry => {
-    return entry.event === "card-disconnected";
-  }));
-  assert.ok(reconnectEvents.some(entry => {
-    return entry.event === "card-connected";
-  }));
-  assert.ok(reconnectEvents.some(entry => {
-    return entry.event === "reconnect-snapshot" &&
-      entry.reason === "card-disconnected";
-  }));
+  assert.deepEqual(reconnectEvents, []);
 });
 
 test("live status positions default safely and update the existing stalled spinner without touching media", t => {
@@ -1137,9 +1124,13 @@ test("downstream replacement removes old listeners and invalidates callbacks", a
   assert.equal(state.frameCount, 0);
   assert.deepEqual(events, []);
   presentFrame(replacement);
-  replacement.dispatchEvent(new harness.window.Event("playing"));
+  replacement.dispatchEvent(new harness.window.Event("waiting"));
+  replacement.dispatchEvent(new harness.window.Event("stalled"));
+  replacement.dispatchEvent(new harness.window.Event("error"));
+  replacement.dispatchEvent(new harness.window.Event("error"));
   assert.equal(state.frameCount, 1);
   assert.equal(events.length, 1);
+  assert.equal(events[0][0], "media-error");
 });
 
 test("presentation cleanup explicitly cancels the first-frame timer", t => {
@@ -1376,7 +1367,7 @@ test("reconnect snapshot reports ownership and source without changing runtime s
   }).length, writesBefore);
 });
 
-test("changed hass connection identity is observed without rerender or rehydration", t => {
+test("changed hass connection identity stays quiet without rerender or rehydration", t => {
   const harness = setup(t);
   const card = harness.createCard();
   card.assignCamera("Garage");
@@ -1408,24 +1399,13 @@ test("changed hass connection identity is observed without rerender or rehydrati
 
   card.hass = nextHass;
 
-  const changed = logs.find(entry => {
-    return entry.event === "hass-reference-changed";
-  });
-  assert.equal(changed.hassChanged, true);
-  assert.equal(changed.connectionChanged, true);
-  assert.equal(changed.connectionConnected, true);
+  assert.deepEqual(logs, []);
   assert.equal(renderSlotCalls, 0);
   assert.strictEqual(harness.getPlayer(card, "Garage"), image);
   assert.equal(image.cameraImage, source);
   assert.equal(harness.userStateCalls.filter(call => {
     return call.type === "frontend/get_user_data";
   }).length, loadsBefore);
-  const snapshot = logs.find(entry => {
-    return entry.event === "reconnect-snapshot" &&
-      entry.reason === "hass-reference-changed";
-  });
-  assert.equal(snapshot.cells[0].haStateEntityExists, true);
-  assert.equal(snapshot.cells[0].haState, "streaming");
 });
 
 test("public connection state changes emit lost and restored snapshots without timers", t => {
@@ -1462,10 +1442,7 @@ test("public connection state changes emit lost and restored snapshots without t
   assert.ok(logs.some(entry => {
     return entry.event === "ha-connection-restored";
   }));
-  assert.ok(logs.some(entry => {
-    return entry.event === "reconnect-snapshot" &&
-      entry.reason === "connection-restored";
-  }));
+  assert.equal(logs.some(entry => entry.event === "reconnect-snapshot"), false);
   assert.strictEqual(harness.getPlayer(card, "Garage"), image);
 });
 
@@ -1875,6 +1852,126 @@ test("card workspace logic accepts a replaceable HA user-state adapter", t => {
       view => view.name
     ), ["Adapter View"]);
   });
+});
+
+test("workspace restore blocks default writes and keeps remote state authoritative", async t => {
+  const harness = setup(t);
+  let resolveLoad;
+  const saves = [];
+  const store = {
+    load: () => new Promise(resolve => { resolveLoad = resolve; }),
+    save: (key, value) => {
+      saves.push({ key, value });
+      return Promise.resolve();
+    }
+  };
+  const card = harness.window.document.createElement("nvr-card");
+  card._userStateStore = store;
+  harness.window.document.body.appendChild(card);
+  card.setConfig({ cameras: defaultCameras });
+  card.hass = harness.createHass();
+  const hydration = card._workspaceHydration;
+
+  card.selectLayout("3x3");
+  card.assignCameraToSlot("Front", 0);
+  assert.equal(card._workspaceRestoreState, "loading");
+  assert.equal(card._workspaceHydrated, false);
+  assert.deepEqual(saves, []);
+
+  const remoteAssignments = new Array(16).fill(null);
+  remoteAssignments[5] = "camera.garage";
+  resolveLoad({
+    result: "loaded",
+    value: {
+      version: 1,
+      viewState: {
+        version: 1,
+        layout: "4x4",
+        assignedCameras: remoteAssignments,
+        maximizedSlot: 5
+      },
+      savedViews: {
+        version: 1,
+        views: [{
+          id: "view-remote",
+          name: "Remote",
+          state: {
+            version: 1,
+            layout: "4x4",
+            assignedCameras: remoteAssignments,
+            maximizedSlot: 5
+          }
+        }]
+      },
+      preferences: {},
+      customLayouts: { retained: true }
+    }
+  });
+  await hydration;
+
+  assert.equal(card._workspaceRestoreState, "resolved");
+  assert.equal(card._workspaceHydrated, true);
+  assert.equal(card._layout, "4x4");
+  assert.equal(card._assignedCameras[0], null);
+  assert.equal(card._assignedCameras[5], "Garage");
+  assert.equal(card._maximizedSlot, 5);
+  assert.deepEqual(Array.from(card._savedViews, view => view.name), ["Remote"]);
+  assert.equal(card._workspace.customLayouts.retained, true);
+  assert.deepEqual(saves, []);
+});
+
+test("failed workspace restore remains write-closed and retries on HA reconnect", async t => {
+  const harness = setup(t);
+  const saves = [];
+  let loadCount = 0;
+  const restoredAssignments = new Array(16).fill(null);
+  restoredAssignments[2] = "camera.hall";
+  const store = {
+    load: () => {
+      loadCount += 1;
+      if (loadCount === 1) return Promise.reject(new Error("temporary HA disconnect"));
+      return Promise.resolve({
+        result: "loaded",
+        value: {
+          version: 1,
+          viewState: {
+            version: 1,
+            layout: "3x3",
+            assignedCameras: restoredAssignments,
+            maximizedSlot: null
+          },
+          savedViews: { version: 1, views: [] },
+          preferences: {},
+          customLayouts: {}
+        }
+      });
+    },
+    save: (key, value) => {
+      saves.push({ key, value });
+      return Promise.resolve();
+    }
+  };
+  const card = harness.window.document.createElement("nvr-card");
+  card._userStateStore = store;
+  harness.window.document.body.appendChild(card);
+  card.setConfig({ cameras: defaultCameras });
+  card.hass = harness.createHass();
+  await card._workspaceHydration;
+
+  assert.equal(card._workspaceRestoreState, "failed");
+  assert.equal(card._workspaceHydrated, false);
+  card.selectLayout("4x4");
+  card.assignCameraToSlot("Front", 0);
+  assert.deepEqual(saves, []);
+
+  card.hass = harness.createHass();
+  await card._workspaceHydration;
+  assert.equal(loadCount, 2);
+  assert.equal(card._workspaceRestoreState, "resolved");
+  assert.equal(card._layout, "3x3");
+  assert.equal(card._assignedCameras[0], null);
+  assert.equal(card._assignedCameras[2], "Hall");
+  assert.deepEqual(saves, []);
 });
 
 test("HA user workspace uses stable frontend user-data messages without a user id", t => {

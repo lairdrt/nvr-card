@@ -10,7 +10,17 @@ const REVIEW_SLOT_CAPACITY = 16;
 const REVIEW_DEFAULT_RANGE_SECONDS = 3600;
 const REVIEW_CAMERA_DRAG_TYPE = "application/x-nvr-camera";
 const REVIEW_LAYOUT_DRAG_TYPE = "application/x-nvr-layout";
+const REVIEW_FILTERS = Object.freeze(["person", "car", "animal", "package"]);
+const REVIEW_QUERY_DEBOUNCE_MS = 400;
+const REVIEW_MEDIA_READY_TIMEOUT_MS = 15000;
+const HAVE_FUTURE_DATA = 3;
 export const REVIEW_PLAYBACK_SPEEDS = Object.freeze([1, 2, 4, 8, 16]);
+export const REVIEW_TIMELINE_CAMERA_COLORS = Object.freeze([
+  "#68c5e8", "#ef9b5f", "#77cf83", "#d58be8",
+  "#f0cf65", "#5ed0bd", "#ee7896", "#8fa9f4",
+  "#b9d873", "#dd8fca", "#7bc3a4", "#f0a86f",
+  "#71b7de", "#c69ae7", "#98c96a", "#e88778"
+]);
 
 const gridCells = count => Array.from({ length: count }, (_, slot) => ({ slot }));
 const freezeLayout = layout => Object.freeze({
@@ -164,6 +174,34 @@ export function normalizeReviewTimelineItems(result, range) {
 export function reviewTimelineMarkerTop(epoch, range) {
   if (!(range.from < range.to) || !Number.isFinite(epoch)) return null;
   return Math.min(1, Math.max(0, (range.to - epoch) / (range.to - range.from)));
+}
+
+export function reviewTimelineMarkerGeometry(item, range) {
+  const start = Number(item?.start_time);
+  if (!Number.isFinite(start) || !(range?.from < range?.to)) return null;
+  const candidateEnd = item?.end_time == null ? start : Number(item.end_time);
+  const end = Number.isFinite(candidateEnd) && candidateEnd >= start
+    ? candidateEnd
+    : start;
+  const top = reviewTimelineMarkerTop(end, range);
+  const bottom = reviewTimelineMarkerTop(start, range);
+  if (!Number.isFinite(top) || !Number.isFinite(bottom)) return null;
+  return {
+    top,
+    height: Math.max(0, bottom - top),
+    startEpoch: start,
+    endEpoch: end
+  };
+}
+
+export function reviewTimelineEpochFromCoordinate(clientY, contentTop, contentHeight, range) {
+  const y = Number(clientY);
+  const top = Number(contentTop);
+  const height = Number(contentHeight);
+  if (!Number.isFinite(y) || !Number.isFinite(top) || !(height > 0) ||
+      !(range?.from < range?.to)) return null;
+  const fraction = Math.min(1, Math.max(0, (y - top) / height));
+  return range.to - fraction * (range.to - range.from);
 }
 
 export class ReviewClock {
@@ -446,7 +484,9 @@ export class ReviewController {
     loadHls = loadReviewHls,
     now = () => performance.now(),
     wallClock = () => Date.now(),
-    datePickerFactory = globalThis.flatpickr
+    datePickerFactory = globalThis.flatpickr,
+    queryDebounceMs = REVIEW_QUERY_DEBOUNCE_MS,
+    mediaReadyTimeoutMs = REVIEW_MEDIA_READY_TIMEOUT_MS
   } = {}) {
     this._document = documentRef;
     this._loadHls = loadHls;
@@ -463,6 +503,8 @@ export class ReviewController {
     this._reviewAssignments = new Array(REVIEW_SLOT_CAPACITY).fill(null);
     this._selectedReviewCamera = null;
     this._selectedReviewLayout = null;
+    this._desiredReviewQuery = null;
+    this._displayedReviewQuery = null;
     this._selectionInitialized = false;
     this._active = false;
     this._suspended = false;
@@ -470,7 +512,9 @@ export class ReviewController {
     this._generation = 0;
     this._historicalPlayers = new Map();
     this._historicalRange = null;
+    this._historicalPlaybackRange = null;
     this._historicalPreparing = false;
+    this._historicalStatus = "";
     this._mediaPanels = new Map();
     this._diagnosticTimer = null;
     this._debugEnabled = false;
@@ -480,11 +524,18 @@ export class ReviewController {
       cameras: false, layouts: false, when: false, filters: false, diagnostics: false
     };
     this._reviewRange = null;
-    this._draftReviewRange = null;
-    this._rangeRefreshCount = 0;
-    this._timelineRequestId = 0;
-    this._timeline = { status: "idle", items: [], error: null, queryRange: null };
+    this._desiredReviewRange = null;
+    this._queryRefreshCount = 0;
+    this._queryGeneration = 0;
+    this._queryTimer = null;
+    this._queryDebounceMs = queryDebounceMs;
+    this._mediaReadyTimeoutMs = mediaReadyTimeoutMs;
+    this._timeline = {
+      status: "idle", refreshing: false, items: [], error: null, queryRange: null
+    };
     this._playbackSpeed = 1;
+    this._timelineDrag = null;
+    this._timelineClickSuppressionTimer = null;
     this.clock = new ReviewClock(now);
   }
 
@@ -498,6 +549,8 @@ export class ReviewController {
   }
 
   get state() {
+    this.ensureReviewQuery();
+    const desiredReviewQuery = this.getDesiredReviewQuery();
     return {
       active: this._active,
       presentationMode: this._presentationMode,
@@ -507,15 +560,18 @@ export class ReviewController {
       reviewAssignments: [...this._reviewAssignments],
       reviewClockAbsolute: this.clock.absoluteTime,
       reviewRange: this._reviewRange ? { ...this._reviewRange } : null,
-      activeReviewRange: this._reviewRange ? { ...this._reviewRange } : null,
-      draftReviewRange: this._draftReviewRange ? { ...this._draftReviewRange } : null,
-      reviewRangeDirty: this.isReviewRangeDirty(),
+      desiredReviewRange: this._desiredReviewRange ? { ...this._desiredReviewRange } : null,
+      desiredReviewQuery,
+      displayedReviewQuery: this.cloneReviewQuery(this._displayedReviewQuery),
       timeline: {
         status: this._timeline.status,
+        refreshing: this._timeline.refreshing,
         items: [...this._timeline.items],
         queryRange: this._timeline.queryRange ? { ...this._timeline.queryRange } : null
       },
       playbackSpeed: this._playbackSpeed,
+      historicalPreparing: this._historicalPreparing,
+      historicalStatus: this._historicalStatus,
       selectedFilters: [...this._selectedFilters],
       rhsMode: this._rhsMode,
       sectionExpanded: { ...this._sectionExpanded }
@@ -529,9 +585,6 @@ export class ReviewController {
     const enabledNames = this._cameras.map(camera => camera.name);
     if (!this._selectionInitialized) {
       this._reviewAssignments.fill(null);
-      enabledNames.slice(0, 2).forEach((name, slot) => {
-        this._reviewAssignments[slot] = name;
-      });
       this.syncSelectionFromAssignments();
       this._selectionInitialized = true;
     } else {
@@ -539,6 +592,11 @@ export class ReviewController {
       this._reviewAssignments = this._reviewAssignments.map(name =>
         enabled.has(name) ? name : null);
       this.syncSelectionFromAssignments();
+      if (this._desiredReviewQuery) {
+        this._desiredReviewQuery.cameraNames = this.canonicalCameraNames(
+          this._desiredReviewQuery.cameraNames.filter(name => enabled.has(name))
+        );
+      }
     }
     if (this._active && !this._suspended) {
       this.returnToLive();
@@ -580,6 +638,7 @@ export class ReviewController {
   mount(root, transportRoot = null) {
     if (this._root === root && this._transportRoot === transportRoot) return;
     this.cleanupHistorical();
+    this.cleanupTimelineInteraction();
     if (this._transportRoot) this._transportRoot.replaceChildren();
     this._root = root;
     this._transportRoot = transportRoot;
@@ -590,6 +649,8 @@ export class ReviewController {
 
   unmount() {
     this.cleanupHistorical();
+    this.cleanupTimelineInteraction();
+    this.cancelScheduledReviewQuery();
     this.cleanupDatePicker();
     if (this._root) this._root.replaceChildren();
     if (this._transportRoot) this._transportRoot.replaceChildren();
@@ -603,11 +664,12 @@ export class ReviewController {
     this._suspended = false;
     this._presentationMode = "live";
     this.clock.reset();
-    this.ensureReviewRange();
+    const initialQuery = this.ensureReviewQuery();
     if (this._root) {
       this._root.hidden = false;
       if (this._transportRoot) this._transportRoot.hidden = false;
       this.render();
+      if (initialQuery) void this.refreshReviewQuery();
     }
   }
 
@@ -615,6 +677,8 @@ export class ReviewController {
     this._active = false;
     this._presentationMode = "live";
     this.cleanupHistorical();
+    this.cleanupTimelineInteraction();
+    this.cancelScheduledReviewQuery();
     this.cleanupDatePicker();
     this.clock.reset();
     this._mediaPanels.clear();
@@ -631,6 +695,8 @@ export class ReviewController {
   suspend() {
     this._suspended = true;
     this.cleanupHistorical();
+    this.cleanupTimelineInteraction();
+    this.cancelScheduledReviewQuery();
     this.cleanupDatePicker();
     this._mediaPanels.clear();
     if (this._root) this._root.replaceChildren();
@@ -645,8 +711,44 @@ export class ReviewController {
     }
   }
 
+  canonicalCameraNames(names) {
+    const requested = new Set(Array.isArray(names) ? names : []);
+    return this._cameras.map(camera => camera.name).filter(name => requested.has(name));
+  }
+
+  canonicalFilters(filters) {
+    const requested = new Set(filters ?? []);
+    return REVIEW_FILTERS.filter(name => requested.has(name));
+  }
+
+  cloneReviewQuery(query) {
+    if (!query) return null;
+    return {
+      cameraNames: [...query.cameraNames],
+      range: { ...query.range },
+      filters: [...query.filters]
+    };
+  }
+
+  getDesiredReviewQuery() {
+    this.ensureReviewRange();
+    return {
+      cameraNames: this.canonicalCameraNames(this._selectedCameraNames),
+      range: { ...this._desiredReviewRange },
+      filters: this.canonicalFilters(this._selectedFilters)
+    };
+  }
+
+  ensureReviewQuery() {
+    this.ensureReviewRange();
+    this._desiredReviewQuery = this.getDesiredReviewQuery();
+    if (this._displayedReviewQuery) return false;
+    this._displayedReviewQuery = this.cloneReviewQuery(this._desiredReviewQuery);
+    this._reviewRange = { ...this._displayedReviewQuery.range };
+    return true;
+  }
+
   setSelectedCameraNames(names) {
-    const previous = new Set(this._selectedCameraNames);
     const requested = new Set(Array.isArray(names) ? names : []);
     const ordered = this._cameras
       .map(camera => camera.name)
@@ -670,11 +772,12 @@ export class ReviewController {
       next[slot] = name;
     }
     if (next.every((name, slot) => name === this._reviewAssignments[slot])) {
+      this.renderCameraControls();
       return true;
     }
     this._reviewAssignments = next;
     this.syncSelectionFromAssignments();
-    this.handleAssignmentChange(previous);
+    this.handleAssignmentChange();
     return true;
   }
 
@@ -690,36 +793,13 @@ export class ReviewController {
       this._selectedCameraNames[0] ?? null;
   }
 
-  handleAssignmentChange(previous = new Set()) {
-    const selected = new Set(this._selectedCameraNames);
+  handleAssignmentChange({ refreshQuery = true } = {}) {
     if (this._active && !this._suspended) {
-      if (this._presentationMode === "historical") {
-        for (const name of previous) {
-          if (!selected.has(name)) {
-            this.cleanupHistoricalPlayer(this._historicalPlayers.get(name));
-            this._historicalPlayers.delete(name);
-          }
-        }
-        const additions = this.getSelectedCameras().filter(camera => !previous.has(camera.name));
-        for (const camera of additions) {
-          this._historicalPlayers.set(camera.name, this.createHistoricalPlayer(camera));
-        }
-        this.renderCameraControls();
-        this.syncMediaPanels();
-        const generation = this._generation;
-        additions.forEach(camera => {
-          void this.prepareHistoricalAddition(
-            this._historicalPlayers.get(camera.name),
-            generation
-          );
-        });
-        if (this._historicalPlayers.size === 0) this.clock.pause();
-        this.updateTransport();
-      } else {
-        this.renderCameraControls();
-        this.syncMediaPanels();
-      }
+      if (refreshQuery) this.retireHistoricalForReviewEdit();
+      this.renderCameraControls();
+      this.syncMediaPanels();
     }
+    if (refreshQuery) this.reviewCriteriaChanged();
   }
 
   setPrimaryCamera(name) {
@@ -747,7 +827,6 @@ export class ReviewController {
       this.updateReviewLayoutControls();
       return true;
     }
-    const previous = new Set(this._selectedCameraNames);
     const names = this._reviewAssignments.filter(Boolean);
     this._reviewLayout = layoutKey;
     this._selectedReviewLayout = null;
@@ -757,7 +836,7 @@ export class ReviewController {
     });
     this.syncSelectionFromAssignments();
     this.applyReviewLayout();
-    this.handleAssignmentChange(previous);
+    this.handleAssignmentChange({ refreshQuery: false });
     this.updateReviewLayoutControls();
     return true;
   }
@@ -790,12 +869,21 @@ export class ReviewController {
     if (!camera || !visible || !Number.isInteger(targetSlot)) return false;
     const sourceSlot = this._reviewAssignments.indexOf(cameraName);
     if (sourceSlot === targetSlot) return true;
-    const previous = new Set(this._selectedCameraNames);
     if (sourceSlot >= 0) this._reviewAssignments[sourceSlot] = null;
     this._reviewAssignments[targetSlot] = cameraName;
     this._selectedReviewCamera = null;
     this.syncSelectionFromAssignments();
-    this.handleAssignmentChange(previous);
+    this.handleAssignmentChange();
+    return true;
+  }
+
+  removeCameraFromSlot(cameraName) {
+    const slot = this._reviewAssignments.indexOf(cameraName);
+    if (slot < 0) return false;
+    this._reviewAssignments[slot] = null;
+    this._selectedReviewCamera = null;
+    this.syncSelectionFromAssignments();
+    this.handleAssignmentChange({ refreshQuery: true });
     return true;
   }
 
@@ -807,44 +895,91 @@ export class ReviewController {
   }
 
   setFilter(name, selected) {
-    if (!["person", "car", "animal", "package"].includes(name)) return false;
+    if (!REVIEW_FILTERS.includes(name)) return false;
+    if (this._selectedFilters.has(name) === Boolean(selected)) return true;
     if (selected) this._selectedFilters.add(name);
     else this._selectedFilters.delete(name);
+    this.retireHistoricalForReviewEdit();
+    this.reviewCriteriaChanged();
     return true;
   }
 
   ensureReviewRange() {
-    if (!(this._reviewRange?.from < this._reviewRange?.to)) {
+    if (!this._reviewRange || !Number.isFinite(this._reviewRange.from) ||
+        !Number.isFinite(this._reviewRange.to)) {
       const to = Math.floor((this._wallClock() / 1000) / 60) * 60;
       this._reviewRange = { from: to - REVIEW_DEFAULT_RANGE_SECONDS, to };
     }
-    if (!(this._draftReviewRange?.from < this._draftReviewRange?.to)) {
-      this._draftReviewRange = { ...this._reviewRange };
+    if (!this._desiredReviewRange || !Number.isFinite(this._desiredReviewRange.from) ||
+        !Number.isFinite(this._desiredReviewRange.to)) {
+      this._desiredReviewRange = { ...this._reviewRange };
     }
   }
 
-  isReviewRangeDirty() {
-    return Boolean(this._draftReviewRange && this._reviewRange &&
-      (this._draftReviewRange.from !== this._reviewRange.from ||
-       this._draftReviewRange.to !== this._reviewRange.to));
+  cancelScheduledReviewQuery() {
+    if (this._queryTimer === null) return;
+    const view = this._root?.ownerDocument?.defaultView ?? globalThis;
+    view.clearTimeout(this._queryTimer);
+    this._queryTimer = null;
   }
 
-  refreshReviewRange() {
+  retireHistoricalForReviewEdit() {
+    if (this._presentationMode === "historical" || this._historicalPreparing) {
+      this.returnToLive();
+    }
+  }
+
+  reviewCriteriaChanged() {
     this.ensureReviewRange();
-    this._rangeRefreshCount += 1;
-    const requestId = ++this._timelineRequestId;
-    const range = { ...this._reviewRange };
+    this._desiredReviewQuery = this.getDesiredReviewQuery();
+    const generation = ++this._queryGeneration;
+    this.cancelScheduledReviewQuery();
+    if (!(this._desiredReviewQuery.range.from < this._desiredReviewQuery.range.to)) {
+      this._timeline.refreshing = false;
+      this.updateRhs();
+      return false;
+    }
+    const view = this._root?.ownerDocument?.defaultView ?? globalThis;
+    this._queryTimer = view.setTimeout(() => {
+      this._queryTimer = null;
+      void this.refreshReviewQuery(generation);
+    }, this._queryDebounceMs);
+    return true;
+  }
+
+  flushScheduledReviewQuery() {
+    const scheduled = this._queryTimer !== null;
+    this.cancelScheduledReviewQuery();
+    if (!scheduled) return Promise.resolve(false);
+    return this.refreshReviewQuery(this._queryGeneration);
+  }
+
+  refreshReviewQuery(generation = this._queryGeneration) {
+    this.cancelScheduledReviewQuery();
+    this.ensureReviewQuery();
+    const query = this.cloneReviewQuery(this._desiredReviewQuery);
+    if (!(query.range.from < query.range.to)) return Promise.resolve(false);
+    this._queryRefreshCount += 1;
+    const range = query.range;
     const now = this._wallClock() / 1000;
     const queryTo = Math.min(range.to, now);
-    const cameras = this.getOrderedCameras()
+    const desiredNames = new Set(query.cameraNames);
+    const cameras = this._cameras.filter(camera => desiredNames.has(camera.name))
       .map(camera => this.getFrigateCameraId(camera))
       .filter((camera, index, list) => camera && list.indexOf(camera) === index);
-    this._timeline = { status: "loading", items: [], error: null, queryRange: null };
+    this._timeline.refreshing = true;
+    this._timeline.error = null;
     this.updateRhs();
     if (queryTo <= range.from || !this._hass || typeof this._hass.callWS !== "function" || cameras.length === 0) {
-      this._timeline = { status: "loaded", items: [], error: null, queryRange: { from: range.from, to: queryTo } };
+      if (generation !== this._queryGeneration) return Promise.resolve(this._queryRefreshCount);
+      this._displayedReviewQuery = this.cloneReviewQuery(query);
+      this._reviewRange = { ...range };
+      this._timeline = {
+        status: "loaded", refreshing: false, items: [], error: null,
+        queryRange: { from: range.from, to: queryTo }
+      };
       this.updateRhs();
-      return Promise.resolve(this._rangeRefreshCount);
+      return Promise.resolve(this._queryRefreshCount);
     }
     const queryRange = { from: range.from, to: queryTo };
     this._timeline.queryRange = queryRange;
@@ -854,32 +989,22 @@ export class ReviewController {
       from: queryRange.from,
       to: queryRange.to
     })).then(result => {
-      if (requestId !== this._timelineRequestId) return;
-      this._timeline = { status: "loaded", items: normalizeReviewTimelineItems(result, range), error: null, queryRange };
+      if (generation !== this._queryGeneration) return;
+      this._displayedReviewQuery = this.cloneReviewQuery(query);
+      this._reviewRange = { ...range };
+      this._timeline = {
+        status: "loaded", refreshing: false,
+        items: normalizeReviewTimelineItems(result, range), error: null, queryRange
+      };
       this.updateRhs();
     }).catch(error => {
-      if (requestId !== this._timelineRequestId) return;
-      this._timeline = { status: "error", items: [], error: "Unable to load activity.", queryRange };
+      if (generation !== this._queryGeneration) return;
+      this._timeline.refreshing = false;
+      this._timeline.error = "Unable to load activity.";
+      if (this._timeline.status === "idle") this._timeline.status = "error";
       this.updateRhs();
       if (this._debugEnabled) console.warn("Review Timeline refresh failed", error?.message);
-    }).then(() => this._rangeRefreshCount);
-  }
-
-  applyReviewRange() {
-    this.ensureReviewRange();
-    if (!this.isReviewRangeDirty()) return false;
-    const next = { ...this._draftReviewRange };
-    if (!(next.from < next.to)) return false;
-    this._reviewRange = next;
-    const absolute = this.clock.absoluteTime;
-    if (Number.isFinite(absolute) &&
-        (absolute < next.from || absolute > next.to)) {
-      this.clock.setAbsolute(Math.min(Math.max(absolute, next.from), next.to));
-      this.updateClockDisplay();
-    }
-    void this.refreshReviewRange();
-    this.updateTransport();
-    return true;
+    }).then(() => this._queryRefreshCount);
   }
 
   setReviewRangeEndpoint(endpoint, value) {
@@ -887,25 +1012,18 @@ export class ReviewController {
     const epoch = value instanceof Date ? value.getTime() / 1000 : Number(value);
     if (!Number.isFinite(epoch)) return false;
     this.ensureReviewRange();
-    const duration = Math.max(
-      this._draftReviewRange.to - this._draftReviewRange.from,
-      REVIEW_DEFAULT_RANGE_SECONDS
-    );
-    if (endpoint === "from") {
-      this._draftReviewRange.from = epoch;
-      if (epoch >= this._draftReviewRange.to) this._draftReviewRange.to = epoch + duration;
-    } else {
-      this._draftReviewRange.to = epoch;
-      if (epoch <= this._draftReviewRange.from) this._draftReviewRange.from = epoch - duration;
-    }
+    if (this._desiredReviewRange[endpoint] === epoch) return true;
+    this._desiredReviewRange[endpoint] = epoch;
+    this.retireHistoricalForReviewEdit();
     this.updateWhenControls();
+    this.reviewCriteriaChanged();
     return true;
   }
 
   setReviewTimePart(endpoint, part, value) {
     if (!['from', 'to'].includes(endpoint) || !['hour', 'minute'].includes(part)) return false;
     this.ensureReviewRange();
-    const date = pickerDateForEpoch(this._draftReviewRange[endpoint], this.timeZone);
+    const date = pickerDateForEpoch(this._desiredReviewRange[endpoint], this.timeZone);
     const numeric = Number(value);
     if (!Number.isInteger(numeric) || (part === 'hour' && (numeric < 0 || numeric > 23)) ||
         (part === 'minute' && (numeric < 0 || numeric > 59))) return false;
@@ -930,13 +1048,17 @@ export class ReviewController {
 
   includeReviewTarget(targetEpoch) {
     this.ensureReviewRange();
+    this.cancelScheduledReviewQuery();
+    this._queryGeneration += 1;
     const duration = this._reviewRange.to - this._reviewRange.from;
     if (targetEpoch < this._reviewRange.from) {
       this._reviewRange = { from: targetEpoch, to: targetEpoch + duration };
     } else if (targetEpoch > this._reviewRange.to) {
       this._reviewRange = { from: targetEpoch - duration, to: targetEpoch };
     }
-    this._draftReviewRange = { ...this._reviewRange };
+    this._desiredReviewRange = { ...this._reviewRange };
+    this._desiredReviewQuery = this.getDesiredReviewQuery();
+    this._displayedReviewQuery = this.cloneReviewQuery(this._desiredReviewQuery);
     this.updateWhenControls();
   }
 
@@ -945,12 +1067,31 @@ export class ReviewController {
     this.cleanupHistorical();
     this.clock.reset();
     this._presentationMode = "live";
+    this._historicalStatus = "";
     if (this._active && !this._suspended) this.renderMediaArea();
   }
 
-  getSelectedCameras() {
-    const selected = new Set(this._selectedCameraNames);
-    return this._cameras.filter(camera => selected.has(camera.name));
+  async selectTimelineTime(value) {
+    this.ensureReviewRange();
+    const targetEpoch = Number(value);
+    const displayedQuery = this._displayedReviewQuery;
+    const range = displayedQuery?.range;
+    if (!Number.isFinite(targetEpoch) || !(range?.from < range?.to) ||
+        targetEpoch < range.from || targetEpoch > range.to) return false;
+    if (targetEpoch > this._wallClock() / 1000) {
+      if (this._presentationMode === "historical" || this._historicalPreparing) {
+        this.returnToLive();
+      }
+      this._historicalStatus = "No recording at this time.";
+      this.updateTransport();
+      return false;
+    }
+    await this.playHistorical(targetEpoch, {
+      updateDisplayedRange: false,
+      playbackRange: { ...range },
+      cameraNames: [...displayedQuery.cameraNames]
+    });
+    return true;
   }
 
   getOrderedCameras() {
@@ -1097,7 +1238,15 @@ export class ReviewController {
     transport.className = "review-transport";
     const controlsGroup = this._document.createElement("div");
     controlsGroup.className = "review-transport-controls";
-    const addTransportButton = ({ className, label, icon, disabled = false, action }) => {
+    const transportGroup = this._document.createElement("div");
+    transportGroup.className = "review-toolbar-group review-vcr-group";
+    const speedGroup = this._document.createElement("div");
+    speedGroup.className = "review-toolbar-group review-speed-group";
+    const nowGroup = this._document.createElement("div");
+    nowGroup.className = "review-toolbar-group review-now-group";
+    const addTransportButton = ({
+      parent = transportGroup, className, label, icon, disabled = false, action
+    }) => {
       const button = this._document.createElement("button");
       button.type = "button";
       button.className = className;
@@ -1108,7 +1257,7 @@ export class ReviewController {
       symbol.setAttribute("icon", icon);
       button.appendChild(symbol);
       if (action) button.addEventListener("click", action);
-      controlsGroup.appendChild(button);
+      parent.appendChild(button);
       return button;
     };
     addTransportButton({
@@ -1147,14 +1296,17 @@ export class ReviewController {
       speed.appendChild(option);
     }
     speed.addEventListener("change", () => this.setPlaybackSpeed(speed.value));
-    controlsGroup.appendChild(speed);
+    speedGroup.appendChild(speed);
     addTransportButton({
+      parent: nowGroup,
       className: "review-now", label: "Now",
       icon: "mdi:clock-fast", action: () => this.returnToLive()
     });
-    const clock = this._document.createElement("time");
-    clock.className = "review-clock-display";
-    transport.append(controlsGroup, clock);
+    controlsGroup.append(transportGroup, speedGroup, nowGroup);
+    const playbackStatus = this._document.createElement("span");
+    playbackStatus.className = "review-historical-state";
+    playbackStatus.hidden = true;
+    transport.append(controlsGroup, playbackStatus);
     const wall = this._document.createElement("div");
     wall.className = "review-camera-wall";
     for (let slot = 0; slot < REVIEW_SLOT_CAPACITY; slot += 1) {
@@ -1171,17 +1323,26 @@ export class ReviewController {
     rhs.className = "review-rhs";
     const modes = this._document.createElement("div");
     modes.className = "review-rhs-modes";
+    modes.setAttribute("role", "tablist");
     for (const mode of ["timeline", "events", "details"]) {
       const button = this._document.createElement("button");
       button.type = "button";
       button.dataset.mode = mode;
       button.textContent = mode[0].toUpperCase() + mode.slice(1);
+      button.setAttribute("role", "tab");
       button.addEventListener("click", () => this.setRhsMode(mode));
       modes.appendChild(button);
     }
     const rhsContent = this._document.createElement("div");
     rhsContent.className = "review-rhs-content";
-    rhs.append(modes, rhsContent);
+    const timeTruth = this._document.createElement("footer");
+    timeTruth.className = "review-time-truth";
+    const timeLabel = this._document.createElement("span");
+    timeLabel.textContent = "Review Time:";
+    const clock = this._document.createElement("time");
+    clock.className = "review-clock-display";
+    timeTruth.append(timeLabel, clock);
+    rhs.append(modes, rhsContent, timeTruth);
     product.append(controls, media, rhs);
     this._root.appendChild(product);
     this.renderCameraControls();
@@ -1303,9 +1464,6 @@ export class ReviewController {
       input.type = "text";
       input.className = `review-range-picker review-${endpoint}-picker`;
       input.setAttribute("aria-label", `Review ${endpoint} date and time`);
-      input.addEventListener("keydown", event => {
-        if (event.key === "Enter" && this.isReviewRangeDirty()) this.applyReviewRange();
-      });
       label.append(caption, input);
       content.appendChild(label);
       if (typeof this._datePickerFactory === "function") {
@@ -1319,7 +1477,7 @@ export class ReviewController {
           dateFormat: "Y-m-d H:i",
           allowInput: true,
           disableMobile: true,
-          defaultDate: pickerDateForEpoch(this._draftReviewRange[endpoint], this.timeZone),
+          defaultDate: pickerDateForEpoch(this._desiredReviewRange[endpoint], this.timeZone),
           appendTo: this._root,
           onChange: dates => {
             if (dates[0] instanceof Date) {
@@ -1360,19 +1518,6 @@ export class ReviewController {
       directField.appendChild(direct);
       content.appendChild(directField);
     }
-    const applyField = this._document.createElement("div");
-    applyField.className = "review-range-field review-range-apply-field";
-    const applyCaption = this._document.createElement("span");
-    applyCaption.setAttribute("aria-hidden", "true");
-    applyField.appendChild(applyCaption);
-    const apply = this._document.createElement("button");
-    apply.type = "button";
-    apply.className = "review-when-apply";
-    apply.textContent = "Apply";
-    apply.setAttribute("aria-label", "Apply Review investigation window");
-    apply.addEventListener("click", () => this.applyReviewRange());
-    applyField.appendChild(apply);
-    content.appendChild(applyField);
     this.updateWhenControls();
   }
 
@@ -1387,7 +1532,7 @@ export class ReviewController {
     this.ensureReviewRange();
     for (const endpoint of ["from", "to"]) {
       const input = this._root?.querySelector(`.review-${endpoint}-picker`);
-      const value = pickerDateForEpoch(this._draftReviewRange[endpoint], this.timeZone);
+      const value = pickerDateForEpoch(this._desiredReviewRange[endpoint], this.timeZone);
       if (this._datePickers[endpoint]) {
         this._datePickers[endpoint].setDate(value, false);
       } else if (input) {
@@ -1396,7 +1541,7 @@ export class ReviewController {
           hour: "2-digit", minute: "2-digit", hourCycle: "h23",
         }).format(value);
       }
-      const date = pickerDateForEpoch(this._draftReviewRange[endpoint], this.timeZone);
+      const date = pickerDateForEpoch(this._desiredReviewRange[endpoint], this.timeZone);
       const hour = this._root?.querySelector(`.review-${endpoint}-picker`)?.closest(".review-range-field")
         ?.nextElementSibling;
       const hourSelect = hour?.querySelector(".review-time-hour");
@@ -1404,53 +1549,227 @@ export class ReviewController {
       if (hourSelect) hourSelect.value = String(date.getHours());
       if (minuteSelect) minuteSelect.value = String(date.getMinutes());
     }
-    const apply = this._root?.querySelector(".review-when-apply");
-    if (apply) {
-      const dirty = this.isReviewRangeDirty();
-      apply.disabled = !dirty;
-      apply.classList.toggle("dirty", dirty);
-      apply.setAttribute("aria-disabled", String(!dirty));
-    }
   }
 
   updateRhs() {
     if (!this._root) return;
+    if (this._timelineDrag) this.cancelTimelineDrag();
     this._root.querySelectorAll(".review-rhs-modes button").forEach(button => {
       const selected = button.dataset.mode === this._rhsMode;
       button.classList.toggle("selected", selected);
       button.setAttribute("aria-pressed", String(selected));
+      button.setAttribute("aria-selected", String(selected));
     });
     const content = this._root.querySelector(".review-rhs-content");
     if (!content) return;
     if (this._rhsMode === "timeline") {
       content.innerHTML = this.renderTimeline();
+      this.attachTimelineSelection(content);
+      this.updateTimelineCursor();
       return;
     }
     const title = this._rhsMode[0].toUpperCase() + this._rhsMode.slice(1);
     content.innerHTML = `<div class="review-placeholder"><strong>${title}</strong><span>Foundation placeholder</span><small>Newest / Now at top<br>Earlier time runs downward</small></div>`;
   }
 
+  getTimelineLanes() {
+    const names = this.canonicalCameraNames(
+      this._displayedReviewQuery?.cameraNames ?? this._selectedCameraNames
+    );
+    return names.flatMap(name => {
+      const camera = this._cameras.find(candidate => candidate.name === name);
+      if (!camera) return [];
+      const cameraId = this.getFrigateCameraId(camera);
+      const index = Math.max(0, this._cameras.indexOf(camera));
+      return [{
+        name: camera.name,
+        cameraId,
+        color: REVIEW_TIMELINE_CAMERA_COLORS[index % REVIEW_TIMELINE_CAMERA_COLORS.length]
+      }];
+    });
+  }
+
   renderTimeline() {
     this.ensureReviewRange();
-    const range = this._reviewRange;
+    const range = this._displayedReviewQuery?.range ?? this._reviewRange;
+    const lanes = this.getTimelineLanes();
     const format = epoch => new Intl.DateTimeFormat(undefined, {
       timeZone: this.timeZone, hour: "2-digit", minute: "2-digit", hourCycle: "h23"
     }).format(new Date(epoch * 1000));
     const ticks = Array.from({ length: 5 }, (_, index) => {
       const epoch = range.to - ((range.to - range.from) * index / 4);
-      return `<div class="review-timeline-tick" style="top:${index * 25}%"><span>${format(epoch)}</span></div>`;
+      const top = reviewTimelineMarkerTop(epoch, range);
+      return `<div class="review-timeline-tick" style="top:${top * 100}%"><span>${format(epoch)}</span></div>`;
     }).join("");
-    let body = "";
-    if (this._timeline.status === "loading") body = "<div class=\"review-timeline-message\">Loading activity…</div>";
-    else if (this._timeline.status === "error") body = `<div class="review-timeline-message error">${this._timeline.error}</div>`;
-    else if (this._timeline.items.length === 0) body = "<div class=\"review-timeline-message\">No activity in this range</div>";
-    else body = this._timeline.items.map(item => {
-      const top = reviewTimelineMarkerTop(item.start_time, range) * 100;
-      const camera = escapeViewerHtml(item.camera_id);
-      const type = escapeViewerHtml(item.type);
-      return `<div class="review-timeline-marker" style="top:${top}%" title="${camera}: ${type}"><span>${camera}</span></div>`;
+    const laneCount = Math.max(1, lanes.length);
+    const headers = lanes.map(lane => {
+      const name = escapeViewerHtml(lane.name);
+      return `<div class="review-timeline-lane-heading" style="--review-camera-color:${lane.color}" title="${name}"><span>${name}</span></div>`;
     }).join("");
-    return `<div class="review-timeline" aria-label="Review activity timeline"><div class="review-timeline-axis">${ticks}${body}</div><div class="review-timeline-endpoints"><span>${format(range.to)}</span><span>${format(range.from)}</span></div></div>`;
+    const laneBodies = lanes.map(lane => {
+      const markers = this._timeline.items.filter(item => item.camera_id === lane.cameraId)
+        .map(item => {
+          const geometry = reviewTimelineMarkerGeometry(item, range);
+          if (!geometry) return "";
+          const camera = escapeViewerHtml(item.camera_id);
+          const type = escapeViewerHtml(item.type);
+          const diagnostics = this._debugEnabled
+            ? ` data-camera-id="${camera}" data-start-epoch="${geometry.startEpoch}" data-end-epoch="${geometry.endEpoch}"`
+            : "";
+          const point = geometry.height === 0 ? " point" : "";
+          return `<div class="review-timeline-marker${point}" style="top:${geometry.top * 100}%;height:${geometry.height * 100}%;--review-camera-color:${lane.color}"${diagnostics} title="${type}"></div>`;
+        }).join("");
+      return `<div class="review-timeline-lane" data-camera-id="${escapeViewerHtml(lane.cameraId ?? "")}" style="--review-camera-color:${lane.color}">${markers}</div>`;
+    }).join("");
+    let message = "";
+    if (this._timeline.status === "idle") message = "<div class=\"review-timeline-message\">Loading activity…</div>";
+    else if (this._timeline.status === "error") message = `<div class="review-timeline-message error">${this._timeline.error}</div>`;
+    else if (this._timeline.items.length === 0) message = "<div class=\"review-timeline-message\">No activity in this range</div>";
+    const refresh = this._timeline.refreshing
+      ? '<div class="review-timeline-refresh" role="status">Updating...</div>'
+      : this._timeline.error
+        ? `<div class="review-timeline-refresh error" role="status">${this._timeline.error}</div>`
+        : "";
+    return `<div class="review-timeline" aria-label="Review activity timeline" style="--review-timeline-lane-count:${laneCount}">${refresh}<div class="review-timeline-lane-headings"><div class="review-timeline-time-heading">Time</div>${headers}</div><div class="review-timeline-axis" role="button" aria-label="Select Review playback time">${ticks}<div class="review-timeline-lanes">${laneBodies}</div>${message}<div class="review-timeline-cursor" hidden aria-hidden="true"><span class="review-timeline-handle" role="slider" aria-label="Drag Review time"></span></div></div></div>`;
+  }
+
+  attachTimelineSelection(content) {
+    const axis = content?.querySelector(".review-timeline-axis");
+    if (!axis) return;
+    axis.addEventListener("click", event => {
+      if (event.button !== 0) return;
+      if (this._timelineClickSuppressionTimer !== null) return;
+      const epoch = this.getTimelinePointerEpoch(axis, event.clientY);
+      if (this._debugEnabled && Number.isFinite(epoch)) {
+        axis.dataset.selectedEpoch = String(epoch);
+        axis.dataset.displayedFrom = String(this._displayedReviewQuery?.range?.from ?? "");
+        axis.dataset.displayedTo = String(this._displayedReviewQuery?.range?.to ?? "");
+      }
+      if (Number.isFinite(epoch)) void this.selectTimelineTime(epoch);
+    });
+    const handle = axis.querySelector(".review-timeline-handle");
+    if (!handle) return;
+    handle.addEventListener("pointerdown", event => this.beginTimelineDrag(event, axis, handle));
+    handle.addEventListener("pointermove", event => this.moveTimelineDrag(event));
+    handle.addEventListener("pointerup", event => this.finishTimelineDrag(event));
+    handle.addEventListener("pointercancel", event => this.cancelTimelineDrag(event));
+  }
+
+  getTimelinePointerEpoch(axis, clientY, range = null) {
+    const rect = axis?.getBoundingClientRect?.();
+    if (!rect) return null;
+    const borderTop = Number(axis.clientTop) || 0;
+    const contentHeight = Number(axis.clientHeight) || Math.max(0, rect.height - borderTop);
+    return reviewTimelineEpochFromCoordinate(
+      clientY,
+      rect.top + borderTop,
+      contentHeight,
+      range ?? this._displayedReviewQuery?.range ?? this._reviewRange
+    );
+  }
+
+  beginTimelineDrag(event, axis, handle) {
+    if ((event.button ?? 0) !== 0 || this._timelineDrag ||
+        this._presentationMode !== "historical" || !Number.isFinite(this.clock.absoluteTime)) return;
+    const range = this._displayedReviewQuery?.range;
+    if (!(range?.from < range?.to)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const wasRunning = this.clock.running;
+    if (wasRunning) this.pausePlayback();
+    this._timelineDrag = {
+      pointerId: event.pointerId,
+      axis,
+      handle,
+      range: { ...range },
+      originalEpoch: this.clock.absoluteTime,
+      wasRunning
+    };
+    try {
+      handle.setPointerCapture?.(event.pointerId);
+    } catch {}
+    this.previewTimelineDrag(event.clientY);
+  }
+
+  previewTimelineDrag(clientY) {
+    const drag = this._timelineDrag;
+    if (!drag) return null;
+    const epoch = this.getTimelinePointerEpoch(drag.axis, clientY, drag.range);
+    if (!Number.isFinite(epoch)) return null;
+    this.clock.setAbsolute(epoch);
+    this.updateClockDisplay();
+    return epoch;
+  }
+
+  moveTimelineDrag(event) {
+    if (!this._timelineDrag || event.pointerId !== this._timelineDrag.pointerId) return;
+    event.preventDefault();
+    event.stopPropagation();
+    this.previewTimelineDrag(event.clientY);
+  }
+
+  finishTimelineDrag(event) {
+    const drag = this._timelineDrag;
+    if (!drag || event.pointerId !== drag.pointerId) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const epoch = this.previewTimelineDrag(event.clientY);
+    this._timelineDrag = null;
+    try {
+      drag.handle.releasePointerCapture?.(event.pointerId);
+    } catch {}
+    const view = this._root?.ownerDocument?.defaultView ?? globalThis;
+    if (this._timelineClickSuppressionTimer !== null) {
+      view.clearTimeout(this._timelineClickSuppressionTimer);
+    }
+    this._timelineClickSuppressionTimer = view.setTimeout(() => {
+      this._timelineClickSuppressionTimer = null;
+    }, 0);
+    if (Number.isFinite(epoch)) void this.selectTimelineTime(epoch);
+  }
+
+  cancelTimelineDrag(event = null) {
+    const drag = this._timelineDrag;
+    if (!drag || (event && event.pointerId !== drag.pointerId)) return false;
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+    this._timelineDrag = null;
+    try {
+      drag.handle.releasePointerCapture?.(drag.pointerId);
+    } catch {}
+    if (Number.isFinite(drag.originalEpoch)) this.clock.setAbsolute(drag.originalEpoch);
+    if (drag.wasRunning) this.resumePlayback();
+    else this.updateClockDisplay();
+    return true;
+  }
+
+  cleanupTimelineInteraction() {
+    this._timelineDrag = null;
+    if (this._timelineClickSuppressionTimer === null) return;
+    const view = this._root?.ownerDocument?.defaultView ?? globalThis;
+    view.clearTimeout(this._timelineClickSuppressionTimer);
+    this._timelineClickSuppressionTimer = null;
+  }
+
+  updateTimelineCursor() {
+    const cursor = this._root?.querySelector(".review-timeline-cursor");
+    if (!cursor) return;
+    const absolute = this.clock.absoluteTime;
+    const top = reviewTimelineMarkerTop(
+      absolute,
+      this._displayedReviewQuery?.range ?? this._reviewRange
+    );
+    const visible = (this._presentationMode === "historical" || this._timelineDrag) &&
+      Number.isFinite(top);
+    cursor.hidden = !visible;
+    cursor.setAttribute("aria-hidden", String(!visible));
+    if (visible) {
+      cursor.style.top = `${top * 100}%`;
+      const handle = cursor.querySelector(".review-timeline-handle");
+      handle?.setAttribute("aria-valuemin", String(this._displayedReviewQuery?.range?.from ?? ""));
+      handle?.setAttribute("aria-valuemax", String(this._displayedReviewQuery?.range?.to ?? ""));
+      handle?.setAttribute("aria-valuenow", String(absolute));
+    }
   }
 
   renderMediaArea() {
@@ -1467,9 +1786,6 @@ export class ReviewController {
     panel.className = "review-camera-panel";
     panel.dataset.camera = camera.name;
     panel.draggable = true;
-    const heading = this._document.createElement("div");
-    heading.className = "review-camera-heading";
-    heading.textContent = camera.name;
     const media = this._document.createElement("div");
     media.className = "review-camera-media";
     if (this._presentationMode === "live") {
@@ -1486,11 +1802,33 @@ export class ReviewController {
       media.appendChild(video);
       const status = this._document.createElement("div");
       status.className = "review-camera-status";
-      status.textContent = player?.message ?? "Preparing recording...";
+      status.textContent = player?.message ?? "Loading...";
+      status.hidden = !status.textContent;
       if (player) player.statusElement = status;
       media.appendChild(status);
     }
-    panel.append(heading, media);
+    const overlay = this._document.createElement("div");
+    overlay.className = "review-camera-overlay";
+    const name = this._document.createElement("span");
+    name.className = "review-camera-name";
+    name.textContent = camera.name;
+    const close = this._document.createElement("button");
+    close.type = "button";
+    close.className = "review-camera-close";
+    close.title = `Remove ${camera.name} from Review`;
+    close.setAttribute("aria-label", close.title);
+    const closeIcon = this._document.createElement("ha-icon");
+    closeIcon.setAttribute("icon", "mdi:close");
+    close.appendChild(closeIcon);
+    close.addEventListener("pointerdown", event => event.stopPropagation());
+    close.addEventListener("pointerup", event => event.stopPropagation());
+    close.addEventListener("click", event => {
+      event.preventDefault();
+      event.stopPropagation();
+      this.removeCameraFromSlot(camera.name);
+    });
+    overlay.append(name, close);
+    panel.append(media, overlay);
     panel.addEventListener("dragstart", event => {
       if (!event.dataTransfer) return;
       event.dataTransfer.effectAllowed = "move";
@@ -1510,8 +1848,7 @@ export class ReviewController {
     });
     panel.addEventListener("pointercancel", () => { touchStart = null; });
     panel.addEventListener("pointerup", event => {
-      if (event.pointerType !== "touch" || !touchStart ||
-          !panel.classList.contains("secondary")) return;
+      if (event.pointerType !== "touch" || !touchStart) return;
       const moved = Math.hypot(
         event.clientX - touchStart.x,
         event.clientY - touchStart.y
@@ -1522,9 +1859,10 @@ export class ReviewController {
         previousTap = 0;
         return;
       }
+      panel.classList.add("controls-visible");
       if (previousTap > 0 && event.timeStamp - previousTap <= 450) {
         previousTap = 0;
-        this.setPrimaryCamera(camera.name);
+        if (panel.classList.contains("secondary")) this.setPrimaryCamera(camera.name);
       } else {
         previousTap = event.timeStamp;
       }
@@ -1535,7 +1873,26 @@ export class ReviewController {
   syncMediaPanels() {
     const wall = this._root?.querySelector(".review-camera-wall");
     if (!wall) return;
-    const selected = new Set(this._selectedCameraNames);
+    const historicalNames = this._presentationMode === "historical"
+      ? this.canonicalCameraNames(this._displayedReviewQuery?.cameraNames ?? [])
+      : null;
+    const selectedNames = historicalNames ?? this._selectedCameraNames;
+    const selected = new Set(selectedNames);
+    const displayAssignments = [...this._reviewAssignments];
+    if (historicalNames) {
+      const active = new Set(historicalNames);
+      for (let slot = 0; slot < displayAssignments.length; slot += 1) {
+        if (displayAssignments[slot] && !active.has(displayAssignments[slot])) {
+          displayAssignments[slot] = null;
+        }
+      }
+      const visibleSlots = this.currentLayout.cells.map(cell => cell.slot);
+      for (const name of historicalNames) {
+        if (displayAssignments.includes(name)) continue;
+        const slot = visibleSlots.find(candidate => displayAssignments[candidate] === null);
+        if (slot !== undefined) displayAssignments[slot] = name;
+      }
+    }
     for (const [name, panel] of this._mediaPanels) {
       if (!selected.has(name)) {
         panel.remove();
@@ -1546,7 +1903,7 @@ export class ReviewController {
     for (const cellDefinition of this.currentLayout.cells) {
       const slot = cellDefinition.slot;
       const cell = wall.querySelector(`[data-review-slot="${slot}"]`);
-      const name = this._reviewAssignments[slot];
+      const name = displayAssignments[slot];
       const camera = this._cameras.find(candidate => candidate.name === name);
       if (!cell || !camera) continue;
       let panel = this._mediaPanels.get(camera.name);
@@ -1558,7 +1915,7 @@ export class ReviewController {
       panel.classList.toggle("secondary", slot !== 0);
       cell.appendChild(panel);
     }
-    if (this._selectedCameraNames.length === 0) {
+    if (selectedNames.length === 0) {
       const firstSlot = this.currentLayout.cells[0]?.slot;
       const firstCell = wall.querySelector(`[data-review-slot="${firstSlot}"]`);
       if (firstCell) {
@@ -1589,9 +1946,11 @@ export class ReviewController {
   }
 
   updateTransport() {
+    const playable = [...this._historicalPlayers.values()].some(player =>
+      !player.unavailable && player.video && player.hls);
     const historical = this._presentationMode === "historical" &&
       !this._historicalPreparing &&
-      this._historicalPlayers.size > 0;
+      playable;
     const pause = this._transportRoot?.querySelector(".review-pause");
     const play = this._transportRoot?.querySelector(".review-play");
     const back = this._transportRoot?.querySelector(".review-back-ten");
@@ -1609,14 +1968,25 @@ export class ReviewController {
     const now = this._transportRoot?.querySelector(".review-now");
     if (now) now.disabled = false;
     const speed = this._transportRoot?.querySelector(".review-speed-select");
-    if (speed) speed.value = String(this._playbackSpeed);
+    if (speed) {
+      speed.value = String(this._playbackSpeed);
+      speed.disabled = !historical;
+    }
+    const status = this._transportRoot?.querySelector(".review-historical-state");
+    if (status) {
+      status.textContent = this._historicalStatus;
+      status.hidden = !this._historicalStatus;
+    }
     this.updateClockDisplay();
   }
 
   updateClockDisplay() {
-    const output = this._transportRoot?.querySelector(".review-clock-display");
+    const output = this._root?.querySelector(".review-time-truth .review-clock-display");
     if (!output) return;
-    const absolute = this.clock.absoluteTime;
+    const clockAbsolute = this.clock.absoluteTime;
+    const absolute = Number.isFinite(clockAbsolute)
+      ? clockAbsolute
+      : this._wallClock() / 1000;
     output.textContent = Number.isFinite(absolute)
       ? new Intl.DateTimeFormat(undefined, {
         timeZone: this.timeZone,
@@ -1624,6 +1994,8 @@ export class ReviewController {
         hour: "numeric", minute: "2-digit", second: "2-digit"
       }).format(new Date(absolute * 1000))
       : "";
+    output.dateTime = Number.isFinite(absolute) ? new Date(absolute * 1000).toISOString() : "";
+    this.updateTimelineCursor();
   }
 
   pausePlayback() {
@@ -1655,7 +2027,18 @@ export class ReviewController {
   async seekHistoricalRelative(deltaSeconds) {
     if (this._presentationMode !== "historical" ||
         !Number.isFinite(this.clock.absoluteTime)) return false;
-    const target = this.clock.absoluteTime + Number(deltaSeconds);
+    let target = this.clock.absoluteTime + Number(deltaSeconds);
+    let reachedHistoricalEnd = false;
+    if (this._historicalPlaybackRange) {
+      const now = this._wallClock() / 1000;
+      const upper = Math.min(this._historicalPlaybackRange.to, now);
+      if (target >= upper && this._historicalPlaybackRange.to > now) {
+        this.returnToLive();
+        return true;
+      }
+      reachedHistoricalEnd = target >= upper;
+      target = Math.min(upper, Math.max(this._historicalPlaybackRange.from, target));
+    }
     const wasRunning = this.clock.running;
     const withinPreparedRange = this._historicalRange &&
       target >= this._historicalRange.start && target <= this._historicalRange.end;
@@ -1673,10 +2056,10 @@ export class ReviewController {
         player.seek = calculateHistoricalSeek(target, player.timing);
         await this.seekHistoricalPlayer(player);
       } catch (error) {
-        this.setPlayerStatus(player, `Unavailable: ${sanitizeReviewError(error)}`, true);
+        this.setPlayerStatus(player, "Historical playback unavailable.", true);
       }
     }));
-    if (wasRunning && players.some(player => !player.unavailable)) {
+    if (wasRunning && !reachedHistoricalEnd && players.some(player => !player.unavailable)) {
       players.filter(player => !player.unavailable).forEach(player => {
         player.video.playbackRate = this._playbackSpeed;
         void Promise.resolve(player.video.play()).catch(() => {});
@@ -1693,6 +2076,7 @@ export class ReviewController {
     player.unavailable = unavailable;
     if (player.statusElement) {
       player.statusElement.textContent = message;
+      player.statusElement.hidden = !message;
       player.statusElement.classList.toggle("unavailable", unavailable);
     }
   }
@@ -1706,32 +2090,9 @@ export class ReviewController {
       hlsListeners: [],
       waitCancellations: [],
       statusElement: null,
-      message: "Preparing recording...",
+      message: "Loading...",
       unavailable: false
     };
-  }
-
-  async prepareHistoricalAddition(player, generation) {
-    const targetEpoch = this.clock.absoluteTime;
-    if (!player || !Number.isFinite(targetEpoch)) return;
-    try {
-      if (!player.frigateCamera) throw new Error("No Frigate camera identity.");
-      const range = buildReviewRange(targetEpoch);
-      const Hls = await this._loadHls();
-      if (!Hls.isSupported()) throw new Error("This browser does not support historical HLS playback.");
-      await this.attachHistoricalPlayer(player, range, Hls, generation);
-      if (this._historicalPlayers.get(player.camera.name) !== player) return;
-      player.seek = calculateHistoricalSeek(this.clock.absoluteTime, player.timing);
-      await this.seekHistoricalPlayer(player);
-      if (this.clock.running) await Promise.resolve(player.video.play());
-      this.setPlayerStatus(player, "Ready");
-    } catch (error) {
-      this.cleanupHistoricalPlayer(player);
-      if (this._historicalPlayers.get(player?.camera?.name) === player) {
-        this.setPlayerStatus(player, `Unavailable: ${sanitizeReviewError(error)}`, true);
-      }
-    }
-    this.updateDiagnostics();
   }
 
   async requestPreparedTiming(player, range) {
@@ -1808,46 +2169,69 @@ export class ReviewController {
       player.video,
       "progress",
       () => player.video.seekable?.length > 0,
-      15000,
+      this._mediaReadyTimeoutMs,
       player.waitCancellations
     );
     this.assertCurrentGeneration(generation);
-    this.setPlayerStatus(player, "Ready");
   }
 
-  async seekHistoricalPlayer(player) {
+  async seekHistoricalPlayer(player, generation = null) {
+    if (generation !== null) this.assertCurrentGeneration(generation);
     const wait = waitForMediaEvent(
       player.video,
       "seeked",
       () => Number.isFinite(player.video.currentTime) &&
         Math.abs(player.video.currentTime - player.seek) <= 0.05 &&
         !player.video.seeking,
-      15000,
+      this._mediaReadyTimeoutMs,
       player.waitCancellations
     );
     player.video.currentTime = player.seek;
     await wait;
+    if (generation !== null) this.assertCurrentGeneration(generation);
+    await waitForMediaEvent(
+      player.video,
+      "canplay",
+      () => player.video.readyState >= HAVE_FUTURE_DATA,
+      this._mediaReadyTimeoutMs,
+      player.waitCancellations
+    );
+    if (generation !== null) this.assertCurrentGeneration(generation);
   }
 
-  async playHistorical(value, { autoplay = true } = {}) {
+  async playHistorical(value, {
+    autoplay = true,
+    updateDisplayedRange = true,
+    playbackRange = null,
+    cameraNames = null
+  } = {}) {
     const generation = ++this._generation;
     this.cleanupHistorical();
     try {
       const targetEpoch = parseReviewTimestamp(value);
-      this.includeReviewTarget(targetEpoch);
+      if (updateDisplayedRange) this.includeReviewTarget(targetEpoch);
       const range = buildReviewRange(targetEpoch);
       this._historicalRange = range;
+      this._historicalPlaybackRange = playbackRange && playbackRange.from < playbackRange.to
+        ? { ...playbackRange }
+        : null;
       this.clock.setAbsolute(targetEpoch);
-      for (const camera of this.getOrderedCameras()) {
+      this.clock.setRate(this._playbackSpeed);
+      const requestedNames = new Set(this.canonicalCameraNames(
+        cameraNames ?? this._displayedReviewQuery?.cameraNames ?? this._selectedCameraNames
+      ));
+      const participatingCameras = this._cameras.filter(camera => requestedNames.has(camera.name));
+      for (const camera of participatingCameras) {
         this._historicalPlayers.set(camera.name, this.createHistoricalPlayer(camera));
       }
       this._historicalPreparing = true;
+      this._historicalStatus = "Preparing playback…";
       this._presentationMode = "historical";
       this.renderMediaArea();
       const players = [...this._historicalPlayers.values()];
       for (const player of players) {
         if (!player.frigateCamera) {
-          this.setPlayerStatus(player, "Unavailable: no Frigate camera identity.", true);
+          this.setPlayerStatus(player, "Historical playback unavailable.", true);
         }
       }
       const candidates = players.filter(player => !player.unavailable);
@@ -1861,59 +2245,91 @@ export class ReviewController {
           this.assertCurrentGeneration(generation);
         } catch (error) {
           this.cleanupHistoricalPlayer(player);
-          this.setPlayerStatus(
-            player,
-            `Unavailable: ${sanitizeReviewError(error)}`,
-            true
-          );
+          this.setPlayerStatus(player, "No recording at this time.", true);
         }
       }));
       if (generation !== this._generation || !this._active) return;
       const ready = players.filter(player => !player.unavailable && player.hls);
       await Promise.all(ready.map(async player => {
         try {
-          await this.seekHistoricalPlayer(player);
+          await this.seekHistoricalPlayer(player, generation);
         } catch (error) {
           this.cleanupHistoricalPlayer(player);
-          this.setPlayerStatus(
-            player,
-            `Unavailable: ${sanitizeReviewError(error)}`,
-            true
-          );
+          this.setPlayerStatus(player, "Historical playback unavailable.", true);
         }
       }));
       const playable = ready.filter(player => !player.unavailable && player.hls);
-      if (generation !== this._generation || !this._active) return;
+      if (generation !== this._generation || !this._active || this._suspended) return;
+      playable.forEach(player => {
+        player.video.playbackRate = this._playbackSpeed;
+      });
+      if (autoplay && playable.length > 0) {
+        this.clock.setAbsolute(targetEpoch);
+        this.clock.start();
+      }
+      playable.forEach(player => this.setPlayerStatus(player, ""));
       const starts = autoplay
-        ? playable.map(player => {
-          player.video.playbackRate = this._playbackSpeed;
-          return Promise.resolve(player.video.play());
-        })
+        ? playable.map(player => Promise.resolve(player.video.play()))
         : [];
-      if (starts.length > 0) this.clock.start();
       const startResults = await Promise.allSettled(starts);
+      if (generation !== this._generation || !this._active || this._suspended) return;
       startResults.forEach((result, index) => {
         if (result.status === "rejected") {
-          this.setPlayerStatus(playable[index], "Unavailable: playback was blocked.", true);
+          this.setPlayerStatus(playable[index], "Historical playback unavailable.", true);
         }
       });
       if (playable.every(player => player.unavailable)) this.clock.pause();
       this._historicalPreparing = false;
+      const availableCount = playable.filter(player => !player.unavailable).length;
+      this._historicalStatus = availableCount === 0
+        ? "No recording at this time."
+        : availableCount < players.length
+          ? "Some cameras have no recording."
+          : "";
       this.updateTransport();
       this.updateDiagnostics();
       const view = this._root?.ownerDocument?.defaultView ?? globalThis;
-      this._diagnosticTimer = view.setInterval(() => {
-        this.updateClockDisplay();
-        this.updateDiagnostics();
-      }, 500);
+      if (availableCount > 0) {
+        this._diagnosticTimer = view.setInterval(() => {
+          if (this.enforceHistoricalPlaybackBoundary()) return;
+          this.updateClockDisplay();
+          this.updateDiagnostics();
+        }, 500);
+      }
     } catch (error) {
       if (generation !== this._generation) return;
       this.clock.pause();
       this._historicalPreparing = false;
+      for (const player of this._historicalPlayers.values()) {
+        if (!player.unavailable) {
+          this.cleanupHistoricalPlayer(player);
+          this.setPlayerStatus(player, "Historical playback unavailable.", true);
+        }
+      }
+      this._historicalStatus = "Unable to prepare playback.";
       const output = this._root?.querySelector(".review-diagnostic-output");
       if (output) output.textContent = sanitizeReviewError(error);
       this.updateTransport();
     }
+  }
+
+  enforceHistoricalPlaybackBoundary() {
+    if (!this._historicalPlaybackRange || this._presentationMode !== "historical" ||
+        !this.clock.running) return false;
+    const absolute = this.clock.absoluteTime;
+    const now = this._wallClock() / 1000;
+    const upper = Math.min(this._historicalPlaybackRange.to, now);
+    if (!Number.isFinite(absolute) || absolute < upper) return false;
+    if (this._historicalPlaybackRange.to > now) {
+      this.returnToLive();
+      return true;
+    }
+    this.clock.pause();
+    this.clock.setAbsolute(this._historicalPlaybackRange.to);
+    for (const player of this._historicalPlayers.values()) player.video?.pause();
+    this.updateTransport();
+    this.updateDiagnostics();
+    return true;
   }
 
   updateDiagnostics() {
@@ -1939,9 +2355,14 @@ export class ReviewController {
       );
     }
     if (estimates.length >= 2) {
+      const absoluteTimes = estimates.map(estimate => estimate.absolute);
       lines.push(
         `${estimates[0].name}/${estimates[1].name} absolute delta=` +
         `${Math.abs(estimates[0].absolute - estimates[1].absolute).toFixed(3)} s`
+      );
+      lines.push(
+        `maximum reconstructed absolute delta=` +
+        `${(Math.max(...absoluteTimes) - Math.min(...absoluteTimes)).toFixed(3)} s`
       );
     }
     output.textContent = lines.join("\n");
@@ -1976,6 +2397,7 @@ export class ReviewController {
     }
     this._historicalPlayers.clear();
     this._historicalRange = null;
+    this._historicalPlaybackRange = null;
     this._historicalPreparing = false;
   }
 }

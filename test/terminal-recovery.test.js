@@ -125,6 +125,70 @@ for (const maximized of [false, true]) test(`terminal recovery: replaces one ima
   }
 });
 
+test("terminal recovery: same-cell reentrancy retains one active recovery generation", t => {
+  const x = setup(t);
+  stall(x);
+  x.h.advanceTime(60000);
+  const replacement = current(x);
+  const replacementState = x.card._reconnectPresentationDiagnostics.get(replacement);
+  const owner = replacementState.recoveryOwner;
+
+  assert.ok(owner?.active);
+  assert.strictEqual(x.card._terminalRecoveryOwners.get(replacement.closest(".video-cell")), owner);
+  x.card.replaceTerminallyStalledImage(x.state);
+  x.card.replaceTerminallyStalledImage(replacementState);
+  x.h.advanceTime(500000);
+
+  assert.strictEqual(current(x), replacement);
+  assert.strictEqual(replacementState.recoveryOwner, owner);
+  assert.equal(x.events.filter(event => event.event === "terminal-recovery-start").length, 1);
+});
+
+test("terminal recovery: stale generation cannot supersede a newer cell presentation", t => {
+  const x = setup(t);
+  stall(x);
+  x.h.advanceTime(60000);
+  const firstReplacement = current(x);
+  const firstState = x.card._reconnectPresentationDiagnostics.get(firstReplacement);
+  const firstOwner = firstState.recoveryOwner;
+  const firstVideo = attach(x.h, x.card, firstReplacement);
+  firstVideo.frame();
+  assert.equal(firstOwner.active, false);
+
+  x.h.advanceTime(10000);
+  x.h.advanceTime(60000);
+  const secondReplacement = current(x);
+  const secondState = x.card._reconnectPresentationDiagnostics.get(secondReplacement);
+  const secondOwner = secondState.recoveryOwner;
+  assert.ok(secondOwner.generation > firstOwner.generation);
+
+  x.card.replaceTerminallyStalledImage(x.state);
+  x.card.replaceTerminallyStalledImage(firstState);
+  assert.strictEqual(current(x), secondReplacement);
+  assert.strictEqual(x.card._terminalRecoveryOwners.get(secondReplacement.closest(".video-cell")), secondOwner);
+  assert.equal(x.events.filter(event => event.event === "terminal-recovery-start").length, 2);
+});
+
+test("terminal recovery: cell-local replacement causes no workspace persistence write", t => {
+  const x = setup(t, { enabled: true, reconnect_after: 60 }, true);
+  const beforeState = JSON.stringify(x.card.captureWorkspace());
+  const beforeWrites = x.h.userStateCalls.filter(call => call.type === "frontend/set_user_data").length;
+  const other = x.h.capturePlayerIdentity(x.card, "Front");
+
+  stall(x);
+  x.h.advanceTime(60000);
+
+  assert.equal(JSON.stringify(x.card.captureWorkspace()), beforeState);
+  assert.equal(
+    x.h.userStateCalls.filter(call => call.type === "frontend/set_user_data").length,
+    beforeWrites
+  );
+  assert.deepEqual(x.h.capturePlayerIdentity(x.card, "Front"), other);
+  assert.equal(x.card._layout, "2x2");
+  assert.equal(x.card._assignedCameras[0], "Garage");
+  assert.equal(x.card._maximizedSlot, 0);
+});
+
 test("terminal recovery: real current frame resets latch for future independent stall", t => {
   const x = setup(t); stall(x); x.h.advanceTime(60000);
   const next = current(x), state = x.card._reconnectPresentationDiagnostics.get(next);

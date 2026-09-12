@@ -195,6 +195,15 @@ const NVR_GRID_CAMERA_DRAG_TYPE =
   "application/x-nvr-grid-camera";
 const NVR_RECONNECT_FIRST_FRAME_TIMEOUT = 15000;
 const NVR_FRAME_LIVENESS_STALL_DEFAULT = 10;
+const NVR_ACTIONABLE_RECONNECT_EVENTS = new Set([
+  "ha-connection-lost",
+  "ha-connection-restored",
+  "first-frame-timeout",
+  "frame-stall-detected",
+  "frame-resumed",
+  "terminal-recovery-start",
+  "terminal-recovery-complete"
+]);
 const AUTO_DIM_DEFAULTS = Object.freeze({
   enabled: false,
   invalid: false,
@@ -361,6 +370,7 @@ class NVRCard extends HTMLElement {
     this._workspacePersistenceKey = null;
     this._workspaceHydration = null;
     this._workspaceHydrated = false;
+    this._workspaceRestoreState = "unstarted";
     this._workspaceGeneration = 0;
     this._workspaceRevision = 0;
     this._restoringViewState = false;
@@ -373,6 +383,8 @@ class NVRCard extends HTMLElement {
     this._reconnectPresentationDiagnostics = new WeakMap();
     this._reconnectPresentationSources = new WeakMap();
     this._terminalRecoveryAttempts = new WeakSet();
+    this._terminalRecoveryOwners = new WeakMap();
+    this._nextTerminalRecoveryGeneration = 1;
     this._activeReconnectPresentationDiagnostics = new Set();
     this._nextReconnectPresentationId = 1;
     this._lastObservedConnection = null;
@@ -460,6 +472,7 @@ class NVRCard extends HTMLElement {
 
 
   logReconnect(event, details = {}) {
+    if (!NVR_ACTIONABLE_RECONNECT_EVENTS.has(event)) return;
     console.info("[NVR reconnect]", {
       event,
       ...this.getReconnectDiagnosticContext(),
@@ -494,6 +507,7 @@ class NVRCard extends HTMLElement {
       cameraImage: state.cameraImage,
       cameraView: state.cameraView,
       huiImageId: state.huiImageId,
+      recoveryGeneration: state.recoveryOwner?.generation ?? null,
       elapsedMs: state.epochStart === null
         ? null
         : Math.round(performance.now() - state.epochStart)
@@ -528,6 +542,12 @@ class NVRCard extends HTMLElement {
     }
     const state = this._reconnectPresentationDiagnostics.get(image);
     if (!state) return;
+    const recoveryOwner = state.recoveryOwner;
+    if (recoveryOwner && this._terminalRecoveryOwners.get(recoveryOwner.cell) === recoveryOwner) {
+      recoveryOwner.active = false;
+      this._terminalRecoveryOwners.delete(recoveryOwner.cell);
+    }
+    state.recoveryOwner = null;
     this.cancelTerminalRecovery(state, "presentation-retired");
     state.active = false;
     this.cleanupReconnectVideo(state);
@@ -642,10 +662,18 @@ class NVRCard extends HTMLElement {
     const oldImage = state.image;
     const frame = oldImage.parentElement;
     const cell = frame?.parentElement;
-    if (!state.active || state.recoveryAttempted || !oldImage.isConnected ||
+    const activeRecovery = cell ? this._terminalRecoveryOwners.get(cell) : null;
+    if (!state.active || state.recoveryAttempted || activeRecovery?.active || !oldImage.isConnected ||
         !frame?.classList.contains("camera-frame") ||
         Number(cell?.dataset.slot) !== state.slot ||
         this.getPresentationCameraName(state.slot) !== state.logicalCamera) return;
+    const recoveryOwner = {
+      generation: this._nextTerminalRecoveryGeneration++,
+      cell,
+      image: null,
+      active: true
+    };
+    this._terminalRecoveryOwners.set(cell, recoveryOwner);
     state.recoveryAttempted = true;
     this.setReconnectPresentationVisualState(state, true);
     this.logReconnect("terminal-recovery-start", this.getReconnectPresentationDetails(state));
@@ -657,6 +685,7 @@ class NVRCard extends HTMLElement {
       this.completeMaximizeMediaSession("presentation-retired");
     }
     const image = this.createLiveCameraImage(oldImage.dataset.entity, state.cameraImage);
+    recoveryOwner.image = image;
     this._terminalRecoveryAttempts.delete(oldImage);
     this._terminalRecoveryAttempts.add(image);
     image.style.cssText = oldImage.style.cssText;
@@ -666,7 +695,7 @@ class NVRCard extends HTMLElement {
     oldImage.replaceWith(image);
     this._reconnectNodeIdentity.set(cell, image);
     this.armReconnectPresentationDiagnostics(image, state.slot, state.logicalCamera,
-      state.cameraImage, true, { indicator });
+      state.cameraImage, true, { indicator, recoveryOwner });
   }
 
 
@@ -686,6 +715,13 @@ class NVRCard extends HTMLElement {
     this.cancelTerminalRecovery(state, "frame-resumed");
     const wasReconnecting = state.recoveryAttempted;
     if (state.recoveryAttempted) {
+      const recoveryOwner = state.recoveryOwner;
+      if (recoveryOwner && this._terminalRecoveryOwners.get(recoveryOwner.cell) === recoveryOwner &&
+          recoveryOwner.image === state.image) {
+        recoveryOwner.active = false;
+        this._terminalRecoveryOwners.delete(recoveryOwner.cell);
+      }
+      state.recoveryOwner = null;
       state.recoveryAttempted = false;
       this._terminalRecoveryAttempts.delete(state.image);
       this.logReconnect("terminal-recovery-complete", this.getReconnectPresentationDetails(state));
@@ -770,23 +806,22 @@ class NVRCard extends HTMLElement {
     this.cleanupReconnectVideo(state);
     if (!video) return;
     state.video = video;
+    state.mediaErrorLogged = false;
     const generation = state.videoGeneration;
     const isCurrent = () => state.active && state.video === video &&
       state.videoGeneration === generation;
-    ["waiting", "stalled", "error", "ended", "emptied", "playing"].forEach(event => {
-      const listener = () => {
-        if (!isCurrent()) return;
-        const error = video.error;
-        this.logMedia("media-event", {
-          ...this.getReconnectPresentationDetails(state),
-          mediaEvent: event,
-          mediaErrorCode: event === "error" ? error?.code ?? null : null,
-          mediaErrorMessage: event === "error" ? error?.message ?? null : null
-        });
-      };
-      video.addEventListener(event, listener, { passive: true });
-      state.mediaListeners.push({ target: video, event, listener });
-    });
+    const errorListener = () => {
+      if (!isCurrent() || state.mediaErrorLogged) return;
+      state.mediaErrorLogged = true;
+      const error = video.error;
+      this.logMedia("media-error", {
+        ...this.getReconnectPresentationDetails(state),
+        mediaErrorCode: error?.code ?? null,
+        mediaErrorMessage: error?.message ?? null
+      });
+    };
+    video.addEventListener("error", errorListener, { passive: true });
+    state.mediaListeners.push({ target: video, event: "error", listener: errorListener });
     if (typeof video.requestVideoFrameCallback === "function") {
       const nextFrame = () => {
         if (!isCurrent()) return;
@@ -857,6 +892,19 @@ class NVRCard extends HTMLElement {
       return;
     }
     this.cleanupReconnectPresentationDiagnostics(image);
+    let recoveryOwner = recovery?.recoveryOwner ?? null;
+    if (!recoveryOwner && this._terminalRecoveryAttempts.has(image)) {
+      const cell = image.closest(".video-cell");
+      if (cell) {
+        recoveryOwner = {
+          generation: this._nextTerminalRecoveryGeneration++,
+          cell,
+          image,
+          active: true
+        };
+        this._terminalRecoveryOwners.set(cell, recoveryOwner);
+      }
+    }
     const state = {
       image,
       slot,
@@ -868,6 +916,7 @@ class NVRCard extends HTMLElement {
       observers: [],
       observedRoots: new Set(),
       mediaListeners: [],
+      mediaErrorLogged: false,
       video: null,
       videoGeneration: 0,
       frameCallback: null,
@@ -876,6 +925,7 @@ class NVRCard extends HTMLElement {
       silenceStartedAt: null,
       terminalTimer: null,
       recoveryAttempted: this._terminalRecoveryAttempts.has(image),
+      recoveryOwner,
       lastFrameTime: null,
       frameCount: 0,
       frameLivenessStarted: false,
@@ -1281,9 +1331,9 @@ class NVRCard extends HTMLElement {
     }
 
     const generation = ++this._workspaceGeneration;
-    const startingRevision = this._workspaceRevision;
     const key = this.getWorkspacePersistenceKey();
     this._workspacePersistenceKey = key;
+    this._workspaceRestoreState = "loading";
     this.logUserState("workspace-load-start", {
       workspaceKey: key
     });
@@ -1311,15 +1361,9 @@ class NVRCard extends HTMLElement {
           throw new Error("Invalid HA user workspace.");
         }
 
-        if (startingRevision !== this._workspaceRevision) {
-          this._workspaceHydrated = true;
-          this._workspace = this.captureWorkspace();
-          this.saveWorkspace("state-changed-during-hydration");
-          return;
-        }
-
         this.applyHydratedWorkspace(normalized.workspace);
         this._workspaceHydrated = true;
+        this._workspaceRestoreState = "resolved";
         this.logUserState("workspace-load-success", {
           workspaceKey: key,
           result: normalized.result
@@ -1336,8 +1380,8 @@ class NVRCard extends HTMLElement {
         return;
       }
 
-      this._workspaceHydrated = true;
-      this._workspace = this.captureWorkspace();
+      this._workspaceHydrated = false;
+      this._workspaceRestoreState = "failed";
       console.warn("[NVR user state]", {
         event: "workspace-load-failed",
         workspaceKey: key,
@@ -1400,6 +1444,7 @@ class NVRCard extends HTMLElement {
 
     this.applyHydratedWorkspace(workspace);
     this._workspaceHydrated = true;
+    this._workspaceRestoreState = "resolved";
 
     if (!hasLegacyView && !hasLegacySaved) {
       return;
@@ -1488,6 +1533,7 @@ class NVRCard extends HTMLElement {
     if (
       this._restoringViewState ||
       !this._workspaceHydrated ||
+      this._workspaceRestoreState !== "resolved" ||
       !this._workspacePersistenceKey
     ) {
       return;
@@ -2596,12 +2642,10 @@ class NVRCard extends HTMLElement {
           <header class="card-title-bar">
             <div class="application-mode-control" role="group" aria-label="NVR mode">
               <button type="button" data-application-mode="live">
-                <ha-icon icon="mdi:cctv" aria-hidden="true"></ha-icon>
-                <span>Live</span>
+                <span>LIVE</span>
               </button>
               <button type="button" data-application-mode="review">
-                <ha-icon icon="mdi:history" aria-hidden="true"></ha-icon>
-                <span>Review</span>
+                <span>REVIEW</span>
               </button>
             </div>
             <div class="review-header-transport" hidden></div>
@@ -2879,48 +2923,45 @@ class NVRCard extends HTMLElement {
 
       .application-mode-control {
         display: flex;
-        gap: 3px;
-        margin-left: auto;
+        align-self: stretch;
+        gap: 12px;
+        margin-left: 8px;
         position: relative;
         z-index: 2;
       }
 
       .application-mode-control button {
         display: inline-flex;
-        width: 92px;
-        min-height: 34px;
-        padding: 0 10px;
+        width: auto;
+        min-height: 30px;
+        padding: 1px 2px 0;
         align-items: center;
         justify-content: center;
-        gap: 7px;
-        border: 1px solid #3b4954;
-        border-radius: 3px;
-        background: #171f26;
+        border: 0;
+        border-bottom: 2px solid transparent;
+        border-radius: 0;
+        background: transparent;
         color: #aebbc4;
-        box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.015);
-        font-size: 12px;
+        box-shadow: none;
+        font-size: 11px;
         font-weight: 600;
         letter-spacing: 0.02em;
         cursor: pointer;
       }
 
       .application-mode-control button.selected {
-        border-color: #56a7d8;
-        background: #24475b;
+        border-bottom-color: #6bbce9;
+        background: rgba(86, 167, 216, 0.1);
         color: #fff;
-        box-shadow: inset 0 -2px 0 #6bbce9;
+        box-shadow: none;
       }
 
       .application-mode-control button:hover:not(.selected),
       .application-mode-control button:focus-visible {
-        border-color: #587083;
-        background: #1c2831;
+        border-bottom-color: #587083;
+        background: rgba(255, 255, 255, 0.04);
         color: #e5f2fa;
         outline: none;
-      }
-
-      .application-mode-control ha-icon {
-        --mdc-icon-size: 18px;
       }
 
       .review-header-transport {
@@ -2928,7 +2969,7 @@ class NVRCard extends HTMLElement {
         top: 0;
         right: clamp(310px, 27vw, 410px);
         bottom: 0;
-        left: 0;
+        left: 130px;
         z-index: 1;
         display: grid;
         min-width: 0;
@@ -2972,8 +3013,7 @@ class NVRCard extends HTMLElement {
       .review-when-controls input,
       .review-filter-controls input,
       .review-diagnostics button,
-      .review-transport button,
-      .review-rhs-modes button {
+      .review-transport button {
         min-height: 44px;
         border: 1px solid #3b4954;
         border-radius: 4px;
@@ -3151,28 +3191,6 @@ class NVRCard extends HTMLElement {
         outline-offset: 1px;
       }
 
-      .review-when-controls button {
-        color: #cbd2d7;
-      }
-
-      .review-when-apply {
-        width: 100%;
-        min-height: 44px;
-        margin-top: 2px;
-        font-weight: 600;
-      }
-
-      .review-when-apply.dirty {
-        border-color: #568db3;
-        background: #1c303e;
-        color: #fff;
-      }
-
-      .review-when-controls button:disabled {
-        color: #70808c;
-        -webkit-text-fill-color: #70808c;
-      }
-
       .review-filter-controls {
         display: grid;
         grid-template-columns: 1fr 1fr;
@@ -3212,11 +3230,19 @@ class NVRCard extends HTMLElement {
       }
 
       .review-transport-controls {
+        --review-toolbar-group-gap: 8px;
+        display: flex;
+        min-width: 0;
+        align-items: center;
+        gap: var(--review-toolbar-group-gap);
+        white-space: nowrap;
+      }
+
+      .review-toolbar-group {
         display: flex;
         min-width: 0;
         align-items: center;
         gap: 2px;
-        white-space: nowrap;
       }
 
       .review-transport button {
@@ -3254,14 +3280,12 @@ class NVRCard extends HTMLElement {
 
       .review-transport .review-now {
         width: 32px;
-        margin-left: 4px;
       }
 
       .review-speed-select {
         width: 58px;
         height: 30px;
         min-height: 30px;
-        margin-left: 6px;
         padding: 0 5px;
         border: 1px solid #3b5263;
         border-radius: 3px;
@@ -3273,10 +3297,8 @@ class NVRCard extends HTMLElement {
       }
 
       .review-clock-display {
-        max-width: 190px;
         overflow: hidden;
         color: #c8d3da;
-        text-align: center;
         text-overflow: ellipsis;
         white-space: nowrap;
         font-size: 13px;
@@ -3310,7 +3332,10 @@ class NVRCard extends HTMLElement {
       }
 
       .review-camera-panel {
-        position: relative;
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
         min-width: 0;
         min-height: 0;
         background: #000;
@@ -3327,30 +3352,83 @@ class NVRCard extends HTMLElement {
         cursor: pointer;
       }
 
-      .review-camera-heading {
+      .review-camera-overlay {
         position: absolute;
-        top: 6px;
-        left: 7px;
+        top: 0;
+        right: 0;
+        left: 0;
         z-index: 5;
-        padding: 3px 6px;
-        background: rgba(0, 0, 0, 0.68);
+        display: flex;
+        min-width: 0;
+        height: 34px;
+        align-items: center;
+        gap: 4px;
+        padding-left: 8px;
+        background: rgba(0, 0, 0, 0.72);
         color: #fff;
         font-size: 12px;
         font-weight: 500;
         line-height: 1.2;
+        opacity: 0;
         pointer-events: none;
+        transition: opacity 100ms ease;
+        box-sizing: border-box;
+      }
+
+      .review-camera-panel:hover .review-camera-overlay,
+      .review-camera-panel:focus-within .review-camera-overlay,
+      .review-camera-panel.controls-visible .review-camera-overlay {
+        opacity: 1;
+        pointer-events: auto;
+      }
+
+      .review-camera-name {
+        min-width: 0;
+        flex: 1;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .review-camera-close {
+        display: grid;
+        width: 36px;
+        height: 34px;
+        flex: 0 0 36px;
+        place-items: center;
+        padding: 0;
+        border: 0;
+        background: transparent;
+        color: #fff;
+        cursor: pointer;
+      }
+
+      .review-camera-close:hover,
+      .review-camera-close:focus-visible {
+        background: rgba(255, 255, 255, 0.16);
+        outline: 1px solid #6bbce9;
+        outline-offset: -1px;
+      }
+
+      .review-camera-close ha-icon {
+        --mdc-icon-size: 20px;
       }
 
       .review-camera-media {
-        position: relative;
+        position: absolute;
+        inset: 0;
         width: 100%;
         height: 100%;
+        min-width: 0;
+        min-height: 0;
         overflow: hidden;
         background: #000;
       }
 
       .review-live-camera,
       .review-historical-video {
+        position: absolute;
+        inset: 0;
         display: block;
         width: 100%;
         height: 100%;
@@ -3360,16 +3438,32 @@ class NVRCard extends HTMLElement {
         max-height: 100%;
         object-fit: contain;
         overflow: hidden;
+        margin: 0;
+      }
+
+      .review-historical-video {
+        pointer-events: none;
       }
 
       .review-camera-status {
         position: absolute;
-        left: 6px;
-        bottom: 6px;
-        padding: 3px 5px;
+        inset: 0;
+        z-index: 3;
+        display: grid;
+        min-width: 0;
+        min-height: 0;
+        place-items: center;
+        padding: 8px;
         background: rgba(0, 0, 0, 0.72);
         color: #dce6ec;
+        text-align: center;
         font: 11px/1.3 monospace;
+        pointer-events: none;
+        box-sizing: border-box;
+      }
+
+      .review-camera-status[hidden] {
+        display: none !important;
       }
 
       .review-camera-status.unavailable {
@@ -3387,28 +3481,66 @@ class NVRCard extends HTMLElement {
       }
 
       .review-rhs {
-        display: grid;
-        grid-template-rows: auto 1fr;
+        display: flex;
+        flex-direction: column;
         border-left: 1px solid #26313b;
         overflow: hidden;
       }
 
       .review-rhs-modes {
         display: grid;
+        flex: 0 0 34px;
         grid-template-columns: repeat(3, 1fr);
-        gap: 3px;
-        padding: 8px;
+        gap: 0;
+        height: 34px;
+        padding: 0 6px;
         border-bottom: 1px solid #26313b;
       }
 
+      .review-rhs-modes button {
+        min-height: 34px;
+        padding: 0 8px;
+        border: 0;
+        border-bottom: 2px solid transparent;
+        border-radius: 0;
+        background: transparent;
+        color: #9fb0ba;
+        font: inherit;
+        font-size: 12px;
+        cursor: pointer;
+      }
+
       .review-rhs-modes button.selected {
-        border-color: #56a7d8;
-        background: #24475b;
+        border-bottom-color: #6bbce9;
+        background: rgba(86, 167, 216, 0.08);
+        color: #fff;
       }
 
       .review-rhs-content {
+        display: flex;
+        flex: 1 1 auto;
         min-height: 0;
-        overflow: auto;
+        overflow: hidden;
+      }
+
+      .review-time-truth {
+        display: flex;
+        flex: 0 0 34px;
+        min-width: 0;
+        padding: 0 10px;
+        align-items: center;
+        gap: 6px;
+        border-top: 1px solid #26313b;
+        background: #11161c;
+        box-sizing: border-box;
+        color: #9fb0ba;
+        font-size: 12px;
+      }
+
+      .review-time-truth .review-clock-display {
+        min-width: 0;
+        color: #e4ebef;
+        font-weight: 600;
       }
 
       .review-placeholder {
@@ -3423,53 +3555,186 @@ class NVRCard extends HTMLElement {
         text-align: center;
       }
 
+      .review-historical-state {
+        max-width: 180px;
+        overflow: hidden;
+        color: #9fb0ba;
+        font-size: 11px;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
       .review-placeholder strong {
         color: #dce6ec;
         font-size: 16px;
       }
 
       .review-timeline {
-        display: grid;
-        grid-template-columns: minmax(0, 1fr);
-        gap: 6px;
-        height: 100%;
-        min-height: 260px;
-        padding: 10px 8px;
+        --review-timeline-time-gutter: 58px;
+        position: relative;
+        display: flex;
+        flex: 1 1 auto;
+        flex-direction: column;
+        min-height: 0;
+        padding: 0 8px 4px;
         box-sizing: border-box;
+      }
+
+      .review-timeline-lane-headings {
+        display: grid;
+        flex: 0 0 28px;
+        grid-template-columns: var(--review-timeline-time-gutter)
+          repeat(var(--review-timeline-lane-count), minmax(0, 1fr));
+        min-width: 0;
+        align-items: center;
+        border-bottom: 1px solid #26313b;
+        color: #9fb0ba;
+        font-size: 10px;
+      }
+
+      .review-timeline-time-heading,
+      .review-timeline-lane-heading {
+        min-width: 0;
+        padding: 0 5px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        box-sizing: border-box;
+      }
+
+      .review-timeline-lane-heading {
+        border-left: 1px solid #26313b;
+        color: var(--review-camera-color);
+        text-align: center;
+      }
+
+      .review-timeline-lane-heading::before {
+        display: inline-block;
+        width: 6px;
+        height: 6px;
+        margin-right: 4px;
+        border-radius: 50%;
+        background: var(--review-camera-color);
+        content: "";
+      }
+
+      .review-timeline-refresh {
+        position: absolute;
+        top: 6px;
+        right: 8px;
+        z-index: 4;
+        padding: 2px 5px;
+        border-radius: 3px;
+        background: rgba(0, 0, 0, 0.72);
+        color: #9fb0ba;
+        font-size: 11px;
+        pointer-events: none;
+      }
+
+      .review-timeline-refresh.error {
+        color: #e59a9a;
       }
 
       .review-timeline-axis {
         position: relative;
-        min-height: 220px;
-        border-left: 2px solid #526675;
+        flex: 1 1 auto;
+        min-height: 0;
+        cursor: pointer;
+        touch-action: manipulation;
+      }
+
+      .review-timeline-lanes {
+        position: absolute;
+        inset: 0 0 0 var(--review-timeline-time-gutter);
+        display: grid;
+        grid-template-columns: repeat(var(--review-timeline-lane-count), minmax(0, 1fr));
+        min-width: 0;
+      }
+
+      .review-timeline-lane {
+        position: relative;
+        min-width: 0;
+        border-left: 1px solid #26313b;
+        overflow: hidden;
+      }
+
+      .review-timeline-lane:last-child {
+        border-right: 1px solid #26313b;
       }
 
       .review-timeline-tick {
         position: absolute;
-        left: -5px;
-        width: calc(100% + 5px);
+        left: 0;
+        z-index: 1;
+        width: 100%;
         border-top: 1px solid #3b4954;
         color: #9fb0ba;
         font-size: 11px;
       }
 
-      .review-timeline-tick span { position: absolute; left: 8px; top: -8px; }
-      .review-timeline-marker {
+      .review-timeline-tick span {
         position: absolute;
         left: 0;
-        width: 100%;
-        min-height: 18px;
-        padding-left: 10px;
+        top: -8px;
+        width: calc(var(--review-timeline-time-gutter) - 6px);
+        padding-left: 4px;
+        background: #11161c;
         box-sizing: border-box;
-        border-left: 4px solid #6db4de;
-        color: #dce6ec;
-        font-size: 11px;
       }
-      .review-timeline-marker span { background: #1c303e; padding: 2px 4px; }
-      .review-timeline-message { align-self: center; justify-self: center; color: #9fb0ba; font-size: 13px; }
-      .review-timeline-message.error { color: #e59a9a; }
-      .review-timeline-endpoints { display: flex; justify-content: space-between; color: #9fb0ba; font-size: 11px; }
+      .review-timeline-marker {
+        position: absolute;
+        left: 4px;
+        width: calc(100% - 8px);
+        min-height: 0;
+        box-sizing: border-box;
+        border-left: 3px solid var(--review-camera-color);
+        background: var(--review-camera-color);
+        opacity: 0.46;
+        pointer-events: none;
+      }
+      .review-timeline-marker.point {
+        height: 0 !important;
+        border-top: 3px solid var(--review-camera-color);
+        border-left: 0;
+        background: transparent;
+        opacity: 0.9;
+      }
+      .review-timeline-cursor {
+        position: absolute;
+        z-index: 3;
+        right: 0;
+        left: var(--review-timeline-time-gutter);
+        border-top: 2px solid #ffd166;
+        pointer-events: none;
+        transform: translateY(-1px);
+      }
 
+      .review-timeline-handle {
+        position: absolute;
+        left: 50%;
+        top: -7px;
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+        background: #ffd166;
+        box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.55);
+        cursor: grab;
+        pointer-events: auto;
+        touch-action: none;
+        transform: translateX(-50%);
+      }
+
+      .review-timeline-handle:active { cursor: grabbing; }
+      .review-timeline-message {
+        position: absolute;
+        inset: 0 0 0 var(--review-timeline-time-gutter);
+        display: grid;
+        place-items: center;
+        color: #9fb0ba;
+        font-size: 13px;
+        pointer-events: none;
+      }
+      .review-timeline-message.error { color: #e59a9a; }
       @media (max-width: 1099px) {
         .review-product {
           grid-template-columns: var(--nvr-sidebar-current-width) minmax(360px, 1fr) minmax(280px, 38vw);
