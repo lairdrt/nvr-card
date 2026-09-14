@@ -12,6 +12,19 @@ function setup(t, options) {
   return harness;
 }
 
+test("time.format defaults to 24-hour and validates explicit 12/24-hour values", t => {
+  const harness = setup(t);
+  const card = harness.createCard();
+  assert.equal(card._reviewController._timeFormat, "24-hour");
+  card.setConfig({ ...card.config, time: { format: "12-hour" } });
+  assert.equal(card._reviewController._timeFormat, "12-hour");
+  card.setConfig({ ...card.config, time: { format: "24-hour" } });
+  assert.equal(card._reviewController._timeFormat, "24-hour");
+  for (const time of [null, {}, { format: "13-hour" }, { format: "12-hour", extra: true }]) {
+    assert.throws(() => card.normalizeConfig({ cameras: [], time }), /time must contain format/);
+  }
+});
+
 test("global historical sync diagnostics address only the sole connected card", t => {
   const harness = setup(t);
   const api = harness.window.nvrDiagnostics;

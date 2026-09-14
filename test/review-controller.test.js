@@ -8,6 +8,7 @@ import {
   REVIEW_PLAYBACK_SPEEDS,
   REVIEW_TIMELINE_CAMERA_COLORS,
   ReviewClock,
+  formatNvrClockTime,
   ReviewController,
   calculateHistoricalSeek,
   getCivilDayBounds,
@@ -140,7 +141,8 @@ test("Review toolbar groups and every cell use one non-flow media geometry contr
 function createHistoricalHarness({
   unavailable = new Set(), prepareGate = null, reviewEvents = [], reviewError = false,
   reviewResponder = null, deferredSeek = new Set(), deferredPlayable = new Set(),
-  mediaReadyTimeoutMs = 15000, now = () => performance.now()
+  mediaReadyTimeoutMs = 15000, now = () => performance.now(),
+  wallClockMs = Date.parse("2026-09-10T12:00:00-07:00"), initialReviewRange = null
 } = {}) {
   const window = new Window({ url: "http://localhost/" });
   const starts = [];
@@ -163,6 +165,10 @@ function createHistoricalHarness({
     const pad = value => String(value).padStart(2, "0");
     const display = value => {
       const date = normalize(value);
+      if (!options.time_24hr) {
+        return `${pad(date.getMonth() + 1)}/${pad(date.getDate())}/${date.getFullYear()} ` +
+          `${pad(date.getHours() % 12 || 12)}:${pad(date.getMinutes())} ${date.getHours() < 12 ? "AM" : "PM"}`;
+      }
       return `${pad(date.getMonth() + 1)}/${pad(date.getDate())}/${date.getFullYear()} ` +
         `${pad(date.getHours())}:${pad(date.getMinutes())}`;
     };
@@ -339,7 +345,7 @@ function createHistoricalHarness({
   controller = new ReviewController({
     documentRef: window.document,
     loadHls: () => Promise.resolve(MockHls),
-    wallClock: () => Date.parse("2026-09-10T12:00:00-07:00"),
+    wallClock: () => typeof wallClockMs === "function" ? wallClockMs() : wallClockMs,
     datePickerFactory,
     mediaReadyTimeoutMs,
     now
@@ -348,6 +354,12 @@ function createHistoricalHarness({
   controller.setSelectedCameraNames(["Drive Up", "Drive Down"]);
   controller.setDebug(true);
   controller.setHass(hass);
+  if (initialReviewRange) {
+    controller._reviewRange = { ...initialReviewRange };
+    controller._desiredReviewRange = { ...initialReviewRange };
+    controller._desiredReviewQuery = controller.getDesiredReviewQuery();
+    controller._displayedReviewQuery = controller.cloneReviewQuery(controller._desiredReviewQuery);
+  }
   controller.mount(surface, transportRoot);
   controller.activate();
   return {
@@ -389,6 +401,246 @@ test("ReviewClock remains an absolute clock independent of player currentTime", 
   clock.pause();
   now = 9000;
   assert.equal(clock.absoluteTime, 1800000005.75);
+});
+
+test("one NVR clock formatter renders 12-hour and 24-hour boundary times", () => {
+  const at = iso => Date.parse(iso) / 1000;
+  assert.match(formatNvrClockTime(at("2026-09-10T00:05:00Z"), "UTC", "12-hour"), /^12:05 AM$/);
+  assert.match(formatNvrClockTime(at("2026-09-10T12:05:00Z"), "UTC", "12-hour"), /^12:05 PM$/);
+  assert.match(formatNvrClockTime(at("2026-09-10T19:05:00Z"), "UTC", "12-hour"), /^7:05 PM$/);
+  assert.equal(formatNvrClockTime(at("2026-09-10T00:05:00Z"), "UTC"), "00:05");
+  assert.equal(formatNvrClockTime(at("2026-09-10T19:05:00Z"), "UTC"), "19:05");
+});
+
+test("When, Timeline and footer share the selected time format without changing epochs", t => {
+  const harness = createHistoricalHarness();
+  t.after(() => harness.close());
+  const controller = harness.controller;
+  const desired = controller.state.desiredReviewRange;
+  const displayed = controller.state.displayedReviewQuery;
+  const originalPanel = harness.root.querySelector('.review-camera-panel[data-camera="Drive Up"]');
+  const originalImage = originalPanel.querySelector("hui-image");
+  controller.setTimeFormat("12-hour");
+  const fromPicker = harness.datePickerInstances.at(-2);
+  assert.equal(fromPicker.options.time_24hr, false);
+  assert.equal(fromPicker.options.altFormat, "m/d/Y h:i K");
+  assert.match(fromPicker.altInput.value, /(?:AM|PM)$/);
+  const hour = harness.root.querySelector(".review-time-hour");
+  assert.equal(hour.options[0].textContent, "12 AM");
+  assert.equal(hour.options[13].textContent, "1 PM");
+  assert.doesNotMatch(hour.textContent, /\b00\b/);
+  assert.match(harness.root.querySelector(".review-timeline-tick span").textContent, /(?:AM|PM)$/);
+  assert.match(harness.root.querySelector(".review-clock-display").textContent, /(?:AM|PM)$/);
+  assert.equal(harness.root.querySelector(".review-timeline").style.getPropertyValue("--review-timeline-time-gutter"), "72px");
+  assert.deepEqual(controller.state.desiredReviewRange, desired);
+  assert.deepEqual(controller.state.displayedReviewQuery, displayed);
+  assert.strictEqual(harness.root.querySelector('.review-camera-panel[data-camera="Drive Up"]'), originalPanel);
+  assert.strictEqual(originalPanel.querySelector("hui-image"), originalImage);
+
+  controller.setTimeFormat("24-hour");
+  assert.equal(harness.datePickerInstances.at(-2).options.time_24hr, true);
+  assert.equal(harness.root.querySelector(".review-time-hour").options[0].textContent, "00");
+  assert.doesNotMatch(harness.root.querySelector(".review-timeline-tick span").textContent, /(?:AM|PM)$/);
+  assert.doesNotMatch(harness.root.querySelector(".review-clock-display").textContent, /(?:AM|PM)$/);
+  assert.equal(harness.root.querySelector(".review-timeline").style.getPropertyValue("--review-timeline-time-gutter"), "58px");
+  assert.deepEqual(controller.state.desiredReviewRange, desired);
+
+  controller.setTimeFormat("12-hour");
+  const afternoonHour = harness.root.querySelector(".review-time-hour");
+  const exactMinute = harness.root.querySelector(".review-time-minute");
+  afternoonHour.value = "13";
+  afternoonHour.dispatchEvent(new harness.window.Event("change", { bubbles: true }));
+  exactMinute.value = "37";
+  exactMinute.dispatchEvent(new harness.window.Event("change", { bubbles: true }));
+  const changed = controller.state.desiredReviewRange.from;
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/Los_Angeles", hour: "2-digit", minute: "2-digit", hourCycle: "h23"
+  }).formatToParts(new Date(changed * 1000));
+  assert.equal(parts.find(part => part.type === "hour").value, "13");
+  assert.equal(parts.find(part => part.type === "minute").value, "37");
+  assert.deepEqual(controller.state.displayedReviewQuery, displayed);
+});
+
+test("initial Timeline cursor is presentation-only and shares exact axis endpoints", t => {
+  const harness = createHistoricalHarness();
+  t.after(() => harness.close());
+  const controller = harness.controller;
+  const range = controller.state.displayedReviewQuery.range;
+  const cursor = harness.root.querySelector(".review-timeline-cursor");
+  const ticks = [...harness.root.querySelectorAll(".review-timeline-tick")];
+  assert.equal(cursor.hidden, false);
+  assert.equal(cursor.style.top, "0%");
+  assert.equal(ticks[0].style.top, "0%");
+  assert.equal(ticks.at(-1).style.top, "100%");
+  assert.equal(ticks[0].textContent, formatNvrClockTime(range.to, "America/Los_Angeles"));
+  assert.equal(ticks.at(-1).textContent, formatNvrClockTime(range.from, "America/Los_Angeles"));
+  assert.equal(reviewTimelineEpochFromCoordinate(100, 100, 400, range), range.to);
+  assert.equal(reviewTimelineEpochFromCoordinate(500, 100, 400, range), range.from);
+  assert.equal(harness.calls.filter(call => call.type === "frigate_max/v1/vod/prepare").length, 0);
+  const source = readFileSync(new URL("../nvr-card.js", import.meta.url), "utf8");
+  assert.match(source, /\.review-timeline\s*{[^}]*padding:\s*0 8px 8px;/s);
+  assert.match(source, /\.review-time-truth\s*{[^}]*justify-content:\s*center;/s);
+  assert.match(source, /\.review-time-truth \.review-clock-display\s*{[^}]*font-weight:\s*600;/s);
+  assert.match(source, /\.review-timeline-tick span\s*{[^}]*top:\s*-8px;/s);
+  assert.match(source, /\.review-timeline-tick span\s*{[^}]*line-height:\s*14px;/s);
+  assert.doesNotMatch(source, /\.review-timeline-tick:last-child/);
+});
+
+test("initial Review position constrains wall time and keeps cursor and footer identical", t => {
+  const wall = Date.parse("2026-09-10T12:00:00-07:00") / 1000;
+  for (const [name, range, expected, top] of [
+    ["inside", { from: wall - 1800, to: wall + 1800 }, wall, "50%"],
+    ["above", { from: wall - 7200, to: wall - 3600 }, wall - 3600, "0%"],
+    ["below", { from: wall + 3600, to: wall + 7200 }, wall + 3600, "100%"]
+  ]) {
+    const harness = createHistoricalHarness({ initialReviewRange: range });
+    t.after(() => harness.close());
+    const controller = harness.controller;
+    const cursor = harness.root.querySelector(".review-timeline-cursor");
+    const footer = harness.root.querySelector(".review-clock-display");
+    assert.equal(controller.state.reviewPositionEpoch, expected, name);
+    assert.equal(cursor.style.top, top, name);
+    assert.equal(footer.dateTime, new Date(expected * 1000).toISOString(), name);
+    assert.equal(harness.calls.filter(call => call.type === "frigate_max/v1/vod/prepare").length, 0, name);
+  }
+});
+
+test("displayed When changes constrain one Review position without VOD preparation", async t => {
+  const wall = Date.parse("2026-09-10T12:00:00-07:00") / 1000;
+  for (const [name, range, expected, top] of [
+    ["preserved", { from: wall - 1800, to: wall + 1800 }, wall, "50%"],
+    ["above", { from: wall - 7200, to: wall - 3600 }, wall - 3600, "0%"],
+    ["below", { from: wall + 3600, to: wall + 7200 }, wall + 3600, "100%"]
+  ]) {
+    const harness = createHistoricalHarness();
+    t.after(() => harness.close());
+    const controller = harness.controller;
+    controller.setReviewRangeEndpoint("from", range.from);
+    controller.setReviewRangeEndpoint("to", range.to);
+    await controller.flushScheduledReviewQuery();
+    assert.equal(controller.state.reviewPositionEpoch, expected, name);
+    assert.equal(harness.root.querySelector(".review-timeline-cursor").style.top, top, name);
+    assert.equal(harness.root.querySelector(".review-clock-display").dateTime,
+      new Date(expected * 1000).toISOString(), name);
+    assert.equal(harness.calls.filter(call => call.type === "frigate_max/v1/vod/prepare").length, 0, name);
+  }
+});
+
+test("out-of-range historical time never appears as a false boundary cursor", t => {
+  const harness = createHistoricalHarness();
+  t.after(() => harness.close());
+  const controller = harness.controller;
+  const range = controller.state.displayedReviewQuery.range;
+  controller._presentationMode = "historical";
+  controller.clock.setAbsolute(range.to + 1);
+  controller.updateClockDisplay();
+  assert.equal(harness.root.querySelector(".review-timeline-cursor").hidden, true);
+  assert.equal(harness.root.querySelector(".review-clock-display").dateTime,
+    new Date((range.to + 1) * 1000).toISOString());
+});
+
+test("When editing retires historical media while preserving an in-range Review position", async t => {
+  const harness = createHistoricalHarness();
+  t.after(() => harness.close());
+  const controller = harness.controller;
+  const initial = controller.state.displayedReviewQuery.range;
+  const selected = initial.from + 900;
+  await controller.selectTimelineTime(selected);
+  controller.pausePlayback();
+  const position = controller.clock.absoluteTime;
+  const prepareCount = harness.calls.filter(call => call.type === "frigate_max/v1/vod/prepare").length;
+  controller.setReviewRangeEndpoint("to", initial.to + 600);
+  await controller.flushScheduledReviewQuery();
+  assert.equal(controller.state.presentationMode, "live");
+  assert.equal(controller.clock.absoluteTime, null);
+  assert.equal(controller.state.reviewPositionEpoch, position);
+  assert.equal(harness.root.querySelector(".review-clock-display").dateTime,
+    new Date(position * 1000).toISOString());
+  assert.equal(harness.calls.filter(call => call.type === "frigate_max/v1/vod/prepare").length,
+    prepareCount);
+});
+
+test("the first live Timeline drag owns the preview through move, release and later drags", async t => {
+  let wall = Date.parse("2026-09-10T12:00:00-07:00");
+  const harness = createHistoricalHarness({ wallClockMs: () => wall });
+  t.after(() => harness.close());
+  const controller = harness.controller;
+  const range = controller.state.displayedReviewQuery.range;
+  const axis = harness.root.querySelector(".review-timeline-axis");
+  const handle = harness.root.querySelector(".review-timeline-handle");
+  const cursor = harness.root.querySelector(".review-timeline-cursor");
+  const footer = harness.root.querySelector(".review-clock-display");
+  axis.getBoundingClientRect = () => ({ top: 100, height: 400 });
+  handle.dispatchEvent(new harness.window.PointerEvent("pointerdown", {
+    bubbles: true, pointerId: 41, button: 0, clientY: 100
+  }));
+  assert.equal(controller._timelineDrag.originalEpoch, range.to);
+  assert.equal(controller._timelineDrag.previewEpoch, range.to);
+  handle.dispatchEvent(new harness.window.PointerEvent("pointermove", {
+    bubbles: true, pointerId: 41, clientY: 300
+  }));
+  const preview = reviewTimelineEpochFromCoordinate(300, 100, 400, range);
+  assert.equal(cursor.style.top, "50%");
+  assert.equal(controller.state.reviewPositionEpoch, preview);
+  assert.equal(footer.dateTime, new Date(preview * 1000).toISOString());
+  wall += 120000;
+  controller.clock.setAbsolute(range.from);
+  controller.updateClockDisplay();
+  assert.equal(cursor.style.top, "50%");
+  assert.equal(footer.dateTime, new Date(preview * 1000).toISOString());
+  await controller.refreshReviewQuery();
+  assert.strictEqual(harness.root.querySelector(".review-timeline-handle"), handle);
+  assert.equal(cursor.style.top, "50%");
+  assert.equal(footer.dateTime, new Date(preview * 1000).toISOString());
+  assert.equal(harness.calls.filter(call => call.type === "frigate_max/v1/vod/prepare").length, 0);
+  handle.dispatchEvent(new harness.window.PointerEvent("pointerup", {
+    bubbles: true, pointerId: 41, button: 0, clientY: 300
+  }));
+  for (let index = 0; index < 20 && harness.starts.length < 2; index += 1) {
+    await new Promise(resolve => harness.window.setTimeout(resolve, 0));
+  }
+  const prepares = harness.calls.filter(call => call.type === "frigate_max/v1/vod/prepare");
+  assert.equal(prepares.length, 2);
+  assert.ok(prepares.every(call => call.target === preview));
+  assert.equal(controller.state.presentationMode, "historical");
+
+  const secondHandle = harness.root.querySelector(".review-timeline-handle");
+  const secondAxis = harness.root.querySelector(".review-timeline-axis");
+  secondAxis.getBoundingClientRect = () => ({ top: 100, height: 400 });
+  secondHandle.dispatchEvent(new harness.window.PointerEvent("pointerdown", {
+    bubbles: true, pointerId: 42, button: 0, clientY: 300
+  }));
+  secondHandle.dispatchEvent(new harness.window.PointerEvent("pointermove", {
+    bubbles: true, pointerId: 42, clientY: 400
+  }));
+  assert.equal(harness.root.querySelector(".review-timeline-cursor").style.top, "75%");
+  assert.equal(harness.calls.filter(call => call.type === "frigate_max/v1/vod/prepare").length, 2);
+  secondHandle.dispatchEvent(new harness.window.PointerEvent("pointercancel", {
+    bubbles: true, pointerId: 42
+  }));
+});
+
+test("cancelling the first live Timeline drag restores its position without VOD", t => {
+  const harness = createHistoricalHarness();
+  t.after(() => harness.close());
+  const controller = harness.controller;
+  const original = controller.state.reviewPositionEpoch;
+  const axis = harness.root.querySelector(".review-timeline-axis");
+  const handle = harness.root.querySelector(".review-timeline-handle");
+  axis.getBoundingClientRect = () => ({ top: 100, height: 400 });
+  handle.dispatchEvent(new harness.window.PointerEvent("pointerdown", {
+    bubbles: true, pointerId: 43, button: 0, clientY: 100
+  }));
+  handle.dispatchEvent(new harness.window.PointerEvent("pointermove", {
+    bubbles: true, pointerId: 43, clientY: 300
+  }));
+  handle.dispatchEvent(new harness.window.PointerEvent("pointercancel", {
+    bubbles: true, pointerId: 43
+  }));
+  assert.equal(controller.state.reviewPositionEpoch, original);
+  assert.equal(harness.root.querySelector(".review-clock-display").dateTime,
+    new Date(original * 1000).toISOString());
+  assert.equal(harness.calls.filter(call => call.type === "frigate_max/v1/vod/prepare").length, 0);
 });
 
 test("Timeline coordinates map newest/top to oldest/bottom for any height", () => {
@@ -1561,7 +1813,8 @@ test("the fixed RHS footer is the sole authoritative Review time in live, paused
   const footer = harness.root.querySelector(".review-time-truth");
   let output = footer.querySelector(".review-clock-display");
   assert.equal(harness.transportRoot.querySelector(".review-clock-display"), null);
-  assert.match(footer.textContent, /^Review Time:/);
+  assert.equal(footer.textContent, output.textContent);
+  assert.doesNotMatch(footer.textContent, /Review Time:/);
   assert.equal(output.dateTime, "2026-09-10T19:00:00.000Z");
 
   const range = controller.state.displayedReviewQuery.range;

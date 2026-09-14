@@ -151,6 +151,8 @@ cameras:
 ```yaml
 type: custom:nvr-card
 camera_aspect_ratio: "16:9"
+time:
+  format: 12-hour
 
 cameras:
   - name: Camera A
@@ -204,6 +206,7 @@ unknown fields inside `live` are rejected.
 | `cameras[].live.substream` | Required when `live` exists | Nonempty HA entity ID for grid presentation. |
 | `cameras[].live.mainstream` | Required when `live` exists | Nonempty HA entity ID for maximized presentation. |
 | `camera_aspect_ratio` | Optional string, `"16:9"` | Exactly one colon; both sides must be positive finite numbers. Controls fitting. |
+| `time.format` | Optional string, `24-hour` | `12-hour` or `24-hour` for NVR-generated Review clock displays. Omit `time` to retain 24-hour When and Timeline presentation. |
 | `live_status.position` | Optional string, `bottom-left` | Valid values are `bottom-left`, `bottom-right`, `top-left`, and `top-right`. Invalid values use `bottom-left`. |
 
 ### Live recovery options

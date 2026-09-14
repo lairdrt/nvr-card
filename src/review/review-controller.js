@@ -15,6 +15,19 @@ const REVIEW_QUERY_DEBOUNCE_MS = 400;
 const REVIEW_MEDIA_READY_TIMEOUT_MS = 15000;
 const HAVE_FUTURE_DATA = 3;
 export const REVIEW_PLAYBACK_SPEEDS = Object.freeze([1, 2, 4, 8, 16]);
+export function formatNvrClockTime(value, timeZone, format = "24-hour", kind = "time") {
+  const options = {
+    ...(timeZone ? { timeZone } : {}),
+    ...(kind === "footer" ? { weekday: "short", month: "short", day: "numeric" } : {}),
+    ...(kind === "when" ? { year: "numeric", month: "2-digit", day: "2-digit" } : {}),
+    ...(kind === "diagnostic" ? { year: "numeric", month: "short", day: "numeric" } : {}),
+    hour: format === "12-hour" ? "numeric" : "2-digit",
+    minute: "2-digit",
+    ...(["footer", "diagnostic"].includes(kind) ? { second: "2-digit" } : {}),
+    ...(format === "12-hour" ? { hour12: true } : { hourCycle: "h23" })
+  };
+  return new Intl.DateTimeFormat("en-US", options).format(value instanceof Date ? value : new Date(value * 1000));
+}
 export const REVIEW_TIMELINE_CAMERA_COLORS = Object.freeze([
   "#68c5e8", "#ef9b5f", "#77cf83", "#d58be8",
   "#f0cf65", "#5ed0bd", "#ee7896", "#8fa9f4",
@@ -493,6 +506,7 @@ export class ReviewController {
     this._datePickerFactory = datePickerFactory;
     this._datePickers = { from: null, to: null };
     this._wallClock = wallClock;
+    this._timeFormat = "24-hour";
     this._root = null;
     this._transportRoot = null;
     this._hass = null;
@@ -509,6 +523,7 @@ export class ReviewController {
     this._active = false;
     this._suspended = false;
     this._presentationMode = "live";
+    this._reviewPosition = null;
     this._generation = 0;
     this._historicalPlayers = new Map();
     this._historicalRange = null;
@@ -540,6 +555,7 @@ export class ReviewController {
     };
     this._playbackSpeed = 1;
     this._timelineDrag = null;
+    this._timelineRefreshDeferred = false;
     this._timelineClickSuppressionTimer = null;
     this.clock = new ReviewClock(now);
   }
@@ -547,6 +563,36 @@ export class ReviewController {
   get timeZone() {
     return this._hass?.config?.time_zone ||
       Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+  }
+
+  get reviewPosition() {
+    if (this._timelineDrag) return this._timelineDrag.previewEpoch;
+    return this._presentationMode === "historical" && Number.isFinite(this.clock.absoluteTime)
+      ? this.clock.absoluteTime : this._reviewPosition;
+  }
+
+  constrainReviewPositionToDisplayedRange() {
+    if (this._presentationMode === "historical") return;
+    const range = this._displayedReviewQuery?.range;
+    if (!(range?.from < range?.to)) return;
+    const position = Number.isFinite(this._reviewPosition)
+      ? this._reviewPosition : this._wallClock() / 1000;
+    this._reviewPosition = Math.min(range.to, Math.max(range.from, position));
+    this.updateClockDisplay();
+  }
+
+  setTimeFormat(format) {
+    if (format !== "12-hour" && format !== "24-hour") {
+      throw new Error("time.format must be 12-hour or 24-hour.");
+    }
+    if (this._timeFormat === format) return;
+    this._timeFormat = format;
+    if (this._active && !this._suspended && this._root) {
+      this.cleanupDatePicker();
+      this.renderWhenControls();
+      this.updateRhs();
+      this.updateClockDisplay();
+    }
   }
 
   get todayKey() {
@@ -564,6 +610,7 @@ export class ReviewController {
       reviewLayout: this._reviewLayout,
       reviewAssignments: [...this._reviewAssignments],
       reviewClockAbsolute: this.clock.absoluteTime,
+      reviewPositionEpoch: this.reviewPosition,
       reviewRange: this._reviewRange ? { ...this._reviewRange } : null,
       desiredReviewRange: this._desiredReviewRange ? { ...this._desiredReviewRange } : null,
       desiredReviewQuery,
@@ -641,9 +688,7 @@ export class ReviewController {
     const report = {
       id: ++this._syncSequence, generation, displayedQueryGeneration: this._queryGeneration,
       source, selectedEpoch: targetEpoch,
-      selectedLocalTime: new Intl.DateTimeFormat(undefined, {
-        timeZone: this.timeZone, dateStyle: "medium", timeStyle: "long"
-      }).format(new Date(targetEpoch * 1000)),
+      selectedLocalTime: formatNvrClockTime(targetEpoch, this.timeZone, this._timeFormat, "diagnostic"),
       displayedFrom: query?.range?.from ?? null, displayedTo: query?.range?.to ?? null,
       playbackRate: this._playbackSpeed, startedAtMs: this._now(),
       disposition: "preparing", terminationReason: null,
@@ -804,7 +849,9 @@ export class ReviewController {
     this._suspended = false;
     this._presentationMode = "live";
     this.clock.reset();
+    this._reviewPosition = this._wallClock() / 1000;
     const initialQuery = this.ensureReviewQuery();
+    this.constrainReviewPositionToDisplayedRange();
     if (this._root) {
       this._root.hidden = false;
       if (this._transportRoot) this._transportRoot.hidden = false;
@@ -821,6 +868,7 @@ export class ReviewController {
     this.cancelScheduledReviewQuery();
     this.cleanupDatePicker();
     this.clock.reset();
+    this._reviewPosition = null;
     this._mediaPanels.clear();
     if (this._root) {
       this._root.replaceChildren();
@@ -1065,7 +1113,7 @@ export class ReviewController {
 
   retireHistoricalForReviewEdit() {
     if (this._presentationMode === "historical" || this._historicalPreparing) {
-      this.returnToLive();
+      this.returnToLive(true);
     }
   }
 
@@ -1114,6 +1162,7 @@ export class ReviewController {
       if (generation !== this._queryGeneration) return Promise.resolve(this._queryRefreshCount);
       this._displayedReviewQuery = this.cloneReviewQuery(query);
       this._reviewRange = { ...range };
+      this.constrainReviewPositionToDisplayedRange();
       this._timeline = {
         status: "loaded", refreshing: false, items: [], error: null,
         queryRange: { from: range.from, to: queryTo }
@@ -1132,6 +1181,7 @@ export class ReviewController {
       if (generation !== this._queryGeneration) return;
       this._displayedReviewQuery = this.cloneReviewQuery(query);
       this._reviewRange = { ...range };
+      this.constrainReviewPositionToDisplayedRange();
       this._timeline = {
         status: "loaded", refreshing: false,
         items: normalizeReviewTimelineItems(result, range), error: null, queryRange
@@ -1202,11 +1252,15 @@ export class ReviewController {
     this.updateWhenControls();
   }
 
-  returnToLive() {
+  returnToLive(preservePosition = false) {
+    const previousPosition = this.reviewPosition;
     this._generation += 1;
     this.cleanupHistorical();
     this.clock.reset();
     this._presentationMode = "live";
+    this._reviewPosition = preservePosition && Number.isFinite(previousPosition)
+      ? previousPosition : this._wallClock() / 1000;
+    this.constrainReviewPositionToDisplayedRange();
     this._historicalStatus = "";
     if (this._active && !this._suspended) this.renderMediaArea();
   }
@@ -1477,11 +1531,9 @@ export class ReviewController {
     rhsContent.className = "review-rhs-content";
     const timeTruth = this._document.createElement("footer");
     timeTruth.className = "review-time-truth";
-    const timeLabel = this._document.createElement("span");
-    timeLabel.textContent = "Review Time:";
     const clock = this._document.createElement("time");
     clock.className = "review-clock-display";
-    timeTruth.append(timeLabel, clock);
+    timeTruth.appendChild(clock);
     rhs.append(modes, rhsContent, timeTruth);
     product.append(controls, media, rhs);
     this._root.appendChild(product);
@@ -1609,11 +1661,11 @@ export class ReviewController {
       if (typeof this._datePickerFactory === "function") {
         this._datePickers[endpoint] = this._datePickerFactory(input, {
           enableTime: true,
-          time_24hr: true,
+          time_24hr: this._timeFormat === "24-hour",
           minuteIncrement: 1,
           altInput: true,
           altInputClass: "review-range-picker",
-          altFormat: "m/d/Y H:i",
+          altFormat: this._timeFormat === "12-hour" ? "m/d/Y h:i K" : "m/d/Y H:i",
           dateFormat: "Y-m-d H:i",
           allowInput: true,
           disableMobile: true,
@@ -1648,7 +1700,9 @@ export class ReviewController {
         for (let value = 0; value <= max; value += 1) {
           const option = this._document.createElement("option");
           option.value = String(value);
-          option.textContent = String(value).padStart(2, "0");
+          option.textContent = part === "hour" && this._timeFormat === "12-hour"
+            ? `${value % 12 || 12} ${value < 12 ? "AM" : "PM"}`
+            : String(value).padStart(2, "0");
           select.appendChild(option);
         }
         select.addEventListener("change", () => this.setReviewTimePart(endpoint, part, select.value));
@@ -1676,10 +1730,7 @@ export class ReviewController {
       if (this._datePickers[endpoint]) {
         this._datePickers[endpoint].setDate(value, false);
       } else if (input) {
-        input.value = new Intl.DateTimeFormat("en-US", {
-          year: "numeric", month: "2-digit", day: "2-digit",
-          hour: "2-digit", minute: "2-digit", hourCycle: "h23",
-        }).format(value);
+        input.value = formatNvrClockTime(value, null, this._timeFormat, "when");
       }
       const date = pickerDateForEpoch(this._desiredReviewRange[endpoint], this.timeZone);
       const hour = this._root?.querySelector(`.review-${endpoint}-picker`)?.closest(".review-range-field")
@@ -1693,7 +1744,18 @@ export class ReviewController {
 
   updateRhs() {
     if (!this._root) return;
-    if (this._timelineDrag) this.cancelTimelineDrag();
+    if (this._timelineDrag) {
+      const current = this._displayedReviewQuery;
+      const drag = this._timelineDrag;
+      const sameQuery = drag.queryGeneration === this._queryGeneration &&
+        current?.range?.from === drag.range.from && current?.range?.to === drag.range.to &&
+        JSON.stringify(current?.cameraNames) === JSON.stringify(drag.cameraNames);
+      if (sameQuery) {
+        this._timelineRefreshDeferred = true;
+        return;
+      }
+      this.cancelTimelineDrag();
+    }
     this._root.querySelectorAll(".review-rhs-modes button").forEach(button => {
       const selected = button.dataset.mode === this._rhsMode;
       button.classList.toggle("selected", selected);
@@ -1733,9 +1795,7 @@ export class ReviewController {
     this.ensureReviewRange();
     const range = this._displayedReviewQuery?.range ?? this._reviewRange;
     const lanes = this.getTimelineLanes();
-    const format = epoch => new Intl.DateTimeFormat(undefined, {
-      timeZone: this.timeZone, hour: "2-digit", minute: "2-digit", hourCycle: "h23"
-    }).format(new Date(epoch * 1000));
+    const format = epoch => formatNvrClockTime(epoch, this.timeZone, this._timeFormat);
     const ticks = Array.from({ length: 5 }, (_, index) => {
       const epoch = range.to - ((range.to - range.from) * index / 4);
       const top = reviewTimelineMarkerTop(epoch, range);
@@ -1770,7 +1830,8 @@ export class ReviewController {
       : this._timeline.error
         ? `<div class="review-timeline-refresh error" role="status">${this._timeline.error}</div>`
         : "";
-    return `<div class="review-timeline" aria-label="Review activity timeline" style="--review-timeline-lane-count:${laneCount}">${refresh}<div class="review-timeline-lane-headings"><div class="review-timeline-time-heading">Time</div>${headers}</div><div class="review-timeline-axis" role="button" aria-label="Select Review playback time">${ticks}<div class="review-timeline-lanes">${laneBodies}</div>${message}<div class="review-timeline-cursor" hidden aria-hidden="true"><span class="review-timeline-handle" role="slider" aria-label="Drag Review time"></span></div></div></div>`;
+    const gutter = this._timeFormat === "12-hour" ? "72px" : "58px";
+    return `<div class="review-timeline" aria-label="Review activity timeline" style="--review-timeline-lane-count:${laneCount};--review-timeline-time-gutter:${gutter}">${refresh}<div class="review-timeline-lane-headings"><div class="review-timeline-time-heading">Time</div>${headers}</div><div class="review-timeline-axis" role="button" aria-label="Select Review playback time">${ticks}<div class="review-timeline-lanes">${laneBodies}</div>${message}<div class="review-timeline-cursor" hidden aria-hidden="true"><span class="review-timeline-handle" role="slider" aria-label="Drag Review time"></span></div></div></div>`;
   }
 
   attachTimelineSelection(content) {
@@ -1810,7 +1871,7 @@ export class ReviewController {
 
   beginTimelineDrag(event, axis, handle) {
     if ((event.button ?? 0) !== 0 || this._timelineDrag ||
-        this._presentationMode !== "historical" || !Number.isFinite(this.clock.absoluteTime)) return;
+        !Number.isFinite(this.reviewPosition)) return;
     const range = this._displayedReviewQuery?.range;
     if (!(range?.from < range?.to)) return;
     event.preventDefault();
@@ -1822,7 +1883,10 @@ export class ReviewController {
       axis,
       handle,
       range: { ...range },
-      originalEpoch: this.clock.absoluteTime,
+      queryGeneration: this._queryGeneration,
+      cameraNames: [...(this._displayedReviewQuery?.cameraNames ?? [])],
+      originalEpoch: this.reviewPosition,
+      previewEpoch: this.reviewPosition,
       wasRunning
     };
     try {
@@ -1836,7 +1900,8 @@ export class ReviewController {
     if (!drag) return null;
     const epoch = this.getTimelinePointerEpoch(drag.axis, clientY, drag.range);
     if (!Number.isFinite(epoch)) return null;
-    this.clock.setAbsolute(epoch);
+    drag.previewEpoch = epoch;
+    if (this._presentationMode === "historical") this.clock.setAbsolute(epoch);
     this.updateClockDisplay();
     return epoch;
   }
@@ -1855,6 +1920,9 @@ export class ReviewController {
     event.stopPropagation();
     const epoch = this.previewTimelineDrag(event.clientY);
     this._timelineDrag = null;
+    if (this._presentationMode !== "historical" && Number.isFinite(epoch)) {
+      this._reviewPosition = epoch;
+    }
     try {
       drag.handle.releasePointerCapture?.(event.pointerId);
     } catch {}
@@ -1865,6 +1933,10 @@ export class ReviewController {
     this._timelineClickSuppressionTimer = view.setTimeout(() => {
       this._timelineClickSuppressionTimer = null;
     }, 0);
+    if (this._timelineRefreshDeferred) {
+      this._timelineRefreshDeferred = false;
+      this.updateRhs();
+    }
     if (Number.isFinite(epoch)) void this.selectTimelineTime(epoch, "timeline drag release");
   }
 
@@ -1877,14 +1949,22 @@ export class ReviewController {
     try {
       drag.handle.releasePointerCapture?.(drag.pointerId);
     } catch {}
-    if (Number.isFinite(drag.originalEpoch)) this.clock.setAbsolute(drag.originalEpoch);
+    if (Number.isFinite(drag.originalEpoch)) {
+      if (this._presentationMode === "historical") this.clock.setAbsolute(drag.originalEpoch);
+      else this._reviewPosition = drag.originalEpoch;
+    }
     if (drag.wasRunning) this.resumePlayback();
     else this.updateClockDisplay();
+    if (this._timelineRefreshDeferred) {
+      this._timelineRefreshDeferred = false;
+      this.updateRhs();
+    }
     return true;
   }
 
   cleanupTimelineInteraction() {
     this._timelineDrag = null;
+    this._timelineRefreshDeferred = false;
     if (this._timelineClickSuppressionTimer === null) return;
     const view = this._root?.ownerDocument?.defaultView ?? globalThis;
     view.clearTimeout(this._timelineClickSuppressionTimer);
@@ -1894,13 +1974,13 @@ export class ReviewController {
   updateTimelineCursor() {
     const cursor = this._root?.querySelector(".review-timeline-cursor");
     if (!cursor) return;
-    const absolute = this.clock.absoluteTime;
+    const absolute = this.reviewPosition;
+    const range = this._displayedReviewQuery?.range ?? this._reviewRange;
     const top = reviewTimelineMarkerTop(
       absolute,
-      this._displayedReviewQuery?.range ?? this._reviewRange
+      range
     );
-    const visible = (this._presentationMode === "historical" || this._timelineDrag) &&
-      Number.isFinite(top);
+    const visible = Number.isFinite(top) && absolute >= range.from && absolute <= range.to;
     cursor.hidden = !visible;
     cursor.setAttribute("aria-hidden", String(!visible));
     if (visible) {
@@ -2123,16 +2203,9 @@ export class ReviewController {
   updateClockDisplay() {
     const output = this._root?.querySelector(".review-time-truth .review-clock-display");
     if (!output) return;
-    const clockAbsolute = this.clock.absoluteTime;
-    const absolute = Number.isFinite(clockAbsolute)
-      ? clockAbsolute
-      : this._wallClock() / 1000;
+    const absolute = this.reviewPosition;
     output.textContent = Number.isFinite(absolute)
-      ? new Intl.DateTimeFormat(undefined, {
-        timeZone: this.timeZone,
-        weekday: "short", month: "short", day: "numeric",
-        hour: "numeric", minute: "2-digit", second: "2-digit"
-      }).format(new Date(absolute * 1000))
+      ? formatNvrClockTime(absolute, this.timeZone, this._timeFormat, "footer")
       : "";
     output.dateTime = Number.isFinite(absolute) ? new Date(absolute * 1000).toISOString() : "";
     this.updateTimelineCursor();

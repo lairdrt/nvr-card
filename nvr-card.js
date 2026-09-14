@@ -1849,6 +1849,7 @@ class NVRCard extends HTMLElement {
     });
 
     this.config = config;
+    this._reviewController.setTimeFormat(normalized.timeFormat);
     this._reviewController.setDebug(config.review_debug === true);
     if (JSON.stringify(this._autoDimConfig) !== JSON.stringify(normalized.autoDim)) {
       this.applyAutoDimConfig(normalized.autoDim);
@@ -1925,11 +1926,21 @@ class NVRCard extends HTMLElement {
       config.auto_dim,
       Object.prototype.hasOwnProperty.call(config, "auto_dim")
     );
+    let timeFormat = "24-hour";
+    if (Object.prototype.hasOwnProperty.call(config, "time")) {
+      if (!config.time || typeof config.time !== "object" || Array.isArray(config.time) ||
+          !["12-hour", "24-hour"].includes(config.time.format) ||
+          Object.keys(config.time).some(key => key !== "format")) {
+        throw new Error("time must contain format: 12-hour or 24-hour.");
+      }
+      timeFormat = config.time.format;
+    }
 
     return {
       cameras,
       cameraAspectRatio,
-      autoDim
+      autoDim,
+      timeFormat
     };
   }
 
@@ -3561,7 +3572,7 @@ class NVRCard extends HTMLElement {
         min-width: 0;
         padding: 0 10px;
         align-items: center;
-        gap: 6px;
+        justify-content: center;
         border-top: 1px solid #26313b;
         background: #11161c;
         box-sizing: border-box;
@@ -3608,7 +3619,7 @@ class NVRCard extends HTMLElement {
         flex: 1 1 auto;
         flex-direction: column;
         min-height: 0;
-        padding: 0 8px 4px;
+        padding: 0 8px 8px;
         box-sizing: border-box;
       }
 
@@ -3708,6 +3719,7 @@ class NVRCard extends HTMLElement {
         position: absolute;
         left: 0;
         top: -8px;
+        line-height: 14px;
         width: calc(var(--review-timeline-time-gutter) - 6px);
         padding-left: 4px;
         background: #11161c;
