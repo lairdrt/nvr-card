@@ -891,6 +891,74 @@ test("historical players use independent origins and start as one orchestration"
   assert.equal(calculateHistoricalSeek(target, prepared("drive_up", target - 21)), 21);
 });
 
+test("gated historical sync report records origins, barrier, advancement and bounded samples", async t => {
+  let tick = 1000;
+  const harness = createHistoricalHarness({ now: () => tick });
+  t.after(() => harness.close());
+  await harness.controller.playHistorical(1800000000, { source: "timeline click" });
+  let report = harness.controller.getLatestHistoricalSyncReport();
+  assert.equal(report.selectedEpoch, 1800000000);
+  assert.equal(report.source, "timeline click");
+  assert.equal(report.cameras["Drive Up"].effectiveOriginEpoch, 1800000000 - 21);
+  assert.equal(report.cameras["Drive Up"].requestedMediaTime, 21);
+  assert.equal(report.cameras["Drive Up"].actualSeekTime, 21);
+  assert.equal(report.cameras["Drive Up"].barrierReadyEpoch, 1800000000);
+  assert.equal(report.summary.barrierDeltaSeconds, 0);
+  assert.deepEqual(report.barrier.ready, ["Drive Up", "Drive Down"]);
+  assert.equal(report.cameras["Drive Up"].play.outcome, "fulfilled");
+  assert.equal(report.cameras["Drive Down"].play.issuedAtMs, report.cameras["Drive Up"].play.issuedAtMs);
+  const player = harness.controller._historicalPlayers.get("Drive Up");
+  tick = 1400;
+  player.video.currentTime = 21.4;
+  player.video.dispatchEvent(new harness.window.Event("timeupdate"));
+  for (const second of [1, 5, 30]) {
+    tick = 1000 + second * 1000;
+    harness.controller.syncTick(harness.controller._syncSession, harness.controller._generation);
+  }
+  report = harness.controller.getLatestHistoricalSyncReport();
+  assert.equal(report.cameras["Drive Up"].firstAdvance.delayMs, 400);
+  assert.ok(report.samples[1]);
+  assert.ok(report.samples[5]);
+  assert.ok(report.samples[30]);
+  assert.ok(Math.abs(report.summary.sampleDeltaSeconds[30] - 0.4) < 0.00001);
+  assert.doesNotThrow(() => JSON.stringify(report));
+  assert.equal(JSON.stringify(report).includes("signed/"), false);
+  report.cameras["Drive Up"].status = "changed";
+  assert.equal(harness.controller.getLatestHistoricalSyncReport().cameras["Drive Up"].status, "released");
+});
+
+test("sync reports distinguish preparation failure from post-seek readiness failure and stop on Now", async t => {
+  const harness = createHistoricalHarness({
+    unavailable: new Set(["drive_up"]), deferredPlayable: new Set(["Drive Down"]),
+    mediaReadyTimeoutMs: 100
+  });
+  t.after(() => harness.close());
+  await harness.controller.playHistorical(1800000000);
+  const report = harness.controller.getLatestHistoricalSyncReport();
+  assert.equal(report.cameras["Drive Up"].reason, "prepare_reported_no_recording");
+  assert.equal(report.cameras["Drive Down"].reason, "post_seek_playability_failure");
+  assert.equal(report.disposition, "all unavailable");
+  harness.controller.returnToLive();
+  assert.equal(harness.controller._syncSession, null);
+});
+
+test("sync diagnostics are disabled by default and history is bounded", async t => {
+  const window = new Window({ url: "http://localhost/" });
+  t.after(() => window.close());
+  const controller = new ReviewController({ documentRef: window.document });
+  assert.equal(controller.startSyncReport(1, 1800000000, [], "test"), null);
+  assert.deepEqual(controller.getHistoricalSyncReports(), []);
+  controller.setDebug(true);
+  for (let id = 1; id <= 10; id += 1) {
+    controller.startSyncReport(id, 1800000000 + id, [], "test");
+  }
+  const reports = controller.getHistoricalSyncReports();
+  assert.equal(reports.length, 8);
+  assert.equal(reports[0].id, 3);
+  assert.equal(reports.at(-1).id, 10);
+  assert.doesNotThrow(() => JSON.stringify(reports));
+});
+
 test("historical startup waits through seeked and post-seek playability for one common release", async t => {
   const deferredSeek = new Set(["Drive Down"]);
   const deferredPlayable = new Set(["Drive Up", "Drive Down"]);
@@ -2025,12 +2093,18 @@ test("minus and plus ten derive coordinated player positions from ReviewClock", 
   const instanceCount = harness.instances.length;
   await harness.controller.seekHistoricalRelative(-10);
   const backTarget = pausedAt - 10;
+  const vcrReport = harness.controller.getLatestHistoricalSyncReport();
+  assert.equal(vcrReport.source, "VCR seek");
+  assert.equal(vcrReport.selectedEpoch, backTarget);
+  assert.equal(vcrReport.summary.barrierDeltaSeconds, 0);
+  assert.equal(vcrReport.cameras["Drive Up"].requestedMediaTime, backTarget - (1800000000 - 21));
   assert.equal(harness.controller.clock.absoluteTime, backTarget);
   assert.deepEqual(
     [...harness.controller._historicalPlayers.values()].map(player => player.video.currentTime),
     [backTarget - (1800000000 - 21), backTarget - (1800000000 - 22)]
   );
   await harness.controller.seekHistoricalRelative(10);
+  assert.equal(harness.controller.getHistoricalSyncReports().length, 3);
   assert.equal(harness.controller.clock.absoluteTime, pausedAt);
   assert.deepEqual(
     [...harness.controller._historicalPlayers.values()].map(player => player.video.currentTime),

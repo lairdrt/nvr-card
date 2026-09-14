@@ -518,6 +518,11 @@ export class ReviewController {
     this._mediaPanels = new Map();
     this._diagnosticTimer = null;
     this._debugEnabled = false;
+    this._historicalSyncDiagnosticsEnabled = null;
+    this._syncReports = [];
+    this._syncSession = null;
+    this._syncSequence = 0;
+    this._now = now;
     this._rhsMode = "timeline";
     this._selectedFilters = new Set();
     this._sectionExpanded = {
@@ -607,7 +612,142 @@ export class ReviewController {
     const next = enabled === true;
     if (next === this._debugEnabled) return;
     this._debugEnabled = next;
+    if (!(this._historicalSyncDiagnosticsEnabled ?? next)) {
+      this.endSyncReport("diagnostics_disabled");
+    }
     if (this._active && !this._suspended) this.render();
+  }
+
+  setHistoricalSyncDiagnostics(enabled) {
+    this._historicalSyncDiagnosticsEnabled = enabled === true;
+    if (!this._historicalSyncDiagnosticsEnabled) {
+      this.endSyncReport("diagnostics_disabled");
+    }
+    return this._historicalSyncDiagnosticsEnabled;
+  }
+
+  // Explicit development retrieval. Always return a detached, JSON-compatible snapshot.
+  getHistoricalSyncReports() {
+    return JSON.parse(JSON.stringify(this._syncReports));
+  }
+
+  getLatestHistoricalSyncReport() {
+    return JSON.parse(JSON.stringify(this._syncReports.at(-1) ?? null));
+  }
+
+  startSyncReport(generation, targetEpoch, cameras, source) {
+    if (!(this._historicalSyncDiagnosticsEnabled ?? this._debugEnabled)) return null;
+    const query = this._displayedReviewQuery;
+    const report = {
+      id: ++this._syncSequence, generation, displayedQueryGeneration: this._queryGeneration,
+      source, selectedEpoch: targetEpoch,
+      selectedLocalTime: new Intl.DateTimeFormat(undefined, {
+        timeZone: this.timeZone, dateStyle: "medium", timeStyle: "long"
+      }).format(new Date(targetEpoch * 1000)),
+      displayedFrom: query?.range?.from ?? null, displayedTo: query?.range?.to ?? null,
+      playbackRate: this._playbackSpeed, startedAtMs: this._now(),
+      disposition: "preparing", terminationReason: null,
+      cameras: Object.fromEntries(cameras.map(camera => [camera.name, {
+        logicalId: camera.name, generation, requestedEpoch: targetEpoch,
+        status: "preparing", reason: null, stages: {}, firstAdvance: null, play: null
+      }])),
+      barrier: null, samples: {}, summary: null
+    };
+    this._syncReports.push(report);
+    if (this._syncReports.length > 8) this._syncReports.shift();
+    this._syncSession = report;
+    return report;
+  }
+
+  syncCamera(report, generation, player) {
+    return report && this._syncSession === report && generation === this._generation
+      ? report.cameras[player.camera.name] : null;
+  }
+
+  syncStage(report, generation, player, stage) {
+    const camera = this.syncCamera(report, generation, player);
+    if (camera && camera.stages[stage] == null) camera.stages[stage] = this._now();
+  }
+
+  syncUnavailable(report, generation, player, reason) {
+    const camera = this.syncCamera(report, generation, player);
+    if (!camera) return;
+    camera.status = "unavailable";
+    camera.reason = reason;
+  }
+
+  syncSnapshot(players, report, atMs = this._now()) {
+    const clockEpoch = this.clock.absoluteTime;
+    const cameras = {};
+    for (const player of players) {
+      if (player.unavailable || !player.video || !player.timing) continue;
+      const currentTime = Number(player.video.currentTime);
+      if (!Number.isFinite(currentTime)) continue;
+      const reconstructedEpoch = player.timing.effective_absolute_origin + currentTime;
+      cameras[player.camera.name] = {
+        atMs, currentTime, reconstructedEpoch, reviewClockEpoch: clockEpoch,
+        errorSeconds: Number.isFinite(clockEpoch) ? reconstructedEpoch - clockEpoch : null
+      };
+    }
+    const epochs = Object.values(cameras).map(camera => camera.reconstructedEpoch);
+    return { atMs, cameras, maxInterCameraDeltaSeconds:
+      epochs.length > 1 ? Math.max(...epochs) - Math.min(...epochs) : 0 };
+  }
+
+  syncTick(report, generation) {
+    if (!report || this._syncSession !== report || generation !== this._generation ||
+        this._presentationMode !== "historical") return;
+    const barrier = report.barrier;
+    if (!barrier) return;
+    const now = this._now();
+    const players = [...this._historicalPlayers.values()];
+    for (const player of players) {
+      const camera = report.cameras[player.camera.name];
+      const baseline = barrier.snapshot.cameras[player.camera.name];
+      if (!camera || camera.firstAdvance || !baseline || player.unavailable || !player.video) continue;
+      const currentTime = Number(player.video.currentTime);
+      if (Number.isFinite(currentTime) && currentTime > baseline.currentTime + 0.01) {
+        const reconstructedEpoch = player.timing.effective_absolute_origin + currentTime;
+        camera.firstAdvance = { atMs: now, currentTime, reconstructedEpoch,
+          delayMs: now - barrier.atMs,
+          reviewClockErrorSeconds: reconstructedEpoch - this.clock.absoluteTime };
+      }
+    }
+    for (const seconds of [1, 5, 30]) {
+      if (!report.samples[seconds] && now - barrier.atMs >= seconds * 1000) {
+        report.samples[seconds] = this.syncSnapshot(players, report, now);
+      }
+    }
+    this.updateSyncSummary(report);
+    if (report.samples[30]) {
+      for (const player of players) this.removeSyncListeners(player);
+      this._syncSession = null;
+    }
+  }
+
+  updateSyncSummary(report) {
+    const cameras = Object.values(report.cameras);
+    const numbers = values => values.length ? Math.max(...values.map(Math.abs)) : null;
+    report.summary = {
+      selectedEpoch: report.selectedEpoch, requested: cameras.map(camera => camera.logicalId),
+      released: cameras.filter(camera => camera.status === "released").map(camera => camera.logicalId),
+      unavailable: cameras.filter(camera => camera.status === "unavailable").map(camera => camera.logicalId),
+      barrierDeltaSeconds: report.barrier?.snapshot.maxInterCameraDeltaSeconds ?? null,
+      sampleDeltaSeconds: Object.fromEntries([1, 5, 30].map(second =>
+        [second, report.samples[second]?.maxInterCameraDeltaSeconds ?? null])),
+      largestSeekErrorSeconds: numbers(cameras.map(camera => camera.seekErrorSeconds).filter(Number.isFinite)),
+      largestFirstAdvanceDelayMs: numbers(cameras.map(camera => camera.firstAdvance?.delayMs).filter(Number.isFinite)),
+      disposition: report.disposition
+    };
+  }
+
+  endSyncReport(reason) {
+    const report = this._syncSession;
+    if (!report) return;
+    report.terminationReason = reason;
+    if (report.disposition === "preparing") report.disposition = "stale/cancelled";
+    this.updateSyncSummary(report);
+    this._syncSession = null;
   }
 
   setHass(hass) {
@@ -1071,7 +1211,7 @@ export class ReviewController {
     if (this._active && !this._suspended) this.renderMediaArea();
   }
 
-  async selectTimelineTime(value) {
+  async selectTimelineTime(value, source = "timeline click") {
     this.ensureReviewRange();
     const targetEpoch = Number(value);
     const displayedQuery = this._displayedReviewQuery;
@@ -1089,7 +1229,7 @@ export class ReviewController {
     await this.playHistorical(targetEpoch, {
       updateDisplayedRange: false,
       playbackRange: { ...range },
-      cameraNames: [...displayedQuery.cameraNames]
+      cameraNames: [...displayedQuery.cameraNames], source
     });
     return true;
   }
@@ -1725,7 +1865,7 @@ export class ReviewController {
     this._timelineClickSuppressionTimer = view.setTimeout(() => {
       this._timelineClickSuppressionTimer = null;
     }, 0);
-    if (Number.isFinite(epoch)) void this.selectTimelineTime(epoch);
+    if (Number.isFinite(epoch)) void this.selectTimelineTime(epoch, "timeline drag release");
   }
 
   cancelTimelineDrag(event = null) {
@@ -2043,8 +2183,27 @@ export class ReviewController {
     const withinPreparedRange = this._historicalRange &&
       target >= this._historicalRange.start && target <= this._historicalRange.end;
     if (!withinPreparedRange) {
-      await this.playHistorical(target, { autoplay: wasRunning });
+      await this.playHistorical(target, { autoplay: wasRunning, source: "VCR seek" });
       return true;
+    }
+    this.endSyncReport("VCR seek");
+    for (const player of this._historicalPlayers.values()) this.removeSyncListeners(player);
+    const generation = this._generation;
+    const report = this.startSyncReport(generation, target,
+      [...this._historicalPlayers.values()].map(player => player.camera), "VCR seek");
+    if (report) {
+      for (const player of this._historicalPlayers.values()) {
+        const diagnostic = report.cameras[player.camera.name];
+        if (player.unavailable || !player.timing) {
+          diagnostic.status = "unavailable";
+          diagnostic.reason = "unavailable_before_vcr_seek";
+        } else {
+          diagnostic.prepareSucceeded = true;
+          diagnostic.effectiveOriginEpoch = player.timing.effective_absolute_origin;
+          diagnostic.requestedMediaTime = target - diagnostic.effectiveOriginEpoch;
+          diagnostic.insideKnownInterval = diagnostic.requestedMediaTime >= 0;
+        }
+      }
     }
     this.clock.pause();
     this.clock.setAbsolute(target);
@@ -2054,17 +2213,57 @@ export class ReviewController {
     await Promise.all(players.map(async player => {
       try {
         player.seek = calculateHistoricalSeek(target, player.timing);
+        this.syncStage(report, generation, player, "seekIssuedMs");
         await this.seekHistoricalPlayer(player);
+        const diagnostic = this.syncCamera(report, generation, player);
+        if (diagnostic) {
+          diagnostic.actualSeekTime = Number(player.video.currentTime);
+          diagnostic.seekErrorSeconds = diagnostic.actualSeekTime - player.seek;
+          diagnostic.barrierReadyEpoch = diagnostic.effectiveOriginEpoch + diagnostic.actualSeekTime;
+          diagnostic.barrierReadyErrorSeconds = diagnostic.barrierReadyEpoch - target;
+          diagnostic.status = "released";
+          this.syncStage(report, generation, player, "barrierReadyMs");
+        }
       } catch (error) {
+        this.syncUnavailable(report, generation, player, "vcr_seek_or_readiness_failure");
         this.setPlayerStatus(player, "Historical playback unavailable.", true);
       }
     }));
+    if (report && generation === this._generation && this._syncSession === report) {
+      const atMs = this._now();
+      report.barrier = {
+        atMs, ready: players.filter(player => !player.unavailable).map(player => player.camera.name),
+        unavailable: [...this._historicalPlayers.values()].filter(player => player.unavailable)
+          .map(player => player.camera.name),
+        reviewClockAnchorMs: null, reviewClockAnchorEpoch: target,
+        snapshot: this.syncSnapshot(players, report, atMs)
+      };
+      for (const player of players.filter(player => !player.unavailable)) {
+        const onTimeUpdate = () => this.syncTick(report, generation);
+        player.video.addEventListener("timeupdate", onTimeUpdate);
+        player.syncListeners = [["timeupdate", onTimeUpdate]];
+      }
+    }
     if (wasRunning && !reachedHistoricalEnd && players.some(player => !player.unavailable)) {
       players.filter(player => !player.unavailable).forEach(player => {
         player.video.playbackRate = this._playbackSpeed;
-        void Promise.resolve(player.video.play()).catch(() => {});
+        const diagnostic = this.syncCamera(report, generation, player);
+        if (diagnostic) {
+          diagnostic.appliedPlaybackRate = player.video.playbackRate;
+          diagnostic.play = { issuedAtMs: this._now(), outcome: "pending", settledAtMs: null };
+        }
+        void Promise.resolve(player.video.play()).then(
+          () => { if (diagnostic) { diagnostic.play.outcome = "fulfilled"; diagnostic.play.settledAtMs = this._now(); } },
+          () => { if (diagnostic) { diagnostic.play.outcome = "rejected"; diagnostic.play.settledAtMs = this._now(); } }
+        );
       });
       this.clock.start();
+    }
+    if (report && generation === this._generation && this._syncSession === report) {
+      report.barrier.reviewClockAnchorMs = this.clock._startedAt;
+      report.disposition = players.every(player => player.unavailable) ? "all unavailable" :
+        players.some(player => player.unavailable) ? "partial release" : "released";
+      this.updateSyncSummary(report);
     }
     this.updateTransport();
     this.updateDiagnostics();
@@ -2127,12 +2326,36 @@ export class ReviewController {
     }
   }
 
-  async attachHistoricalPlayer(player, range, Hls, generation) {
-    player.timing = await this.requestPreparedTiming(player, range);
+  async attachHistoricalPlayer(player, range, Hls, generation, report = null) {
+    const diagnostic = this.syncCamera(report, generation, player);
+    this.syncStage(report, generation, player, "prepareStartMs");
+    try {
+      player.timing = await this.requestPreparedTiming(player, range);
+    } catch (error) {
+      if (diagnostic) {
+        diagnostic.prepareSucceeded = false;
+        diagnostic.prepareFailure = /no recording|no vod/i.test(sanitizeReviewError(error))
+          ? "prepare_reported_no_recording" : "prepare_api_failure";
+      }
+      throw error;
+    } finally {
+      this.syncStage(report, generation, player, "prepareCompleteMs");
+    }
     this.assertCurrentGeneration(generation);
+    if (diagnostic) {
+      diagnostic.prepareSucceeded = true;
+      diagnostic.effectiveOriginEpoch = player.timing.effective_absolute_origin;
+      diagnostic.requestedMediaTime = range.targetEpoch - diagnostic.effectiveOriginEpoch;
+      diagnostic.bounds = Object.fromEntries([
+        "requested_start", "requested_end", "recording_start", "requested_clip_from_ms",
+        "adjusted_clip_from_ms"
+      ].map(key => [key, player.timing[key]]));
+      diagnostic.insideKnownInterval = diagnostic.requestedMediaTime >= 0;
+    }
     player.seek = calculateHistoricalSeek(range.targetEpoch, player.timing);
     const signedPath = await this.signManifest(player, range);
     this.assertCurrentGeneration(generation);
+    this.syncStage(report, generation, player, "manifestSignedMs");
     const hls = new Hls({ enableWorker: true, maxBufferLength: 20 });
     player.hls = hls;
     const manifestReady = new Promise((resolve, reject) => {
@@ -2149,6 +2372,7 @@ export class ReviewController {
         else resolve();
       };
       const onManifest = () => {
+        this.syncStage(report, generation, player, "manifestParsedMs");
         finish();
       };
       const onError = (_event, data) => {
@@ -2162,6 +2386,7 @@ export class ReviewController {
       player.waitCancellations.push(cancel);
     });
     hls.attachMedia(player.video);
+    this.syncStage(report, generation, player, "playerMountedMs");
     hls.loadSource(signedPath);
     await manifestReady;
     this.assertCurrentGeneration(generation);
@@ -2173,10 +2398,20 @@ export class ReviewController {
       player.waitCancellations
     );
     this.assertCurrentGeneration(generation);
+    this.syncStage(report, generation, player, "seekableNonemptyMs");
   }
 
-  async seekHistoricalPlayer(player, generation = null) {
+  async seekHistoricalPlayer(player, generation = null, report = null) {
     if (generation !== null) this.assertCurrentGeneration(generation);
+    const diagnostic = this.syncCamera(report, generation, player);
+    if (diagnostic) {
+      diagnostic.requestedMediaTime = player.seek;
+      const onSeeked = () => this.syncStage(report, generation, player, "seekedEventMs");
+      const onCanPlay = () => this.syncStage(report, generation, player, "canplayEventMs");
+      player.video.addEventListener("seeked", onSeeked);
+      player.video.addEventListener("canplay", onCanPlay);
+      player.syncListeners = [["seeked", onSeeked], ["canplay", onCanPlay]];
+    }
     const wait = waitForMediaEvent(
       player.video,
       "seeked",
@@ -2186,9 +2421,16 @@ export class ReviewController {
       this._mediaReadyTimeoutMs,
       player.waitCancellations
     );
+    this.syncStage(report, generation, player, "seekIssuedMs");
     player.video.currentTime = player.seek;
     await wait;
     if (generation !== null) this.assertCurrentGeneration(generation);
+    this.syncStage(report, generation, player, "seekingFalseMs");
+    this.syncStage(report, generation, player, "targetToleranceMs");
+    if (diagnostic) {
+      diagnostic.actualSeekTime = Number(player.video.currentTime);
+      diagnostic.seekErrorSeconds = diagnostic.actualSeekTime - player.seek;
+    }
     await waitForMediaEvent(
       player.video,
       "canplay",
@@ -2197,13 +2439,20 @@ export class ReviewController {
       player.waitCancellations
     );
     if (generation !== null) this.assertCurrentGeneration(generation);
+    this.syncStage(report, generation, player, "readyStateThresholdMs");
+    this.syncStage(report, generation, player, "barrierReadyMs");
+    if (diagnostic) {
+      diagnostic.barrierReadyEpoch = player.timing.effective_absolute_origin + Number(player.video.currentTime);
+      diagnostic.barrierReadyErrorSeconds = diagnostic.barrierReadyEpoch - diagnostic.requestedEpoch;
+    }
   }
 
   async playHistorical(value, {
     autoplay = true,
     updateDisplayedRange = true,
     playbackRange = null,
-    cameraNames = null
+    cameraNames = null,
+    source = "other historical path"
   } = {}) {
     const generation = ++this._generation;
     this.cleanupHistorical();
@@ -2221,6 +2470,7 @@ export class ReviewController {
         cameraNames ?? this._displayedReviewQuery?.cameraNames ?? this._selectedCameraNames
       ));
       const participatingCameras = this._cameras.filter(camera => requestedNames.has(camera.name));
+      const report = this.startSyncReport(generation, targetEpoch, participatingCameras, source);
       for (const camera of participatingCameras) {
         this._historicalPlayers.set(camera.name, this.createHistoricalPlayer(camera));
       }
@@ -2232,6 +2482,7 @@ export class ReviewController {
       for (const player of players) {
         if (!player.frigateCamera) {
           this.setPlayerStatus(player, "Historical playback unavailable.", true);
+          this.syncUnavailable(report, generation, player, "missing_frigate_camera_mapping");
         }
       }
       const candidates = players.filter(player => !player.unavailable);
@@ -2241,10 +2492,17 @@ export class ReviewController {
       }
       await Promise.all(candidates.map(async player => {
         try {
-          await this.attachHistoricalPlayer(player, range, Hls, generation);
-          this.assertCurrentGeneration(generation);
-        } catch (error) {
-          this.cleanupHistoricalPlayer(player);
+           await this.attachHistoricalPlayer(player, range, Hls, generation, report);
+           this.assertCurrentGeneration(generation);
+         } catch (error) {
+           const diagnostic = this.syncCamera(report, generation, player);
+           const reason = diagnostic?.prepareFailure ??
+             (diagnostic?.insideKnownInterval === false ? "requested_before_effective_origin" :
+             (diagnostic?.stages.manifestParsedMs != null ? "seekable_or_media_readiness_failure" :
+               diagnostic?.stages.manifestSignedMs != null ? "manifest_failure" :
+                 diagnostic?.prepareSucceeded ? "manifest_sign_failure" : "prepare_failure"));
+           this.syncUnavailable(report, generation, player, reason);
+           this.cleanupHistoricalPlayer(player);
           this.setPlayerStatus(player, "No recording at this time.", true);
         }
       }));
@@ -2252,9 +2510,12 @@ export class ReviewController {
       const ready = players.filter(player => !player.unavailable && player.hls);
       await Promise.all(ready.map(async player => {
         try {
-          await this.seekHistoricalPlayer(player, generation);
-        } catch (error) {
-          this.cleanupHistoricalPlayer(player);
+           await this.seekHistoricalPlayer(player, generation, report);
+         } catch (error) {
+           const diagnostic = this.syncCamera(report, generation, player);
+           this.syncUnavailable(report, generation, player,
+              diagnostic?.stages.targetToleranceMs != null ? "post_seek_playability_failure" : "seek_failure_or_timeout");
+           this.cleanupHistoricalPlayer(player);
           this.setPlayerStatus(player, "Historical playback unavailable.", true);
         }
       }));
@@ -2262,25 +2523,62 @@ export class ReviewController {
       if (generation !== this._generation || !this._active || this._suspended) return;
       playable.forEach(player => {
         player.video.playbackRate = this._playbackSpeed;
+        const diagnostic = this.syncCamera(report, generation, player);
+        if (diagnostic) diagnostic.appliedPlaybackRate = player.video.playbackRate;
       });
       if (autoplay && playable.length > 0) {
         this.clock.setAbsolute(targetEpoch);
         this.clock.start();
       }
+      if (report) {
+        const atMs = this._now();
+        report.barrier = {
+          atMs, ready: playable.map(player => player.camera.name),
+          unavailable: players.filter(player => player.unavailable).map(player => player.camera.name),
+          reviewClockAnchorMs: this.clock._startedAt,
+          reviewClockAnchorEpoch: this.clock._absolute,
+          snapshot: this.syncSnapshot(playable, report, atMs)
+        };
+        for (const player of playable) {
+          const onTimeUpdate = () => this.syncTick(report, generation);
+          player.video.addEventListener("timeupdate", onTimeUpdate);
+          player.syncListeners ??= [];
+          player.syncListeners.push(["timeupdate", onTimeUpdate]);
+        }
+      }
       playable.forEach(player => this.setPlayerStatus(player, ""));
       const starts = autoplay
-        ? playable.map(player => Promise.resolve(player.video.play()))
+        ? playable.map(player => {
+          const diagnostic = this.syncCamera(report, generation, player);
+          if (diagnostic) diagnostic.play = { issuedAtMs: this._now(), outcome: "pending", settledAtMs: null };
+          const start = Promise.resolve(player.video.play());
+          if (diagnostic) start.then(
+            () => { diagnostic.play.outcome = "fulfilled"; diagnostic.play.settledAtMs = this._now(); },
+            () => { diagnostic.play.outcome = "rejected"; diagnostic.play.settledAtMs = this._now(); }
+          );
+          return start;
+        })
         : [];
       const startResults = await Promise.allSettled(starts);
       if (generation !== this._generation || !this._active || this._suspended) return;
       startResults.forEach((result, index) => {
         if (result.status === "rejected") {
+          this.syncUnavailable(report, generation, playable[index], "play_rejected");
           this.setPlayerStatus(playable[index], "Historical playback unavailable.", true);
         }
       });
       if (playable.every(player => player.unavailable)) this.clock.pause();
       this._historicalPreparing = false;
       const availableCount = playable.filter(player => !player.unavailable).length;
+      if (report) {
+        playable.filter(player => !player.unavailable).forEach(player => {
+          const diagnostic = this.syncCamera(report, generation, player);
+          if (diagnostic) diagnostic.status = "released";
+        });
+        report.disposition = availableCount === 0 ? "all unavailable" :
+          availableCount < players.length ? "partial release" : "released";
+        this.updateSyncSummary(report);
+      }
       this._historicalStatus = availableCount === 0
         ? "No recording at this time."
         : availableCount < players.length
@@ -2294,10 +2592,17 @@ export class ReviewController {
           if (this.enforceHistoricalPlaybackBoundary()) return;
           this.updateClockDisplay();
           this.updateDiagnostics();
+          this.syncTick(this._syncSession, generation);
         }, 500);
       }
     } catch (error) {
       if (generation !== this._generation) return;
+      if (this._syncSession?.generation === generation) {
+        this._syncSession.disposition = "error";
+        this._syncSession.terminationReason = "preparation_or_release_error";
+        this.updateSyncSummary(this._syncSession);
+        this._syncSession = null;
+      }
       this.clock.pause();
       this._historicalPreparing = false;
       for (const player of this._historicalPlayers.values()) {
@@ -2370,6 +2675,7 @@ export class ReviewController {
 
   cleanupHistoricalPlayer(player) {
     if (!player) return;
+    this.removeSyncListeners(player);
     for (const cancel of [...(player.waitCancellations ?? [])]) cancel();
     player.waitCancellations = [];
     for (const [event, handler] of player.hlsListeners ?? []) {
@@ -2385,7 +2691,15 @@ export class ReviewController {
     player.hls = null;
   }
 
+  removeSyncListeners(player) {
+    for (const [event, handler] of player.syncListeners ?? []) {
+      player.video?.removeEventListener(event, handler);
+    }
+    player.syncListeners = [];
+  }
+
   cleanupHistorical() {
+    this.endSyncReport("historical_cleanup_or_generation_change");
     if (this._diagnosticTimer !== null) {
       const view = this._root?.ownerDocument?.defaultView ?? globalThis;
       view.clearInterval(this._diagnosticTimer);

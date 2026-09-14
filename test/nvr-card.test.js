@@ -12,6 +12,48 @@ function setup(t, options) {
   return harness;
 }
 
+test("global historical sync diagnostics address only the sole connected card", t => {
+  const harness = setup(t);
+  const api = harness.window.nvrDiagnostics;
+  assert.equal(api.enableHistoricalSync(), false);
+  assert.equal(api.getLatestHistoricalSyncReport(), null);
+  assert.equal(api.getHistoricalSyncReports().length, 0);
+  assert.equal(api.disableHistoricalSync(), false);
+
+  const card = harness.createCard();
+  const controller = card._reviewController;
+  const liveCell = card.querySelector(".video-cell");
+  assert.equal(controller._historicalSyncDiagnosticsEnabled, null);
+  assert.equal(api.enableHistoricalSync(), true);
+  assert.equal(controller._historicalSyncDiagnosticsEnabled, true);
+  assert.strictEqual(card.querySelector(".video-cell"), liveCell);
+  const camera = { name: "Front", password: "should-never-appear", auth: { token: "secret" } };
+  const report = controller.startSyncReport(controller._generation, 1800000000,
+    [camera], "timeline click");
+  assert.ok(report);
+  const latest = api.getLatestHistoricalSyncReport();
+  assert.equal(latest.selectedEpoch, 1800000000);
+  assert.equal(api.getHistoricalSyncReports().length, 1);
+  assert.equal(JSON.stringify(api.getHistoricalSyncReports()).includes("should-never-appear"), false);
+  assert.equal(JSON.stringify(api.getHistoricalSyncReports()).includes('"auth"'), false);
+  latest.cameras.Front.status = "mutated";
+  assert.equal(api.getLatestHistoricalSyncReport().cameras.Front.status, "preparing");
+  assert.equal(api.disableHistoricalSync(), true);
+  assert.equal(controller.startSyncReport(controller._generation, 1800000010, [], "test"), null);
+  assert.equal(api.getHistoricalSyncReports().length, 1);
+
+  const second = harness.createCard();
+  assert.throws(() => api.enableHistoricalSync(), /exactly one connected/);
+  assert.throws(() => api.getLatestHistoricalSyncReport(), /exactly one connected/);
+  second.remove();
+  assert.equal(api.enableHistoricalSync(), true);
+  card.remove();
+  assert.equal(controller._historicalSyncDiagnosticsEnabled, false);
+  assert.equal(api.enableHistoricalSync(), false);
+  assert.equal(api.getLatestHistoricalSyncReport(), null);
+  assert.equal(api.getHistoricalSyncReports().length, 0);
+});
+
 function assignments(card) {
   return Array.from(card._assignedCameras);
 }

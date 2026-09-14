@@ -6,6 +6,35 @@ import { FrigateProvider } from "./src/providers/frigate-provider.js";
 import { ReviewController } from "./src/review/review-controller.js?v=__NVR_BUILD__";
 
 const NVR_BUILD = "__NVR_BUILD__";
+// Diagnostic facade only; controllers remain private to their owning card.
+const NVR_HISTORICAL_SYNC_CARDS = new Set();
+function soleHistoricalSyncController() {
+  const connected = [...NVR_HISTORICAL_SYNC_CARDS].filter(card => card.isConnected);
+  if (connected.length > 1) {
+    throw new Error("Historical sync diagnostics require exactly one connected NVR card.");
+  }
+  return connected[0]?._reviewController ?? null;
+}
+Object.defineProperty(window, "nvrDiagnostics", {
+  configurable: true,
+  value: Object.freeze({
+    enableHistoricalSync() {
+      return soleHistoricalSyncController()?.setHistoricalSyncDiagnostics(true) ?? false;
+    },
+    disableHistoricalSync() {
+      const controller = soleHistoricalSyncController();
+      if (!controller) return false;
+      controller.setHistoricalSyncDiagnostics(false);
+      return true;
+    },
+    getLatestHistoricalSyncReport() {
+      return soleHistoricalSyncController()?.getLatestHistoricalSyncReport() ?? null;
+    },
+    getHistoricalSyncReports() {
+      return soleHistoricalSyncController()?.getHistoricalSyncReports() ?? [];
+    }
+  })
+});
 const USE_HA_HUI_IMAGE_EXPERIMENT = true;
 const NVR_LIVE_TRANSITION_DIAGNOSTICS = false;
 const NVR_GRID_SLOT_CAPACITY = 16;
@@ -2167,6 +2196,7 @@ class NVRCard extends HTMLElement {
 
   connectedCallback() {
     this._reviewController.resume();
+    NVR_HISTORICAL_SYNC_CARDS.add(this);
     this.querySelectorAll("hui-image.nvr-live-camera").forEach(image => {
       if (!this._reconnectPresentationSources.has(image)) return;
       const slot = Number(image.closest(".video-cell")?.dataset.slot);
@@ -2194,6 +2224,8 @@ class NVRCard extends HTMLElement {
 
 
   disconnectedCallback() {
+    NVR_HISTORICAL_SYNC_CARDS.delete(this);
+    this._reviewController.setHistoricalSyncDiagnostics(false);
     this._reviewController.suspend();
     this._maximizedSwipe = null;
     this._swipeClick = null;
