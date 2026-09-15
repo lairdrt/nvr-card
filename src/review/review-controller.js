@@ -509,6 +509,8 @@ export class ReviewController {
     this._timeFormat = "24-hour";
     this._root = null;
     this._transportRoot = null;
+    this._reviewViewsAdapter = null;
+    this._reviewViewsBody = null;
     this._hass = null;
     this._cameras = [];
     this._selectedCameraNames = [];
@@ -541,7 +543,7 @@ export class ReviewController {
     this._rhsMode = "timeline";
     this._selectedFilters = new Set();
     this._sectionExpanded = {
-      cameras: false, layouts: false, when: false, filters: false, diagnostics: false
+      cameras: false, layouts: false, views: false, when: false, filters: false, diagnostics: false
     };
     this._reviewRange = null;
     this._desiredReviewRange = null;
@@ -806,6 +808,18 @@ export class ReviewController {
     this.updateCameraStatuses();
   }
 
+  setReviewViewsAdapter(adapter = null) {
+    this._reviewViewsAdapter = adapter && typeof adapter.render === "function"
+      ? adapter
+      : null;
+    this.renderReviewViews();
+  }
+
+  renderReviewViews() {
+    if (!this._reviewViewsBody || !this._reviewViewsAdapter) return;
+    this._reviewViewsAdapter.render(this._reviewViewsBody);
+  }
+
   updateCameraStatuses() {
     this._root?.querySelectorAll(".review-camera-controls .camera-item").forEach(row => {
       const camera = this._cameras.find(candidate => candidate.name === row.dataset.camera);
@@ -842,6 +856,7 @@ export class ReviewController {
     this._mediaPanels.clear();
     this._root = null;
     this._transportRoot = null;
+    this._reviewViewsBody = null;
   }
 
   activate() {
@@ -907,6 +922,171 @@ export class ReviewController {
   canonicalFilters(filters) {
     const requested = new Set(filters ?? []);
     return REVIEW_FILTERS.filter(name => requested.has(name));
+  }
+
+  captureReviewViewState() {
+    const range = this._desiredReviewRange;
+    if (!Object.hasOwn(VIEWER_LAYOUTS, this._reviewLayout) ||
+        !Number.isFinite(range?.from) || !Number.isFinite(range?.to) ||
+        !(range.from < range.to)) {
+      return null;
+    }
+    const assignedCameras = this._reviewAssignments.map(name => {
+      const camera = this._cameras.find(candidate => candidate.name === name);
+      return typeof camera?.entity === "string" && camera.entity.trim()
+        ? camera.entity.trim()
+        : null;
+    });
+    return JSON.parse(JSON.stringify({
+      version: 1,
+      layout: this._reviewLayout,
+      assignedCameras,
+      when: {
+        version: 1,
+        kind: "absolute-range",
+        from: range.from,
+        to: range.to
+      },
+      filters: this.canonicalFilters(this._selectedFilters)
+    }));
+  }
+
+  getReviewViewCaptureResult() {
+    const state = this.captureReviewViewState();
+    return state
+      ? { result: "valid", state }
+      : { result: "invalid", state: null, reason: "invalid_when_range" };
+  }
+
+  normalizeReviewViewState(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value) ||
+        value.version !== 1 || typeof value.layout !== "string" ||
+        !Object.hasOwn(VIEWER_LAYOUTS, value.layout) ||
+        !Array.isArray(value.assignedCameras) ||
+        !value.when || typeof value.when !== "object" ||
+        Array.isArray(value.when) || value.when.version !== 1 ||
+        value.when.kind !== "absolute-range" ||
+        !Number.isFinite(value.when.from) || !Number.isFinite(value.when.to) ||
+        !(value.when.from < value.when.to) || !Array.isArray(value.filters)) {
+      return { result: "invalid", state: null };
+    }
+
+    const entityToName = new Map();
+    for (const camera of this._cameras) {
+      if (typeof camera?.entity !== "string" || !camera.entity.trim() ||
+          typeof camera.name !== "string") continue;
+      if (!entityToName.has(camera.entity.trim())) {
+        entityToName.set(camera.entity.trim(), camera.name);
+      }
+    }
+    let partial = value.assignedCameras.length !== REVIEW_SLOT_CAPACITY;
+    const seenEntities = new Set();
+    const staleCameras = [];
+    const duplicateCameras = [];
+    const assignedCameras = new Array(REVIEW_SLOT_CAPACITY).fill(null);
+    for (let slot = 0; slot < REVIEW_SLOT_CAPACITY; slot += 1) {
+      const entity = value.assignedCameras[slot];
+      if (entity == null) continue;
+      if (typeof entity !== "string" || !entity.trim() || !entityToName.has(entity.trim())) {
+        partial = true;
+        staleCameras.push(entity);
+        continue;
+      }
+      const normalizedEntity = entity.trim();
+      if (seenEntities.has(normalizedEntity)) {
+        partial = true;
+        duplicateCameras.push(normalizedEntity);
+        continue;
+      }
+      seenEntities.add(normalizedEntity);
+      assignedCameras[slot] = entityToName.get(normalizedEntity);
+    }
+
+    const requestedFilters = new Set();
+    const unknownFilters = [];
+    for (const filter of value.filters) {
+      if (typeof filter !== "string" || !REVIEW_FILTERS.includes(filter)) {
+        unknownFilters.push(filter);
+        continue;
+      }
+      requestedFilters.add(filter);
+    }
+    if (unknownFilters.length > 0) partial = true;
+
+    return {
+      result: partial ? "partial" : "restored",
+      state: JSON.parse(JSON.stringify({
+        version: 1,
+        layout: value.layout,
+        assignedCameras,
+        when: {
+          version: 1,
+          kind: "absolute-range",
+          from: value.when.from,
+          to: value.when.to
+        },
+        filters: REVIEW_FILTERS.filter(filter => requestedFilters.has(filter))
+      })),
+      issues: {
+        staleCameras,
+        duplicateCameras,
+        unknownFilters
+      }
+    };
+  }
+
+  getReviewCriteriaSignature(query) {
+    if (!query) return null;
+    return JSON.stringify({
+      cameraNames: [...new Set(query.cameraNames)].sort(),
+      range: { from: query.range.from, to: query.range.to },
+      filters: [...new Set(query.filters)].sort()
+    });
+  }
+
+  constrainReviewPositionToRange(range, position = this._reviewPosition) {
+    if (!(range?.from < range?.to) || !Number.isFinite(position)) return position;
+    this._reviewPosition = Math.min(range.to, Math.max(range.from, position));
+    return this._reviewPosition;
+  }
+
+  restoreReviewView(value) {
+    const normalized = this.normalizeReviewViewState(value);
+    if (normalized.result === "invalid") return normalized;
+
+    this.ensureReviewQuery();
+    const beforeCriteria = this.getReviewCriteriaSignature(this._desiredReviewQuery);
+    const preservedPosition = this.reviewPosition;
+    this.cancelScheduledReviewQuery();
+    this._queryGeneration += 1;
+    this.cleanupTimelineInteraction();
+    if (this._presentationMode === "historical" || this._historicalPreparing) {
+      this.returnToLive(true);
+    }
+
+    const state = normalized.state;
+    this._reviewLayout = state.layout;
+    this._reviewAssignments = [...state.assignedCameras];
+    this.syncSelectionFromAssignments();
+    this._selectedFilters = new Set(state.filters);
+    this._desiredReviewRange = { from: state.when.from, to: state.when.to };
+    this._selectedReviewCamera = null;
+    this._selectedReviewLayout = null;
+    this._desiredReviewQuery = this.getDesiredReviewQuery();
+    this.constrainReviewPositionToRange(state.when, preservedPosition);
+
+    const afterCriteria = this.getReviewCriteriaSignature(this._desiredReviewQuery);
+    if (this._active && !this._suspended) this.render();
+    const criteriaChanged = beforeCriteria !== afterCriteria;
+    if (criteriaChanged) this.reviewCriteriaChanged();
+    else this.updateClockDisplay();
+
+    return {
+      result: normalized.result,
+      state: JSON.parse(JSON.stringify(state)),
+      issues: normalized.issues ?? {},
+      criteriaChanged
+    };
   }
 
   cloneReviewQuery(query) {
@@ -1327,6 +1507,7 @@ export class ReviewController {
     icon.setAttribute("icon", {
       cameras: "mdi:video-outline",
       layouts: "mdi:view-grid-outline",
+      views: "mdi:view-dashboard-outline",
       when: "mdi:calendar-clock-outline",
       filters: "mdi:filter-outline",
       diagnostics: "mdi:stethoscope"
@@ -1396,6 +1577,19 @@ export class ReviewController {
     const layoutContent = this._document.createElement("div");
     layoutContent.className = "sidebar-layout-body review-layout-controls";
     controls.appendChild(this.createSection("layouts", "Layouts", layoutContent));
+    const viewsContent = this._document.createElement("div");
+    viewsContent.className = "saved-views-body review-saved-views-body sidebar-scroll-region";
+    viewsContent.innerHTML = `
+      <div class="saved-views-toolbar">
+        <button type="button" class="saved-view-save-current" data-saved-view-action="create">
+          Save Current View
+        </button>
+      </div>
+      <div class="saved-views-list"></div>
+      <div class="saved-views-message" role="status" aria-live="polite"></div>
+    `;
+    controls.appendChild(this.createSection("views", "Views", viewsContent));
+    this._reviewViewsBody = viewsContent;
     const whenContent = this._document.createElement("div");
     whenContent.className = "review-section-content review-when-controls";
     controls.appendChild(this.createSection("when", "When", whenContent));
@@ -1539,6 +1733,7 @@ export class ReviewController {
     this._root.appendChild(product);
     this.renderCameraControls();
     this.renderReviewLayoutControls();
+    this.renderReviewViews();
     this.renderWhenControls();
     this.updateRhs();
     this.applyReviewLayout();

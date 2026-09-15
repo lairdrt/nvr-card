@@ -2050,6 +2050,7 @@ test("HA user workspace uses stable frontend user-data messages without a user i
   assert.equal(save.key, key);
   assert.deepEqual(Object.keys(save.value), [
     "version", "viewState", "savedViews",
+    "reviewSavedViews",
     "preferences", "customLayouts"
   ]);
 });
@@ -2079,6 +2080,172 @@ test("workspace save performs no diagnostic read-back and routine success stays 
   assert.equal(JSON.stringify(card.captureWorkspace()), stateAfterSave);
 
   assert.deepEqual(diagnostics, []);
+});
+
+test("workspace without Review Views hydrates with an empty independent collection", t => {
+  const harness = setup(t);
+  const seed = harness.window.document.createElement("nvr-card");
+  harness.userStateBackend.set(seed.getWorkspacePersistenceKey(), {
+    version: 1,
+    viewState: {
+      version: 1,
+      layout: "2x2",
+      assignedCameras: new Array(16).fill(null),
+      maximizedSlot: null
+    },
+    savedViews: {
+      version: 1,
+      views: [{
+        id: "view-1",
+        name: "Live Yard",
+        state: {
+          version: 1,
+          layout: "2x2",
+          assignedCameras: new Array(16).fill(null),
+          maximizedSlot: null
+        }
+      }]
+    },
+    preferences: {},
+    customLayouts: {}
+  });
+
+  const card = harness.createCard();
+  assert.deepEqual(Array.from(card._savedViews, view => view.name), ["Live Yard"]);
+  assert.deepEqual(Array.from(card._reviewSavedViews), []);
+  assert.notStrictEqual(card._savedViews, card._reviewSavedViews);
+  assert.equal(JSON.stringify(card.captureWorkspace().reviewSavedViews),
+    JSON.stringify({ version: 1, views: [] }));
+});
+
+test("valid Review Views hydrate separately and preserve opaque detached state", t => {
+  const harness = setup(t);
+  const seed = harness.window.document.createElement("nvr-card");
+  const reviewState = {
+    layout: "primary12",
+    when: { from: 100, to: 200 },
+    filters: ["person"]
+  };
+  harness.userStateBackend.set(seed.getWorkspacePersistenceKey(), {
+    version: 1,
+    viewState: {
+      version: 1,
+      layout: "2x2",
+      assignedCameras: new Array(16).fill(null),
+      maximizedSlot: null
+    },
+    savedViews: { version: 1, views: [] },
+    reviewSavedViews: {
+      version: 1,
+      views: [{ id: "view-1", name: "Overnight", state: reviewState }]
+    },
+    preferences: {},
+    customLayouts: {}
+  });
+
+  const card = harness.createCard();
+  assert.deepEqual(Array.from(card._reviewSavedViews, view => view.name), ["Overnight"]);
+  assert.equal(JSON.stringify(card._reviewSavedViews[0].state), JSON.stringify(reviewState));
+  assert.notStrictEqual(card._reviewSavedViews[0].state, reviewState);
+  assert.equal(
+    JSON.stringify(card.captureWorkspace().reviewSavedViews.views[0].state),
+    JSON.stringify(reviewState)
+  );
+  assert.notStrictEqual(
+    card.captureWorkspace().savedViews,
+    card.captureWorkspace().reviewSavedViews
+  );
+});
+
+test("malformed Review Views are isolated while valid Live Views remain readable", t => {
+  const harness = setup(t);
+  const seed = harness.window.document.createElement("nvr-card");
+  harness.userStateBackend.set(seed.getWorkspacePersistenceKey(), {
+    version: 1,
+    viewState: {
+      version: 1,
+      layout: "2x2",
+      assignedCameras: new Array(16).fill(null),
+      maximizedSlot: null
+    },
+    savedViews: {
+      version: 1,
+      views: [{
+        id: "view-1",
+        name: "Live",
+        state: {
+          version: 1,
+          layout: "2x2",
+          assignedCameras: new Array(16).fill(null),
+          maximizedSlot: null
+        }
+      }]
+    },
+    reviewSavedViews: { version: 99, views: "malformed" },
+    preferences: {},
+    customLayouts: {}
+  });
+
+  const card = harness.createCard();
+  assert.equal(card._workspaceRestoreState, "resolved");
+  assert.deepEqual(Array.from(card._savedViews, view => view.name), ["Live"]);
+  assert.deepEqual(Array.from(card._reviewSavedViews), []);
+});
+
+test("Live and Review CRUD use independent names, IDs, state, and persistence", t => {
+  const harness = setup(t);
+  const card = harness.createCard();
+  const live = card.saveCurrentViewAs("Shared Name");
+  const reviewState = { layout: "primary12", when: { from: 10, to: 20 }, filters: ["car"] };
+  const review = card.saveReviewViewAs("Shared Name", reviewState);
+
+  assert.equal(live.id, "view-1");
+  assert.equal(review.id, "view-1");
+  assert.equal(card._savedViews.length, 1);
+  assert.equal(card._reviewSavedViews.length, 1);
+  assert.notStrictEqual(card._savedViews, card._reviewSavedViews);
+  assert.notStrictEqual(review.state, reviewState);
+
+  reviewState.filters.push("person");
+  assert.deepEqual(Array.from(review.state.filters), ["car"]);
+  assert.equal(card.saveReviewViewAs(" shared name ", { ignored: true }), null);
+  assert.equal(card.renameSavedView(review.id, "Renamed", "review"), true);
+  assert.equal(card._savedViews[0].name, "Shared Name");
+  assert.equal(card.overwriteSavedView(review.id, "review", { updated: true }), true);
+  assert.deepEqual(card._savedViews[0].state, live.state);
+  assert.equal(JSON.stringify(card._reviewSavedViews[0].state), JSON.stringify({ updated: true }));
+  assert.equal(card.deleteSavedView(review.id, "review"), true);
+  assert.equal(card._savedViews.length, 1);
+  assert.equal(card._reviewSavedViews.length, 0);
+
+  const workspaceCalls = harness.userStateCalls.filter(call =>
+    call.type === "frontend/set_user_data"
+  );
+  assert.ok(workspaceCalls.length >= 4);
+  assert.ok(workspaceCalls.every(call => call.key === card.getWorkspacePersistenceKey()));
+  assert.equal(harness.userStateCalls.some(call =>
+    String(call.key).includes("saved-views")
+  ), false);
+});
+
+test("Saved View rendering and handlers can target an explicit non-Live container", t => {
+  const harness = setup(t);
+  const card = harness.createCard();
+  card.saveCurrentViewAs("Live");
+  card.saveReviewViewAs("Review", { opaque: true });
+
+  const body = harness.window.document.createElement("div");
+  body.innerHTML = '<div class="saved-views-list"></div><div class="saved-views-message"></div>';
+  harness.window.document.body.appendChild(body);
+  card.renderSavedViewsList(body, "review");
+  assert.equal(body.querySelector(".saved-view-load").textContent, "Review");
+  assert.equal(card.querySelector(".saved-view-load").textContent, "Live");
+
+  harness.window.confirm = () => true;
+  card.attachSavedViewHandlers(body, "review");
+  body.querySelector('[data-saved-view-action="delete"]').click();
+  assert.equal(card._reviewSavedViews.length, 0);
+  assert.equal(card._savedViews.length, 1);
 });
 
 test("valid remote workspace is authoritative over legacy local storage", t => {
@@ -2456,6 +2623,130 @@ test("saved-view actions preserve the sidebar container", t => {
     '[data-saved-view-action="delete"]'
   ).click();
   assert.equal(card.querySelector(".nvr-sidebar"), sidebar);
+});
+
+test("Review Views render in the Review rail after Layouts and stay separate from Live", t => {
+  const harness = setup(t);
+  const card = harness.createCard();
+  card.saveCurrentViewAs("Shared Name");
+  card.setApplicationMode("review");
+  const headers = [...card.querySelectorAll(".review-control-rail .sidebar-section-header")];
+  assert.deepEqual(headers.map(header => header.getAttribute("aria-label")), [
+    "Cameras", "Layouts", "Views", "When", "Filters"
+  ]);
+  assert.equal(card.querySelectorAll(".review-saved-views-body .saved-view-row").length, 0);
+  assert.equal(card.querySelector(".review-saved-views-body .sidebar-placeholder")?.textContent.trim(), "No saved views");
+  card.saveReviewViewAs("Shared Name", card._reviewController.captureReviewViewState());
+  assert.equal(card.querySelectorAll(".review-saved-views-body .saved-view-row").length, 1);
+  assert.equal(card.querySelector(".review-saved-views-body .saved-view-load").textContent, "Shared Name");
+  assert.equal(card.querySelectorAll(".saved-views-body .saved-view-row").length, 2);
+  card.setApplicationMode("live");
+  assert.equal(card.querySelector(".saved-views-body .saved-view-load").textContent, "Shared Name");
+  assert.equal(card.querySelectorAll(".review-saved-views-body .saved-view-row").length, 0);
+});
+
+test("Review Save Current View uses the Review capture contract and persists once", t => {
+  const harness = setup(t);
+  const card = harness.createCard();
+  card.setApplicationMode("review");
+  card._reviewController.setSelectedCameraNames(["Front", "Garage"]);
+  card._reviewController._desiredReviewRange = { from: 100, to: 200 };
+  harness.window.prompt = () => "  Investigation  ";
+  const beforeWrites = harness.userStateCalls.filter(call => call.type === "frontend/set_user_data").length;
+  card.querySelector(".review-saved-views-body .saved-view-save-current").click();
+  const afterWrites = harness.userStateCalls.filter(call => call.type === "frontend/set_user_data").length;
+  assert.equal(afterWrites - beforeWrites, 1);
+  assert.equal(card._reviewSavedViews.length, 1);
+  assert.equal(card._reviewSavedViews[0].name, "Investigation");
+  assert.equal(JSON.stringify(card._reviewSavedViews[0].state.when), JSON.stringify({
+    version: 1, kind: "absolute-range", from: 100, to: 200
+  }));
+  assert.equal(card._savedViews.length, 0);
+});
+
+test("Review Save refuses an invalid desired When range without changing saved Views", t => {
+  const harness = setup(t);
+  const card = harness.createCard();
+  card.setApplicationMode("review");
+  card._reviewController._desiredReviewRange = { from: 200, to: 200 };
+  harness.window.prompt = () => "Invalid Range";
+  card.querySelector(".review-saved-views-body .saved-view-save-current").click();
+  assert.equal(card._reviewSavedViews.length, 0);
+  assert.match(card._reviewSavedViewsMessage, /When range is invalid/);
+});
+
+test("Review load uses transactional restore once and does not overwrite the snapshot", t => {
+  const harness = setup(t);
+  const card = harness.createCard();
+  card.setApplicationMode("review");
+  const controller = card._reviewController;
+  controller._desiredReviewRange = { from: 100, to: 200 };
+  const saved = card.saveReviewViewAs("Saved Review", controller.captureReviewViewState());
+  controller._reviewLayout = "2x2";
+  controller._reviewAssignments = ["Garage", null, ...new Array(14).fill(null)];
+  controller.syncSelectionFromAssignments();
+  const originalState = JSON.stringify(saved.state);
+  let restoreCount = 0;
+  const originalRestore = controller.restoreReviewView.bind(controller);
+  controller.restoreReviewView = state => {
+    restoreCount += 1;
+    return originalRestore(state);
+  };
+  card.querySelector(".review-saved-views-body .saved-view-load").click();
+  assert.equal(restoreCount, 1);
+  assert.equal(controller._reviewLayout, saved.state.layout);
+  assert.equal(JSON.stringify(card._reviewSavedViews[0].state), originalState);
+  assert.equal(card._savedViews.length, 0);
+});
+
+test("Review Update, Rename, and Delete affect only the selected Review View", t => {
+  const harness = setup(t);
+  const card = harness.createCard();
+  card.setApplicationMode("review");
+  const controller = card._reviewController;
+  controller._desiredReviewRange = { from: 100, to: 200 };
+  const live = card.saveCurrentViewAs("Shared");
+  const review = card.saveReviewViewAs("Shared", controller.captureReviewViewState());
+  controller._reviewLayout = "2x2";
+  harness.window.confirm = () => true;
+  card.querySelector(".review-saved-views-body [data-saved-view-action=overwrite]").click();
+  assert.equal(card._reviewSavedViews[0].id, review.id);
+  assert.equal(card._reviewSavedViews[0].state.layout, "2x2");
+  harness.window.prompt = () => "Renamed Review";
+  card.querySelector(".review-saved-views-body [data-saved-view-action=rename]").click();
+  assert.equal(card._reviewSavedViews[0].name, "Renamed Review");
+  card.querySelector(".review-saved-views-body [data-saved-view-action=delete]").click();
+  assert.equal(card._reviewSavedViews.length, 0);
+  assert.equal(card._savedViews[0].id, live.id);
+  assert.equal(card._savedViews[0].name, "Shared");
+});
+
+test("Review View load reports partial and failed restores without changing saved snapshots", t => {
+  const harness = setup(t);
+  const card = harness.createCard();
+  card.setApplicationMode("review");
+  const controller = card._reviewController;
+  controller._desiredReviewRange = { from: 100, to: 200 };
+  const partial = card.saveReviewViewAs("Partial", {
+    version: 1,
+    layout: "primary12",
+    assignedCameras: ["camera.missing", "camera.front", ...new Array(14).fill(null)],
+    when: { version: 1, kind: "absolute-range", from: 100, to: 200 },
+    filters: ["person", "obsolete"]
+  });
+  card._reviewSavedViews.push({
+    id: "view-2", name: "Broken", state: { version: 1, layout: "invalid" }
+  });
+  controller.renderReviewViews();
+  card.querySelector('.review-saved-views-body [data-saved-view-id="view-1"][data-saved-view-action="load"]').click();
+  assert.match(card._reviewSavedViewsMessage, /skipped/);
+  assert.equal(controller._reviewAssignments[1], "Front");
+  const savedPartial = JSON.stringify(partial.state);
+  controller._reviewLayout = "2x2";
+  card.querySelector('.review-saved-views-body [data-saved-view-id="view-2"][data-saved-view-action="load"]').click();
+  assert.equal(controller._reviewLayout, "2x2");
+  assert.match(card._reviewSavedViewsMessage, /Unable to load Broken/);
+  assert.equal(JSON.stringify(card._reviewSavedViews[0].state), savedPartial);
 });
 
 for (const response of [null, "Saved View"]) {

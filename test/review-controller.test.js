@@ -403,6 +403,278 @@ test("ReviewClock remains an absolute clock independent of player currentTime", 
   assert.equal(clock.absoluteTime, 1800000005.75);
 });
 
+test("Review View capture is detached, versioned, and excludes transient state", t => {
+  const harness = createHistoricalHarness({
+    initialReviewRange: { from: 100, to: 200 }
+  });
+  t.after(() => harness.close());
+  const controller = harness.controller;
+  controller._reviewLayout = "primary12";
+  controller._reviewAssignments = [
+    "Drive Up", null, "Drive Down", "Back", ...new Array(12).fill(null)
+  ];
+  controller.syncSelectionFromAssignments();
+  controller._desiredReviewRange = { from: 100, to: 200 };
+  controller._selectedFilters = new Set(["package", "person"]);
+  controller._selectedReviewCamera = "Back";
+  controller._selectedReviewLayout = "4x4";
+  controller._reviewPosition = 150;
+  controller.clock.setAbsolute(175);
+  controller._rhsMode = "details";
+  controller._sectionExpanded.filters = true;
+
+  const snapshot = controller.captureReviewViewState();
+  assert.deepEqual(snapshot, {
+    version: 1,
+    layout: "primary12",
+    assignedCameras: [
+      "camera.drive_up", null, "camera.drive_down", "camera.back",
+      ...new Array(12).fill(null)
+    ],
+    when: { version: 1, kind: "absolute-range", from: 100, to: 200 },
+    filters: ["person", "package"]
+  });
+  assert.equal(snapshot.assignedCameras.length, 16);
+  assert.equal(Object.hasOwn(snapshot, "_reviewPosition"), false);
+  assert.equal(Object.hasOwn(snapshot, "reviewClockAbsolute"), false);
+  assert.equal(Object.hasOwn(snapshot, "rhsMode"), false);
+  snapshot.assignedCameras[0] = "camera.changed";
+  assert.equal(controller._reviewAssignments[0], "Drive Up");
+  assert.deepEqual(controller.getReviewViewCaptureResult(), {
+    result: "valid", state: controller.captureReviewViewState()
+  });
+});
+
+test("Review View capture rejects an invalid desired range without using displayed range", t => {
+  const harness = createHistoricalHarness({
+    initialReviewRange: { from: 100, to: 200 }
+  });
+  t.after(() => harness.close());
+  const controller = harness.controller;
+  controller._desiredReviewRange = { from: 300, to: 300 };
+  controller._displayedReviewQuery.range = { from: 100, to: 200 };
+  assert.equal(controller.captureReviewViewState(), null);
+  assert.deepEqual(controller.getReviewViewCaptureResult(), {
+    result: "invalid", state: null, reason: "invalid_when_range"
+  });
+});
+
+test("Review View normalization maps entities, preserves slots, and canonicalizes partial data", t => {
+  const harness = createHistoricalHarness();
+  t.after(() => harness.close());
+  const result = harness.controller.normalizeReviewViewState({
+    version: 1,
+    layout: "primary12",
+    assignedCameras: [
+      "camera.drive_down", "camera.missing", "camera.drive_down", null,
+      "camera.back"
+    ],
+    when: { version: 1, kind: "absolute-range", from: 10, to: 20 },
+    filters: ["package", "person", "person", "unknown"]
+  });
+  assert.equal(result.result, "partial");
+  assert.deepEqual(result.state.assignedCameras.slice(0, 5), [
+    "Drive Down", null, null, null, "Back"
+  ]);
+  assert.deepEqual(result.state.filters, ["person", "package"]);
+  assert.deepEqual(result.issues.staleCameras, ["camera.missing"]);
+  assert.deepEqual(result.issues.duplicateCameras, ["camera.drive_down"]);
+  assert.deepEqual(result.issues.unknownFilters, ["unknown"]);
+  assert.equal(result.state.assignedCameras.length, 16);
+});
+
+test("Invalid Review View normalization rejects before any controller mutation", t => {
+  const harness = createHistoricalHarness({
+    initialReviewRange: { from: 100, to: 200 }
+  });
+  t.after(() => harness.close());
+  const controller = harness.controller;
+  const before = {
+    layout: controller._reviewLayout,
+    assignments: [...controller._reviewAssignments],
+    range: { ...controller._desiredReviewRange },
+    filters: [...controller._selectedFilters],
+    position: controller.reviewPosition,
+    query: controller.cloneReviewQuery(controller._desiredReviewQuery)
+  };
+  const result = controller.restoreReviewView({
+    version: 1,
+    layout: "not-a-layout",
+    assignedCameras: new Array(16).fill(null),
+    when: { version: 1, kind: "absolute-range", from: 10, to: 20 },
+    filters: []
+  });
+  assert.equal(result.result, "invalid");
+  assert.equal(controller._reviewLayout, before.layout);
+  assert.deepEqual([...controller._reviewAssignments], before.assignments);
+  assert.deepEqual(controller._desiredReviewRange, before.range);
+  assert.deepEqual([...controller._selectedFilters], before.filters);
+  assert.equal(controller.reviewPosition, before.position);
+  assert.deepEqual(controller._desiredReviewQuery, before.query);
+});
+
+test("Review View normalization fails closed for version, When, and structure errors", t => {
+  const harness = createHistoricalHarness();
+  t.after(() => harness.close());
+  const base = {
+    version: 1,
+    layout: "primary12",
+    assignedCameras: new Array(16).fill(null),
+    when: { version: 1, kind: "absolute-range", from: 10, to: 20 },
+    filters: []
+  };
+  for (const invalid of [
+    { ...base, version: 2 },
+    { ...base, when: { ...base.when, version: 2 } },
+    { ...base, when: { ...base.when, kind: "relative" } },
+    { ...base, when: { ...base.when, from: Infinity } },
+    { ...base, when: { ...base.when, from: 20, to: 10 } },
+    { ...base, assignedCameras: "camera.drive_up" },
+    { ...base, filters: "person" }
+  ]) {
+    assert.equal(harness.controller.normalizeReviewViewState(invalid).result, "invalid");
+  }
+});
+
+test("Review View restore round-trips layout, slots, absolute range, and filters", async t => {
+  const harness = createHistoricalHarness({
+    initialReviewRange: { from: 100, to: 200 }
+  });
+  t.after(() => harness.close());
+  const controller = harness.controller;
+  harness.calls.length = 0;
+  const result = controller.restoreReviewView({
+    version: 1,
+    layout: "primary12",
+    assignedCameras: [
+      "camera.drive_down", null, "camera.back", ...new Array(13).fill(null)
+    ],
+    when: { version: 1, kind: "absolute-range", from: 300, to: 400 },
+    filters: ["package", "person"]
+  });
+  assert.equal(result.result, "restored");
+  assert.equal(result.criteriaChanged, true);
+  assert.equal(controller._reviewLayout, "primary12");
+  assert.deepEqual(controller._reviewAssignments.slice(0, 4), [
+    "Drive Down", null, "Back", null
+  ]);
+  assert.equal(controller._primaryCameraName, "Drive Down");
+  assert.deepEqual(controller._desiredReviewRange, { from: 300, to: 400 });
+  assert.deepEqual([...controller._selectedFilters], ["person", "package"]);
+  assert.equal(controller._selectedReviewCamera, null);
+  assert.equal(controller._selectedReviewLayout, null);
+  await controller.flushScheduledReviewQuery();
+  assert.equal(harness.calls.filter(call => call.type === "frigate_max/v1/review/get").length, 1);
+  assert.equal(harness.calls.some(call => call.type === "frigate_max/v1/vod/prepare"), false);
+});
+
+test("Review View restore changing only layout and slot order does not refresh metadata", async t => {
+  const harness = createHistoricalHarness({
+    initialReviewRange: { from: 100, to: 200 }
+  });
+  t.after(() => harness.close());
+  const controller = harness.controller;
+  controller._reviewAssignments = [
+    "Drive Up", "Drive Down", ...new Array(14).fill(null)
+  ];
+  controller.syncSelectionFromAssignments();
+  controller._desiredReviewQuery = controller.getDesiredReviewQuery();
+  harness.calls.length = 0;
+  const result = controller.restoreReviewView({
+    version: 1,
+    layout: "primary12",
+    assignedCameras: [
+      "camera.drive_down", "camera.drive_up", ...new Array(14).fill(null)
+    ],
+    when: { version: 1, kind: "absolute-range", from: 100, to: 200 },
+    filters: []
+  });
+  assert.equal(result.result, "restored");
+  assert.equal(result.criteriaChanged, false);
+  assert.equal(await controller.flushScheduledReviewQuery(), false);
+  assert.equal(harness.calls.length, 0);
+  assert.deepEqual(controller._reviewAssignments.slice(0, 2), ["Drive Down", "Drive Up"]);
+});
+
+test("Review View restore invalidates an in-flight pre-restore metadata response", async t => {
+  const responses = [];
+  const harness = createHistoricalHarness({
+    initialReviewRange: { from: 100, to: 200 },
+    reviewResponder: () => new Promise(resolve => responses.push(resolve))
+  });
+  t.after(() => harness.close());
+  const controller = harness.controller;
+  const oldRefresh = controller.refreshReviewQuery();
+  await Promise.resolve();
+  assert.equal(responses.length, 1);
+  controller.restoreReviewView({
+    version: 1,
+    layout: "primary12",
+    assignedCameras: ["camera.drive_up", ...new Array(15).fill(null)],
+    when: { version: 1, kind: "absolute-range", from: 300, to: 400 },
+    filters: ["person"]
+  });
+  assert.deepEqual(controller._desiredReviewQuery.range, { from: 300, to: 400 });
+  responses[0]([]);
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.deepEqual(controller._desiredReviewQuery.range, { from: 300, to: 400 });
+  assert.deepEqual(controller._displayedReviewQuery.range, { from: 100, to: 200 });
+  await oldRefresh;
+  controller.cancelScheduledReviewQuery();
+});
+
+test("Review View restore retires historical playback once and preserves the shared epoch", async t => {
+  const target = Date.parse("2026-09-10T11:30:00-07:00") / 1000;
+  const harness = createHistoricalHarness({
+    initialReviewRange: { from: target - 1800, to: target + 1800 }
+  });
+  t.after(() => harness.close());
+  const controller = harness.controller;
+  await controller.playHistorical(target, { autoplay: false });
+  const before = harness.calls.length;
+  let retireCount = 0;
+  const originalReturnToLive = controller.returnToLive.bind(controller);
+  controller.returnToLive = (...args) => {
+    retireCount += 1;
+    return originalReturnToLive(...args);
+  };
+  const result = controller.restoreReviewView({
+    version: 1,
+    layout: "primary12",
+    assignedCameras: ["camera.drive_up", ...new Array(15).fill(null)],
+    when: { version: 1, kind: "absolute-range", from: target - 900, to: target + 900 },
+    filters: []
+  });
+  assert.equal(result.result, "restored");
+  assert.equal(retireCount, 1);
+  assert.equal(controller._presentationMode, "live");
+  assert.equal(controller.clock.absoluteTime, null);
+  assert.equal(controller._reviewPosition, target);
+  assert.equal(harness.calls.slice(before).some(call => call.type === "frigate_max/v1/vod/prepare"), false);
+});
+
+test("Review View restore constrains the shared investigation position to saved boundaries", t => {
+  const harness = createHistoricalHarness({
+    initialReviewRange: { from: 100, to: 200 }
+  });
+  t.after(() => harness.close());
+  const controller = harness.controller;
+  const view = position => ({
+    version: 1,
+    layout: "primary12",
+    assignedCameras: ["camera.drive_up", ...new Array(15).fill(null)],
+    when: { version: 1, kind: "absolute-range", from: 300, to: 400 },
+    filters: []
+  });
+  controller._reviewPosition = 250;
+  controller.restoreReviewView(view());
+  assert.equal(controller._reviewPosition, 300);
+  controller._reviewPosition = 450;
+  controller.restoreReviewView({ ...view(), when: { version: 1, kind: "absolute-range", from: 500, to: 600 } });
+  assert.equal(controller._reviewPosition, 500);
+});
+
 test("one NVR clock formatter renders 12-hour and 24-hour boundary times", () => {
   const at = iso => Date.parse(iso) / 1000;
   assert.match(formatNvrClockTime(at("2026-09-10T00:05:00Z"), "UTC", "12-hour"), /^12:05 AM$/);
@@ -962,10 +1234,10 @@ test("rail toggle and native section titles retain one structure in both states"
   const reviewRail = card.querySelector(".review-control-rail");
   const reviewHeaders = [...reviewRail.querySelectorAll(".sidebar-section-header")];
   assert.deepEqual(reviewHeaders.map(header => header.getAttribute("aria-label")), [
-    "Cameras", "Layouts", "When", "Filters"
+    "Cameras", "Layouts", "Views", "When", "Filters"
   ]);
   assert.deepEqual(reviewHeaders.map(header => header.title), [
-    "Cameras", "Layouts", "When", "Filters"
+    "Cameras", "Layouts", "Views", "When", "Filters"
   ]);
   assert.ok(reviewHeaders.every(header => header.querySelector("ha-icon")));
 
@@ -985,7 +1257,7 @@ test("fresh Review sections start closed and share the collapsed rail inset cont
     ".review-control-rail > .sidebar-section"
   )];
 
-  assert.equal(sections.length, 4);
+  assert.equal(sections.length, 5);
   for (const section of sections) {
     const header = section.querySelector(".sidebar-section-header");
     const body = section.querySelector(".sidebar-section-body");
@@ -1355,7 +1627,7 @@ test("all Review sections start hidden and toggle open and closed without changi
   harness.controller.setFilter("person", true);
   harness.controller.setReviewRangeEndpoint("from", Date.parse("2026-09-07T10:00:00-07:00") / 1000);
   const before = harness.controller.state;
-  for (const name of ["cameras", "layouts", "when", "filters"]) {
+  for (const name of ["cameras", "layouts", "views", "when", "filters"]) {
     const section = harness.root.querySelector(`.review-${name}-section`);
     const header = section.querySelector(".sidebar-section-header");
     const body = section.querySelector(".sidebar-section-body");

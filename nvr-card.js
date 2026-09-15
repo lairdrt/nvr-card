@@ -407,6 +407,10 @@ class NVRCard extends HTMLElement {
     this._savedViews = [];
     this._savedViewsLoaded = false;
     this._savedViewsMessage = "";
+    this._reviewSavedViews = [];
+    this._reviewSavedViewsLoaded = false;
+    this._reviewSavedViewsMessage = "";
+    this._reviewViewsRender = null;
     this._reconnectNodeIdentity = new WeakMap();
     this._reconnectPresentationIdentities = new WeakMap();
     this._reconnectPresentationDiagnostics = new WeakMap();
@@ -1196,7 +1200,33 @@ class NVRCard extends HTMLElement {
   }
 
 
-  normalizeSavedViewsCollection(value) {
+  getSavedViewsCollection(kind = "live") {
+    if (kind !== "live" && kind !== "review") {
+      throw new Error(`Unknown Saved Views collection: ${kind}`);
+    }
+    return kind === "review" ? this._reviewSavedViews : this._savedViews;
+  }
+
+
+  getSavedViewsMessage(kind = "live") {
+    this.getSavedViewsCollection(kind);
+    return kind === "review"
+      ? this._reviewSavedViewsMessage
+      : this._savedViewsMessage;
+  }
+
+
+  cloneOpaqueSavedViewState(state) {
+    try {
+      return JSON.parse(JSON.stringify(state));
+    } catch {
+      return {};
+    }
+  }
+
+
+  normalizeSavedViewsCollection(value, kind = "live") {
+    this.getSavedViewsCollection(kind);
     if (
       !value ||
       typeof value !== "object" ||
@@ -1243,7 +1273,9 @@ class NVRCard extends HTMLElement {
       views.push({
         id: view.id,
         name,
-        state: view.state
+        state: kind === "review"
+          ? this.cloneOpaqueSavedViewState(view.state)
+          : view.state
       });
     });
 
@@ -1254,10 +1286,22 @@ class NVRCard extends HTMLElement {
   }
 
 
-  captureSavedViewsCollection() {
+  captureSavedViewsCollection(kind = "live") {
+    const views = this.getSavedViewsCollection(kind);
+    if (kind === "review") {
+      return {
+        version: 1,
+        views: views.map(view => ({
+          id: view.id,
+          name: view.name,
+          state: this.cloneOpaqueSavedViewState(view.state)
+        }))
+      };
+    }
+
     return {
       version: 1,
-      views: this._savedViews.map(view => ({
+      views: views.map(view => ({
         id: view.id,
         name: view.name,
         state: {
@@ -1280,6 +1324,7 @@ class NVRCard extends HTMLElement {
       version: 1,
       viewState: this.captureViewState(),
       savedViews: this.captureSavedViewsCollection(),
+      reviewSavedViews: this.captureSavedViewsCollection("review"),
       preferences: {
         ...(this._workspace?.preferences ?? {})
       },
@@ -1305,6 +1350,9 @@ class NVRCard extends HTMLElement {
     const viewState = this.normalizeViewState(value.viewState);
     const savedViews =
       this.normalizeSavedViewsCollection(value.savedViews);
+    const reviewSavedViews = value.reviewSavedViews === undefined
+      ? { result: "missing", views: [] }
+      : this.normalizeSavedViewsCollection(value.reviewSavedViews, "review");
 
     if (
       viewState.result === "invalid" ||
@@ -1316,7 +1364,9 @@ class NVRCard extends HTMLElement {
     return {
       result:
         viewState.result === "partial" ||
-        savedViews.result === "partial"
+        savedViews.result === "partial" ||
+        reviewSavedViews.result === "partial" ||
+        reviewSavedViews.result === "invalid"
           ? "partial"
           : "restored",
       workspace: {
@@ -1325,6 +1375,10 @@ class NVRCard extends HTMLElement {
         savedViews: {
           version: 1,
           views: savedViews.views
+        },
+        reviewSavedViews: {
+          version: 1,
+          views: reviewSavedViews.views
         },
         preferences:
           value.preferences &&
@@ -1454,6 +1508,10 @@ class NVRCard extends HTMLElement {
         version: 1,
         views: hasLegacySaved ? normalizedSaved.views : []
       },
+      reviewSavedViews: {
+        version: 1,
+        views: []
+      },
       preferences: {},
       customLayouts: {}
     };
@@ -1511,6 +1569,8 @@ class NVRCard extends HTMLElement {
       this._assignedCameras = state.assignedCameras;
       this._savedViews = workspace.savedViews.views;
       this._savedViewsLoaded = true;
+      this._reviewSavedViews = workspace.reviewSavedViews?.views ?? [];
+      this._reviewSavedViewsLoaded = true;
       this.applyLayout();
 
       this._assignedCameras.forEach((cameraName, slot) => {
@@ -1544,8 +1604,9 @@ class NVRCard extends HTMLElement {
   }
 
 
-  saveSavedViews(reason) {
-    this.saveWorkspace(reason);
+  saveSavedViews(reason, kind = "live") {
+    this.getSavedViewsCollection(kind);
+    this.saveWorkspace(kind === "review" ? `review-${reason}` : reason);
   }
 
 
@@ -1585,6 +1646,9 @@ class NVRCard extends HTMLElement {
         reason,
         message: error?.message || "Unknown error"
       });
+      if (reason.startsWith("review-")) {
+        this.setSavedViewsMessage("Unable to save Review View.", "review");
+      }
     });
   }
 
@@ -1617,10 +1681,11 @@ class NVRCard extends HTMLElement {
   }
 
 
-  hasSavedViewName(name, excludedId = null) {
+  hasSavedViewName(name, excludedId = null, kind = "live") {
     const comparableName = name.toLocaleLowerCase();
+    const views = this.getSavedViewsCollection(kind);
 
-    return this._savedViews.some(view => {
+    return views.some(view => {
       return (
         view.id !== excludedId &&
         view.name.toLocaleLowerCase() === comparableName
@@ -1629,8 +1694,8 @@ class NVRCard extends HTMLElement {
   }
 
 
-  createSavedViewId() {
-    const highestId = this._savedViews.reduce(
+  createSavedViewId(kind = "live") {
+    const highestId = this.getSavedViewsCollection(kind).reduce(
       (highest, view) => {
         const match = /^view-(\d+)$/.exec(view.id);
         return match
@@ -1644,43 +1709,72 @@ class NVRCard extends HTMLElement {
   }
 
 
-  setSavedViewsMessage(message) {
+  setSavedViewsMessage(message, kind = "live") {
+    this.getSavedViewsCollection(kind);
+    if (kind === "review") {
+      this._reviewSavedViewsMessage = message;
+      this._reviewViewsRender?.();
+      return;
+    }
     this._savedViewsMessage = message;
     this.renderSavedViewsList();
   }
 
 
-  saveCurrentViewAs(name) {
+  saveSavedViewAs(name, state, kind = "live") {
     const normalizedName =
       this.normalizeSavedViewName(name);
 
     if (normalizedName.length === 0) {
-      this.setSavedViewsMessage("View name is required.");
+      this.setSavedViewsMessage("View name is required.", kind);
       return null;
     }
 
-    if (this.hasSavedViewName(normalizedName)) {
+    if (this.hasSavedViewName(normalizedName, null, kind)) {
       this.setSavedViewsMessage(
-        "A saved view with that name already exists."
+        "A saved view with that name already exists.",
+        kind
+      );
+      return null;
+    }
+
+    const capturedState = typeof state === "function" ? state() : state;
+    if (!capturedState || typeof capturedState !== "object" || Array.isArray(capturedState)) {
+      this.setSavedViewsMessage(
+        kind === "review" ? "Review When range is invalid." : "View state is invalid.",
+        kind
       );
       return null;
     }
 
     const view = {
-      id: this.createSavedViewId(),
+      id: this.createSavedViewId(kind),
       name: normalizedName,
-      state: this.captureViewState()
+      state: kind === "review"
+        ? this.cloneOpaqueSavedViewState(capturedState)
+        : capturedState
     };
 
-    this._savedViews.push(view);
-    this.saveSavedViews("create");
-    this.setSavedViewsMessage(`Saved ${normalizedName}.`);
+    this.getSavedViewsCollection(kind).push(view);
+    this.saveSavedViews("create", kind);
+    this.setSavedViewsMessage(`Saved ${normalizedName}.`, kind);
     return view;
   }
 
 
-  overwriteSavedView(id) {
-    const index = this._savedViews.findIndex(
+  saveCurrentViewAs(name) {
+    return this.saveSavedViewAs(name, () => this.captureViewState(), "live");
+  }
+
+
+  saveReviewViewAs(name, state) {
+    return this.saveSavedViewAs(name, state, "review");
+  }
+
+
+  overwriteSavedView(id, kind = "live", state = null) {
+    const views = this.getSavedViewsCollection(kind);
+    const index = views.findIndex(
       view => view.id === id
     );
 
@@ -1688,20 +1782,34 @@ class NVRCard extends HTMLElement {
       return false;
     }
 
-    this._savedViews[index] = {
-      ...this._savedViews[index],
-      state: this.captureViewState()
+    const nextState = kind === "live"
+      ? this.captureViewState()
+      : state;
+    if (!nextState || typeof nextState !== "object" || Array.isArray(nextState)) {
+      this.setSavedViewsMessage(
+        kind === "review" ? "Review When range is invalid." : "View state is invalid.",
+        kind
+      );
+      return false;
+    }
+    views[index] = {
+      ...views[index],
+      state: kind === "review"
+        ? this.cloneOpaqueSavedViewState(nextState)
+        : nextState
     };
-    this.saveSavedViews("overwrite");
+    this.saveSavedViews("overwrite", kind);
     this.setSavedViewsMessage(
-      `Updated ${this._savedViews[index].name}.`
+      `Updated ${views[index].name}.`,
+      kind
     );
     return true;
   }
 
 
-  renameSavedView(id, name) {
-    const index = this._savedViews.findIndex(
+  renameSavedView(id, name, kind = "live") {
+    const views = this.getSavedViewsCollection(kind);
+    const index = views.findIndex(
       view => view.id === id
     );
     const normalizedName =
@@ -1712,34 +1820,37 @@ class NVRCard extends HTMLElement {
     }
 
     if (normalizedName.length === 0) {
-      this.setSavedViewsMessage("View name is required.");
+      this.setSavedViewsMessage("View name is required.", kind);
       return false;
     }
 
     if (
       this.hasSavedViewName(
         normalizedName,
-        this._savedViews[index].id
+        views[index].id,
+        kind
       )
     ) {
       this.setSavedViewsMessage(
-        "A saved view with that name already exists."
+        "A saved view with that name already exists.",
+        kind
       );
       return false;
     }
 
-    this._savedViews[index] = {
-      ...this._savedViews[index],
+    views[index] = {
+      ...views[index],
       name: normalizedName
     };
-    this.saveSavedViews("rename");
-    this.setSavedViewsMessage(`Renamed to ${normalizedName}.`);
+    this.saveSavedViews("rename", kind);
+    this.setSavedViewsMessage(`Renamed to ${normalizedName}.`, kind);
     return true;
   }
 
 
-  deleteSavedView(id) {
-    const index = this._savedViews.findIndex(
+  deleteSavedView(id, kind = "live") {
+    const views = this.getSavedViewsCollection(kind);
+    const index = views.findIndex(
       view => view.id === id
     );
 
@@ -1747,10 +1858,26 @@ class NVRCard extends HTMLElement {
       return false;
     }
 
-    const [removed] = this._savedViews.splice(index, 1);
-    this.saveSavedViews("delete");
-    this.setSavedViewsMessage(`Deleted ${removed.name}.`);
+    const [removed] = views.splice(index, 1);
+    this.saveSavedViews("delete", kind);
+    this.setSavedViewsMessage(`Deleted ${removed.name}.`, kind);
     return true;
+  }
+
+
+  getSavedView(id, kind = "live") {
+    return this.getSavedViewsCollection(kind).find(view => view.id === id) ?? null;
+  }
+
+
+  loadSavedViewSnapshot(id, kind = "live") {
+    const view = this.getSavedView(id, kind);
+    if (!view) return null;
+    return {
+      id: view.id,
+      name: view.name,
+      state: this.cloneOpaqueSavedViewState(view.state)
+    };
   }
 
 
@@ -4772,6 +4899,7 @@ class NVRCard extends HTMLElement {
 
     this._reviewController.configure(this._cameras);
     this._reviewController.setHass(this._hass);
+    this.configureReviewViewsAdapter();
     this._reviewController.mount(
       this.querySelector(".review-surface"),
       this.querySelector(".review-header-transport")
@@ -4837,6 +4965,37 @@ class NVRCard extends HTMLElement {
   }
 
 
+  configureReviewViewsAdapter() {
+    const attachedBodies = new WeakSet();
+    this._reviewViewsRender = () => this._reviewController.renderReviewViews();
+    this._reviewController.setReviewViewsAdapter({
+      render: body => {
+        const list = body.querySelector(".saved-views-list");
+        const message = body.querySelector(".saved-views-message");
+        if (list) list.innerHTML = this.buildSavedViewsList("review");
+        if (message) message.textContent = this.getSavedViewsMessage("review");
+        if (attachedBodies.has(body)) return;
+        this.attachSavedViewHandlers(body, "review", {
+          captureState: () => this._reviewController.captureReviewViewState(),
+          restoreState: (state, view) => {
+            const result = this._reviewController.restoreReviewView(state);
+            const name = view?.name ?? "Review View";
+            if (result.result === "invalid") {
+              this.setSavedViewsMessage(`Unable to load ${name}.`, "review");
+            } else if (result.result === "partial") {
+              this.setSavedViewsMessage(`Loaded ${name}; some saved items were skipped.`, "review");
+            } else {
+              this.setSavedViewsMessage(`Loaded ${name}.`, "review");
+            }
+            return result;
+          }
+        });
+        attachedBodies.add(body);
+      }
+    });
+  }
+
+
   escapeHtml(value) {
     return String(value)
       .replaceAll("&", "&amp;")
@@ -4847,8 +5006,9 @@ class NVRCard extends HTMLElement {
   }
 
 
-  buildSavedViewsList() {
-    if (this._savedViews.length === 0) {
+  buildSavedViewsList(kind = "live") {
+    const views = this.getSavedViewsCollection(kind);
+    if (views.length === 0) {
       return `
         <div class="sidebar-placeholder">
           <ha-icon icon="mdi:view-dashboard-outline"></ha-icon>
@@ -4857,7 +5017,7 @@ class NVRCard extends HTMLElement {
       `;
     }
 
-    return this._savedViews.map(view => {
+    return views.map(view => {
       const id = this.escapeHtml(view.id);
       const name = this.escapeHtml(view.name);
 
@@ -4900,16 +5060,16 @@ class NVRCard extends HTMLElement {
   }
 
 
-  renderSavedViewsList() {
-    const list = this.querySelector(".saved-views-list");
-    const message = this.querySelector(".saved-views-message");
+  renderSavedViewsList(container = this, kind = "live") {
+    const list = container.querySelector(".saved-views-list");
+    const message = container.querySelector(".saved-views-message");
 
     if (list) {
-      list.innerHTML = this.buildSavedViewsList();
+      list.innerHTML = this.buildSavedViewsList(kind);
     }
 
     if (message) {
-      message.textContent = this._savedViewsMessage;
+      message.textContent = this.getSavedViewsMessage(kind);
     }
   }
 
@@ -7737,8 +7897,11 @@ class NVRCard extends HTMLElement {
   }
 
 
-  attachSavedViewHandlers() {
-    const body = this.querySelector(".saved-views-body");
+  attachSavedViewHandlers(
+    body = this.querySelector(".saved-views-body"),
+    kind = "live",
+    { captureState = null, restoreState = null } = {}
+  ) {
 
     if (!body) {
       return;
@@ -7762,12 +7925,17 @@ class NVRCard extends HTMLElement {
         );
 
         if (name !== null) {
-          this.saveCurrentViewAs(name);
+          if (kind === "live") {
+            this.saveCurrentViewAs(name);
+          } else {
+            const state = typeof captureState === "function" ? captureState() : null;
+            this.saveSavedViewAs(name, state, kind);
+          }
         }
         return;
       }
 
-      const view = this._savedViews.find(candidate => {
+      const view = this.getSavedViewsCollection(kind).find(candidate => {
         return candidate.id === id;
       });
 
@@ -7776,7 +7944,11 @@ class NVRCard extends HTMLElement {
       }
 
       if (action === "load") {
-        this.loadSavedView(id);
+        if (kind === "live") {
+          this.loadSavedView(id);
+        } else if (typeof restoreState === "function") {
+          restoreState(this.cloneOpaqueSavedViewState(view.state), view);
+        }
         return;
       }
 
@@ -7789,7 +7961,7 @@ class NVRCard extends HTMLElement {
         );
 
         if (name !== null) {
-          this.renameSavedView(id, name);
+          this.renameSavedView(id, name, kind);
         }
         return;
       }
@@ -7799,14 +7971,17 @@ class NVRCard extends HTMLElement {
           `Update ${view.name} from the current view?`
         )
       )) {
-        this.overwriteSavedView(id);
+        const state = kind === "live"
+          ? this.captureViewState()
+          : typeof captureState === "function" ? captureState() : null;
+        this.overwriteSavedView(id, kind, state);
         return;
       }
 
       if (action === "delete" && this.runBlockingAutoDimDialog(
         () => window.confirm(`Delete ${view.name}?`)
       )) {
-        this.deleteSavedView(id);
+        this.deleteSavedView(id, kind);
       }
     });
   }

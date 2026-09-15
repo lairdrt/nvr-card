@@ -260,9 +260,15 @@ Traversal wraps around. Swipe browsing uses a temporary maximized-camera
 override; it does not rewrite the saved layout or the pre-maximized
 assignments. Restoring returns to that previous view.
 
-Saved Views capture the layout, assignments, and maximized slot. They support
-create, load, update, rename, and delete; names are trimmed and must be
-case-insensitively unique. Relevant operations use browser-native dialogs.
+Live and Review have separate Saved View collections. Both persist for the
+same Home Assistant user and dashboard pathname, while names and IDs remain
+independently scoped. Live Saved Views capture the live layout, assignments,
+and maximized slot. Review Views capture the Review layout, exact camera
+slots, absolute From/To range, and Filters; they do not capture the playback
+or investigation cursor. Both collections support create, load, update,
+rename, and delete; names are trimmed and must be case-insensitively unique.
+Loading a Review View rapidly restores its saved investigation context.
+Relevant operations use browser-native dialogs. Live behavior is unchanged.
 
 Workspace data is stored per HA user through the HA frontend and is scoped by
 dashboard pathname. Separate HA dashboards or views are the normal way to
