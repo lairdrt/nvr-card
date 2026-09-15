@@ -13,6 +13,8 @@ transport; NVR Card owns camera organization, presentation-source selection,
 layout, interaction, persistence, liveness observation, and display
 orchestration.
 
+The long-term product direction is documented in [VISION.md](VISION.md).
+
 ## Screenshots
 
 ![NVR Card with camera sidebar and live camera grid](docs/images/nvr-card-grid.png)
