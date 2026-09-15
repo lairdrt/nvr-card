@@ -55,6 +55,82 @@ class FrigateMaxProbeTests(unittest.TestCase):
             with self.assertRaises(probe.ProbeDataError):
                 probe.validate_prepare_request(camera, 1000, 1120, 1015)
 
+    def test_recording_availability_request_is_safe_and_two_hour_bounded(self) -> None:
+        self.assertEqual(
+            probe.validate_recording_availability_request("garage", 1000, 4600),
+            ("garage", 1000.0, 4600.0),
+        )
+        for invalid in (
+            ("front/door", 1000, 1100),
+            ("garage", 1000, 1000),
+            ("garage", 1000, 1000 + probe.MAX_AVAILABILITY_RANGE_SECONDS + 1),
+            ("garage", float("nan"), 1100),
+        ):
+            with self.assertRaises(probe.ProbeDataError):
+                probe.validate_recording_availability_request(*invalid)
+
+    def test_recording_availability_empty_result_is_allowlisted(self) -> None:
+        result = probe.normalize_recording_availability([], "garage", 1000, 1100)
+        self.assertEqual(
+            result,
+            {
+                "camera": "garage",
+                "requested_start": 1000,
+                "requested_end": 1100,
+                "coverage": [],
+            },
+        )
+
+    def test_recording_availability_merges_overlap_touch_and_normal_boundaries(self) -> None:
+        result = probe.normalize_recording_availability(
+            [
+                {"start_time": 1000, "end_time": 1010},
+                {"start_time": 1009, "end_time": 1020},
+                {"start_time": 1020, "end_time": 1030},
+                {"start_time": 1030.9, "end_time": 1040},
+                {"start_time": 1041.010, "end_time": 1050},
+            ],
+            "garage",
+            1000,
+            1050,
+        )
+        self.assertEqual(result["coverage"], [{"start": 1000, "end": 1050}])
+
+    def test_recording_availability_preserves_meaningful_gap(self) -> None:
+        result = probe.normalize_recording_availability(
+            [
+                {"start_time": 1000, "end_time": 1010},
+                {"start_time": 1011.5, "end_time": 1020},
+                {"start_time": 1022, "end_time": 1030},
+            ],
+            "garage",
+            1000,
+            1030,
+        )
+        self.assertEqual(
+            result["coverage"],
+            [
+                {"start": 1000, "end": 1020},
+                {"start": 1022, "end": 1030},
+            ],
+        )
+
+    def test_recording_availability_clips_rows_to_requested_interval(self) -> None:
+        result = probe.normalize_recording_availability(
+            [{"start_time": 900, "end_time": 1200}], "garage", 1000, 1100
+        )
+        self.assertEqual(result["coverage"], [{"start": 1000, "end": 1100}])
+
+    def test_recording_availability_rejects_malformed_upstream_rows(self) -> None:
+        with self.assertRaises(probe.ProbeDataError):
+            probe.normalize_recording_availability(
+                [{"start_time": 1000, "end_time": 999}], "garage", 900, 1100
+            )
+        with self.assertRaises(probe.ProbeDataError):
+            probe.normalize_recording_availability(
+                {"recording": "not-a-list"}, "garage", 900, 1100
+            )
+
     def test_v1_prepare_normalization_drops_paths_credentials_and_unknowns(self) -> None:
         result = probe.normalize_prepare_result(
             {

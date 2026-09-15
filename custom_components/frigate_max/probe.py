@@ -10,6 +10,8 @@ from typing import Any
 ALLOWED_CAMERAS = frozenset({"drive_up", "drive_down"})
 MAX_RANGE_SECONDS = 300.0
 MAX_REVIEW_RANGE_SECONDS = 7 * 24 * 60 * 60.0
+MAX_AVAILABILITY_RANGE_SECONDS = 2 * 60 * 60.0
+RECORDING_MERGE_TOLERANCE_SECONDS = 1.5
 ISOLATION_EPSILON_SECONDS = 0.001
 PREPARED_TIMING_FIELDS = (
     "camera",
@@ -145,6 +147,68 @@ def validate_prepare_request(
     if target_epoch < start or target_epoch > end:
         raise ProbeDataError("target must be inside the requested range.")
     return camera, start, end, target_epoch
+
+
+def validate_recording_availability_request(
+    camera: Any, requested_start: Any, requested_end: Any
+) -> tuple[str, float, float]:
+    """Validate one safe, bounded recording-availability request."""
+    if not isinstance(camera, str) or not FRIGATE_CAMERA_ID.fullmatch(camera):
+        raise ProbeDataError("camera must be a safe Frigate camera identifier.")
+    start = _finite_number(requested_start, "start")
+    end = _finite_number(requested_end, "end")
+    if end <= start:
+        raise ProbeDataError("end must be after start.")
+    if end - start > MAX_AVAILABILITY_RANGE_SECONDS:
+        raise ProbeDataError("recording availability range is too large.")
+    return camera, start, end
+
+
+def normalize_recording_availability(
+    recordings: Any,
+    camera: str,
+    requested_start: float,
+    requested_end: float,
+) -> dict[str, Any]:
+    """Return clipped, coalesced recording coverage without raw Frigate fields.
+
+    Frigate's approximately ten-second recording segments can leave harmless
+    boundary discontinuities of about one second.  A 1.5-second tolerance
+    coalesces those observed boundaries while preserving larger gaps as
+    separate coverage intervals.
+    """
+    if not isinstance(recordings, Sequence) or isinstance(recordings, (str, bytes)):
+        raise ProbeDataError("Frigate recordings response must be a list.")
+
+    intervals: list[tuple[float, float]] = []
+    for item in recordings:
+        if not isinstance(item, Mapping):
+            raise ProbeDataError("Frigate returned a malformed recording.")
+        start = _finite_number(item.get("start_time"), "recording start_time")
+        end = _finite_number(item.get("end_time"), "recording end_time")
+        if end <= start:
+            raise ProbeDataError("Frigate returned an invalid recording range.")
+        if end <= requested_start or start >= requested_end:
+            continue
+        clipped_start = max(start, requested_start)
+        clipped_end = min(end, requested_end)
+        if clipped_end > clipped_start:
+            intervals.append((clipped_start, clipped_end))
+
+    intervals.sort()
+    coverage: list[dict[str, float]] = []
+    for start, end in intervals:
+        if coverage and start <= coverage[-1]["end"] + RECORDING_MERGE_TOLERANCE_SECONDS:
+            coverage[-1]["end"] = max(coverage[-1]["end"], end)
+        else:
+            coverage.append({"start": start, "end": end})
+
+    return {
+        "camera": camera,
+        "requested_start": requested_start,
+        "requested_end": requested_end,
+        "coverage": coverage,
+    }
 
 
 def candidate_probe_windows(

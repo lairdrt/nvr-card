@@ -13,6 +13,7 @@ from .probe import (
     normalize_prepare_result,
     validate_prepare_request,
     validate_probe_request,
+    validate_recording_availability_request,
     validate_review_request,
 )
 
@@ -81,6 +82,7 @@ def async_register(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, websocket_probe_vod_timing)
     websocket_api.async_register_command(hass, websocket_prepare_vod_v1)
     websocket_api.async_register_command(hass, websocket_review_events_v1)
+    websocket_api.async_register_command(hass, websocket_recording_availability_v1)
 
 
 @websocket_api.websocket_command(
@@ -105,5 +107,31 @@ async def websocket_review_events_v1(
         result = await hass.data[DOMAIN].get_review_events(cameras, from_epoch, to_epoch)
     except (ProbeDataError, FrigateProbeError) as err:
         connection.send_error(msg["id"], "frigate_max_review_unavailable", str(err))
+        return
+    connection.send_result(msg["id"], result)
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "frigate_max/v1/recordings/availability",
+        vol.Required("camera"): str,
+        vol.Required("start"): vol.Coerce(float),
+        vol.Required("end"): vol.Coerce(float),
+    }
+)
+@websocket_api.async_response
+async def websocket_recording_availability_v1(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict,
+) -> None:
+    """Return safe recording coverage for one bounded interval."""
+    try:
+        camera, start, end = validate_recording_availability_request(
+            msg["camera"], msg["start"], msg["end"]
+        )
+        result = await hass.data[DOMAIN].get_recording_availability(camera, start, end)
+    except (ProbeDataError, FrigateProbeError) as err:
+        connection.send_error(msg["id"], "frigate_max_recordings_unavailable", str(err))
         return
     connection.send_result(msg["id"], result)

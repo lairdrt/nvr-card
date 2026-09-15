@@ -14,6 +14,7 @@ from .probe import (
     derive_timing_result,
     mapping_clips,
     normalize_review_events,
+    normalize_recording_availability,
 )
 
 
@@ -180,3 +181,19 @@ class FrigateProbeClient:
             )
             events.extend(normalize_review_events(result, camera))
         return events
+
+    async def get_recording_availability(
+        self, camera: str, requested_start: float, requested_end: float
+    ) -> dict[str, Any]:
+        """Return normalized recording coverage for one bounded interval."""
+        encoded_camera = quote(camera, safe="")
+        recordings = await self._get_json(
+            f"/api/{encoded_camera}/recordings",
+            params={
+                "after": str(requested_start),
+                "before": str(requested_end),
+            },
+        )
+        return normalize_recording_availability(
+            recordings, camera, requested_start, requested_end
+        )
