@@ -9,6 +9,10 @@ const baseReviewSource = readFileSync(
   new URL("../../src/review/review-controller.js", import.meta.url),
   "utf8"
 );
+const baseHistoricalPresentationSource = readFileSync(
+  new URL("../../src/review/historical-presentation.js", import.meta.url),
+  "utf8"
+).replaceAll("export ", "");
 
 export const defaultCameras = [
   { name: "Front", entity: "camera.front", active: true },
@@ -299,6 +303,10 @@ export function createTestHarness({
   window.FrigateProvider = MockFrigateProvider;
   const reviewSource = baseReviewSource
     .replace('import "../vendor/flatpickr/flatpickr-4.6.13.min.js";', "")
+    .replace(
+      'import {\n  epochToMedia,\n  mediaToEpoch,\n  validateHistoricalPresentation\n} from "./historical-presentation.js";',
+      baseHistoricalPresentationSource
+    )
     .replaceAll("export ", "") +
     "\nwindow.ReviewController = ReviewController; window.ReviewClock = ReviewClock;";
   window.eval(reviewSource);

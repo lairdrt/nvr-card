@@ -32,6 +32,14 @@ Object.defineProperty(window, "nvrDiagnostics", {
     },
     getHistoricalSyncReports() {
       return soleHistoricalSyncController()?.getHistoricalSyncReports() ?? [];
+    },
+    runContinuousHandoffPrototype(options) {
+      const controller = soleHistoricalSyncController();
+      if (!controller) throw new Error("No connected NVR card is available.");
+      return controller.runContinuousHandoffPrototype(options);
+    },
+    getContinuousHandoffPrototypeReport() {
+      return soleHistoricalSyncController()?.getContinuousHandoffPrototypeReport() ?? null;
     }
   })
 });
@@ -3237,6 +3245,11 @@ class NVRCard extends HTMLElement {
       }
 
       .review-when-controls {
+        --review-when-label-width: 36px;
+        --review-when-label-gap: 6px;
+        --review-when-control-offset: calc(
+          var(--review-when-label-width) + var(--review-when-label-gap)
+        );
         display: grid;
         grid-template-columns: minmax(0, 1fr);
         gap: 8px;
@@ -3245,10 +3258,10 @@ class NVRCard extends HTMLElement {
 
       .review-range-field {
         display: grid;
-        grid-template-columns: 36px minmax(0, 1fr);
+        grid-template-columns: var(--review-when-label-width) minmax(0, 1fr);
         align-items: center;
         min-width: 0;
-        gap: 6px;
+        gap: var(--review-when-label-gap);
         color: #9fb0ba;
         font-size: 12px;
       }
@@ -3448,10 +3461,6 @@ class NVRCard extends HTMLElement {
         --mdc-icon-size: 18px;
       }
 
-      .review-transport .review-now {
-        width: 32px;
-      }
-
       .review-speed-select {
         width: 58px;
         height: 30px;
@@ -3558,6 +3567,40 @@ class NVRCard extends HTMLElement {
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
+      }
+
+      .review-when-shortcuts {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 6px;
+        margin-left: var(--review-when-control-offset);
+        width: calc(100% - var(--review-when-control-offset));
+      }
+
+      .review-when-shortcuts button,
+      .review-when-apply {
+        width: 100%;
+        min-width: 0;
+        min-height: 44px;
+      }
+
+      .review-when-apply {
+        margin-left: var(--review-when-control-offset);
+        width: calc(100% - var(--review-when-control-offset));
+        margin-top: 2px;
+      }
+
+      .review-camera-presentation-kind {
+        position: absolute;
+        right: 6px;
+        bottom: 6px;
+        z-index: 4;
+        padding: 2px 5px;
+        border-radius: 3px;
+        background: rgba(0, 0, 0, 0.68);
+        color: #dce6ec;
+        font: 10px/1.2 monospace;
+        pointer-events: none;
       }
 
       .review-camera-close {

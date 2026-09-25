@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any
 from urllib.parse import quote
 
@@ -10,8 +11,15 @@ import aiohttp
 
 from .probe import (
     ProbeDataError,
+    MAPPING_LOOKAROUND_SECONDS,
+    MAX_PRESENTATION_QUERY_SECONDS,
+    PRESENTATION_MAX_SECONDS,
     candidate_probe_windows,
+    build_piecewise_time_map,
+    build_presentation_window,
     derive_timing_result,
+    find_coverage_run,
+    lab_recording_preflight,
     mapping_clips,
     normalize_review_events,
     normalize_recording_availability,
@@ -197,3 +205,104 @@ class FrigateProbeClient:
         return normalize_recording_availability(
             recordings, camera, requested_start, requested_end
         )
+
+    async def prepare_presentation(
+        self,
+        camera: str,
+        target: float,
+        bounds_start: float,
+        bounds_end: float,
+        *,
+        lab_exact_range: bool = False,
+    ) -> dict[str, Any]:
+        """Prepare one bounded, absolute-time presentation without exposing Frigate data."""
+        query_start = bounds_start if lab_exact_range else max(bounds_start, target - PRESENTATION_MAX_SECONDS)
+        query_end = bounds_end if lab_exact_range else min(bounds_end, target + PRESENTATION_MAX_SECONDS)
+        if not lab_exact_range and query_end - query_start > MAX_PRESENTATION_QUERY_SECONDS:
+            raise FrigateProbeError("Presentation query envelope is too large.")
+        row_start = max(0.0, query_start - MAPPING_LOOKAROUND_SECONDS)
+        row_end = query_end + MAPPING_LOOKAROUND_SECONDS if lab_exact_range else min(bounds_end, query_end + MAPPING_LOOKAROUND_SECONDS)
+        encoded_camera = quote(camera, safe="")
+        recordings = await self._get_json(
+            f"/api/{encoded_camera}/recordings",
+            params={"after": str(row_start), "before": str(row_end)},
+        )
+        try:
+            coverage_run = find_coverage_run(recordings, target, query_start, query_end)
+            preflight = lab_recording_preflight(
+                recordings, camera, query_start, query_end, target
+            ) if lab_exact_range else None
+            window = ({
+                "requested_start": query_start,
+                "requested_end": query_end,
+                "logical_start": query_start,
+                "logical_end": query_end,
+            } if lab_exact_range else build_presentation_window(
+                target, coverage_run, bounds_start, bounds_end
+            ))
+        except ProbeDataError as err:
+            raise FrigateProbeError(str(err)) from err
+
+        requested_start = window["requested_start"]
+        requested_end = window["requested_end"]
+        mapping_started = time.perf_counter()
+        full_mapping = await self._get_json(
+            self._vod_path(camera, requested_start, requested_end)
+        )
+        mapping_latency_ms = (time.perf_counter() - mapping_started) * 1000
+        try:
+            clips = mapping_clips(full_mapping)
+            mapped = build_piecewise_time_map(
+                recordings,
+                clips,
+                window["logical_start"],
+                window["logical_end"],
+                target,
+            )
+        except ProbeDataError as err:
+            raise FrigateProbeError(str(err)) from err
+
+        result = {
+            "schema": 2,
+            "camera": camera,
+            "selected_epoch": target,
+            "resolved_selected_epoch": mapped["resolved_selected_epoch"],
+            "requested_wall_start": requested_start,
+            "requested_wall_end": requested_end,
+            "effective_wall_start": mapped["effective_wall_start"],
+            "logical_wall_start": window["logical_start"],
+            "logical_wall_end": window["logical_end"],
+            "effective_absolute_origin": mapped["effective_absolute_origin"],
+            "media_start_position": mapped["media_start_position"],
+            "selected_media_position": mapped["selected_media_position"],
+            "logical_media_end_position": mapped["logical_media_end_position"],
+            "coverage_run": {
+                key: coverage_run[key]
+                for key in (
+                    "known_start", "known_end", "continues_before", "continues_after"
+                )
+            },
+            "time_map": mapped["time_map"],
+        }
+        if lab_exact_range:
+            result["candidate_recording_row_count"] = preflight["candidate_recording_row_count"]
+            result["mapping_clip_count"] = len(clips)
+            result["vod_mapping_latency_ms"] = mapping_latency_ms
+        return result
+
+    async def lab_preflight_vod(
+        self, camera: str, start: float, end: float, target: float
+    ) -> dict[str, Any]:
+        """Temporary Lab measurement: rows and coverage before requesting a mapping."""
+        encoded_camera = quote(camera, safe="")
+        recordings = await self._get_json(
+            f"/api/{encoded_camera}/recordings",
+            params={
+                "after": str(max(0.0, start - MAPPING_LOOKAROUND_SECONDS)),
+                "before": str(end + MAPPING_LOOKAROUND_SECONDS),
+            },
+        )
+        try:
+            return lab_recording_preflight(recordings, camera, start, end, target)
+        except ProbeDataError as err:
+            raise FrigateProbeError(str(err)) from err

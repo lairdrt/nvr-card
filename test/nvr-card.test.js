@@ -32,6 +32,11 @@ test("global historical sync diagnostics address only the sole connected card", 
   assert.equal(api.getLatestHistoricalSyncReport(), null);
   assert.equal(api.getHistoricalSyncReports().length, 0);
   assert.equal(api.disableHistoricalSync(), false);
+  assert.equal(api.getContinuousHandoffPrototypeReport(), null);
+  assert.throws(
+    () => api.runContinuousHandoffPrototype({ targetEpoch: 1800000000 }),
+    /No connected NVR card/
+  );
 
   const card = harness.createCard();
   const controller = card._reviewController;
@@ -40,24 +45,43 @@ test("global historical sync diagnostics address only the sole connected card", 
   assert.equal(api.enableHistoricalSync(), true);
   assert.equal(controller._historicalSyncDiagnosticsEnabled, true);
   assert.strictEqual(card.querySelector(".video-cell"), liveCell);
-  const camera = { name: "Front", password: "should-never-appear", auth: { token: "secret" } };
+  const camera = { name: "Front", password: "fixture-only-password", auth: { token: "fixture-token" } };
   const report = controller.startSyncReport(controller._generation, 1800000000,
     [camera], "timeline click");
   assert.ok(report);
   const latest = api.getLatestHistoricalSyncReport();
   assert.equal(latest.selectedEpoch, 1800000000);
   assert.equal(api.getHistoricalSyncReports().length, 1);
-  assert.equal(JSON.stringify(api.getHistoricalSyncReports()).includes("should-never-appear"), false);
+  assert.equal(JSON.stringify(api.getHistoricalSyncReports()).includes("fixture-only-password"), false);
   assert.equal(JSON.stringify(api.getHistoricalSyncReports()).includes('"auth"'), false);
   latest.cameras.Front.status = "mutated";
   assert.equal(api.getLatestHistoricalSyncReport().cameras.Front.status, "preparing");
   assert.equal(api.disableHistoricalSync(), true);
   assert.equal(controller.startSyncReport(controller._generation, 1800000010, [], "test"), null);
   assert.equal(api.getHistoricalSyncReports().length, 1);
+  const originalPrototypeRunner = controller.runContinuousHandoffPrototype;
+  controller.runContinuousHandoffPrototype = options => ({ controller, options });
+  const prototypeCall = api.runContinuousHandoffPrototype({
+    targetEpoch: 1800000000,
+    rate: 0.25
+  });
+  assert.strictEqual(prototypeCall.controller, controller);
+  assert.equal(prototypeCall.options.rate, 0.25);
+  controller.runContinuousHandoffPrototype = originalPrototypeRunner;
+  controller._continuousHandoffPrototypeReport = {
+    outcome: "completed",
+    events: [],
+    reason: undefined
+  };
+  const prototypeReport = api.getContinuousHandoffPrototypeReport();
+  assert.equal(prototypeReport.outcome, "completed");
+  prototypeReport.outcome = "mutated";
+  assert.equal(api.getContinuousHandoffPrototypeReport().outcome, "completed");
 
   const second = harness.createCard();
   assert.throws(() => api.enableHistoricalSync(), /exactly one connected/);
   assert.throws(() => api.getLatestHistoricalSyncReport(), /exactly one connected/);
+  assert.throws(() => api.getContinuousHandoffPrototypeReport(), /exactly one connected/);
   second.remove();
   assert.equal(api.enableHistoricalSync(), true);
   card.remove();
@@ -65,6 +89,7 @@ test("global historical sync diagnostics address only the sole connected card", 
   assert.equal(api.enableHistoricalSync(), false);
   assert.equal(api.getLatestHistoricalSyncReport(), null);
   assert.equal(api.getHistoricalSyncReports().length, 0);
+  assert.equal(api.getContinuousHandoffPrototypeReport(), null);
 });
 
 function assignments(card) {

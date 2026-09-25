@@ -4,6 +4,9 @@ $HaConfigShare = "Z:"
 
 $SourceFile = Join-Path $PSScriptRoot "nvr-card.js"
 $LoaderSourceFile = Join-Path $PSScriptRoot "loader.js"
+$InvestigationLabSourceFile = Join-Path $PSScriptRoot "investigation-playback-lab.js"
+$InvestigationLabLoaderSourceFile = Join-Path $PSScriptRoot "investigation-playback-lab-loader.js"
+$InvestigationLabSourceDirectory = Join-Path $PSScriptRoot "src\investigation-lab"
 $LiveSourceDirectory = Join-Path $PSScriptRoot "src\live"
 $ProviderSourceDirectory = Join-Path $PSScriptRoot "src\providers"
 $ReviewSourceDirectory = Join-Path $PSScriptRoot "src\review"
@@ -14,6 +17,9 @@ $HlsLicenseSourceFile = Join-Path $PSScriptRoot "src\vendor\hls.js.LICENSE"
 $HaWwwDirectory = Join-Path $HaConfigShare "www\nvr-card"
 $DestinationFile = Join-Path $HaWwwDirectory "nvr-card.js"
 $LoaderDestinationFile = Join-Path $HaWwwDirectory "loader.js"
+$InvestigationLabDestinationFile = Join-Path $HaWwwDirectory "investigation-playback-lab.js"
+$InvestigationLabLoaderDestinationFile = Join-Path $HaWwwDirectory "investigation-playback-lab-loader.js"
+$InvestigationLabDestinationDirectory = Join-Path $HaWwwDirectory "src\investigation-lab"
 $LiveDestinationDirectory = Join-Path $HaWwwDirectory "src\live"
 $ProviderDestinationDirectory = Join-Path $HaWwwDirectory "src\providers"
 $ReviewDestinationDirectory = Join-Path $HaWwwDirectory "src\review"
@@ -34,6 +40,13 @@ if (-not (Test-Path -LiteralPath $SourceFile -PathType Leaf)) {
 
 if (-not (Test-Path -LiteralPath $LoaderSourceFile -PathType Leaf)) {
     Write-Error "Local loader file does not exist: $LoaderSourceFile"
+    exit 1
+}
+
+if (-not (Test-Path -LiteralPath $InvestigationLabSourceFile -PathType Leaf) -or
+    -not (Test-Path -LiteralPath $InvestigationLabLoaderSourceFile -PathType Leaf) -or
+    -not (Test-Path -LiteralPath $InvestigationLabSourceDirectory -PathType Container)) {
+    Write-Error "Investigation Playback Lab source files do not exist."
     exit 1
 }
 
@@ -91,13 +104,21 @@ if ($LASTEXITCODE -ne 0) {
 $ShortHash = ($ShortHash | Out-String).Trim()
 
 $Placeholder = "__NVR_BUILD__"
+$LabPlaceholder = "__LAB_BUILD__"
 
 try {
     $SourceContent = Get-Content -LiteralPath $SourceFile -Raw -ErrorAction Stop
+    $InvestigationLabSourceContent = Get-Content -LiteralPath $InvestigationLabSourceFile -Raw -ErrorAction Stop
+    $InvestigationLabEngineSourceFile = Join-Path $InvestigationLabSourceDirectory "single-camera-engine.js"
+    $InvestigationLabEngineSourceContent = Get-Content -LiteralPath $InvestigationLabEngineSourceFile -Raw -ErrorAction Stop
+    $InvestigationLabLongVodSourceFile = Join-Path $InvestigationLabSourceDirectory "long-vod-two-peer-experiment.js"
+    $InvestigationLabLongVodSourceContent = Get-Content -LiteralPath $InvestigationLabLongVodSourceFile -Raw -ErrorAction Stop
 
     $DeployedSourceFiles = @(
         Get-Item -LiteralPath $SourceFile -ErrorAction Stop
         Get-Item -LiteralPath $LoaderSourceFile -ErrorAction Stop
+        Get-Item -LiteralPath $InvestigationLabSourceFile -ErrorAction Stop
+        Get-ChildItem -LiteralPath $InvestigationLabSourceDirectory -File -Filter "*.js" -ErrorAction Stop
         Get-ChildItem -LiteralPath $LiveSourceDirectory -File -Filter "*.js" -ErrorAction Stop
         Get-ChildItem -LiteralPath $ProviderSourceDirectory -File -Filter "*.js" -ErrorAction Stop
         Get-ChildItem -LiteralPath $ReviewSourceDirectory -File -Filter "*.js" -ErrorAction Stop
@@ -126,6 +147,7 @@ try {
 
     $WorkingTreeHash = $ManifestHash.Substring(0, 6)
     $BuildIdentifier = "NVR $ShortHash-$WorkingTreeHash"
+    $LabBuildIdentifier = "LAB $ShortHash-$WorkingTreeHash"
 
     Write-Host "Deploying build: $BuildIdentifier"
 
@@ -133,11 +155,38 @@ try {
         Write-Error "Build placeholder was not found in the source file: $Placeholder"
         exit 1
     }
+    if (-not $InvestigationLabSourceContent.Contains($LabPlaceholder) -or
+        -not $InvestigationLabEngineSourceContent.Contains($LabPlaceholder) -or
+        -not $InvestigationLabLongVodSourceContent.Contains($LabPlaceholder)) {
+        Write-Error "Lab build placeholder was not found in each required Lab source file."
+        exit 1
+    }
 
     $DeployedContent = $SourceContent.Replace($Placeholder, $BuildIdentifier)
     $DeployedBytes = $Utf8NoBom.GetBytes($DeployedContent)
+    $DeployedInvestigationLabBytes = $Utf8NoBom.GetBytes(
+        $InvestigationLabSourceContent.Replace($LabPlaceholder, $LabBuildIdentifier)
+    )
+    $DeployedInvestigationLabEngineBytes = $Utf8NoBom.GetBytes(
+        $InvestigationLabEngineSourceContent.Replace($LabPlaceholder, $LabBuildIdentifier)
+    )
+    $DeployedInvestigationLabLongVodBytes = $Utf8NoBom.GetBytes(
+        $InvestigationLabLongVodSourceContent.Replace($LabPlaceholder, $LabBuildIdentifier)
+    )
     [System.IO.File]::WriteAllBytes($DestinationFile, $DeployedBytes)
     Copy-Item -LiteralPath $LoaderSourceFile -Destination $LoaderDestinationFile -Force -ErrorAction Stop
+    Copy-Item -LiteralPath $InvestigationLabLoaderSourceFile -Destination $InvestigationLabLoaderDestinationFile -Force -ErrorAction Stop
+    [System.IO.File]::WriteAllBytes($InvestigationLabDestinationFile, $DeployedInvestigationLabBytes)
+    New-Item -ItemType Directory -Path $InvestigationLabDestinationDirectory -Force -ErrorAction Stop | Out-Null
+    Copy-Item -Path (Join-Path $InvestigationLabSourceDirectory "*.js") -Destination $InvestigationLabDestinationDirectory -Force -ErrorAction Stop
+    [System.IO.File]::WriteAllBytes(
+        (Join-Path $InvestigationLabDestinationDirectory "single-camera-engine.js"),
+        $DeployedInvestigationLabEngineBytes
+    )
+    [System.IO.File]::WriteAllBytes(
+        (Join-Path $InvestigationLabDestinationDirectory "long-vod-two-peer-experiment.js"),
+        $DeployedInvestigationLabLongVodBytes
+    )
     New-Item -ItemType Directory -Path $LiveDestinationDirectory -Force -ErrorAction Stop | Out-Null
     Copy-Item -Path (Join-Path $LiveSourceDirectory "*.js") -Destination $LiveDestinationDirectory -Force -ErrorAction Stop
     New-Item -ItemType Directory -Path $ProviderDestinationDirectory -Force -ErrorAction Stop | Out-Null
@@ -164,6 +213,40 @@ if (-not (Test-Path -LiteralPath $DestinationFile -PathType Leaf)) {
 if (-not (Test-Path -LiteralPath $LoaderDestinationFile -PathType Leaf)) {
     Write-Error "Loader destination file does not exist after deployment: $LoaderDestinationFile"
     exit 1
+}
+
+if (-not (Test-Path -LiteralPath $InvestigationLabLoaderDestinationFile -PathType Leaf)) {
+    Write-Error "Investigation Playback Lab loader was not deployed: $InvestigationLabLoaderDestinationFile"
+    exit 1
+}
+
+$InvestigationLabEngineSourceFile = Join-Path $InvestigationLabSourceDirectory "single-camera-engine.js"
+$InvestigationLabEngineDestinationFile = Join-Path $InvestigationLabDestinationDirectory "single-camera-engine.js"
+$InvestigationLabLongVodDestinationFile = Join-Path $InvestigationLabDestinationDirectory "long-vod-two-peer-experiment.js"
+$InvestigationLabFilePairs = @(
+    [PSCustomObject]@{ Bytes = $DeployedInvestigationLabBytes; Destination = $InvestigationLabDestinationFile }
+    [PSCustomObject]@{ Bytes = $DeployedInvestigationLabEngineBytes; Destination = $InvestigationLabEngineDestinationFile }
+    [PSCustomObject]@{ Bytes = $DeployedInvestigationLabLongVodBytes; Destination = $InvestigationLabLongVodDestinationFile }
+)
+
+foreach ($InvestigationLabFilePair in $InvestigationLabFilePairs) {
+    $LabDestination = $InvestigationLabFilePair.Destination
+    if (-not (Test-Path -LiteralPath $LabDestination -PathType Leaf)) {
+        Write-Error "Investigation Playback Lab file was not deployed: $LabDestination"
+        exit 1
+    }
+    $Sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try { $LabSourceHash = ([BitConverter]::ToString($Sha256.ComputeHash($InvestigationLabFilePair.Bytes))).Replace("-", "") }
+    finally { $Sha256.Dispose() }
+    $LabDestinationHash = (Get-FileHash -LiteralPath $LabDestination -Algorithm SHA256 -ErrorAction Stop).Hash
+    if ($LabSourceHash -ne $LabDestinationHash) {
+        Write-Error "Investigation Playback Lab hash verification failed: $LabDestination"
+        exit 1
+    }
+    if ((Get-Content -LiteralPath $LabDestination -Raw).Contains($LabPlaceholder)) {
+        Write-Error "Generated Lab deployment still contains the build placeholder: $LabDestination"
+        exit 1
+    }
 }
 
 if (-not (Test-Path -LiteralPath (Join-Path $LiveDestinationDirectory "nvr-live-presentation.js") -PathType Leaf)) {
