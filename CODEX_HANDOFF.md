@@ -8,6 +8,11 @@ task; do not reconstruct the whole repository or conversation history.
 ## 1. Protected Git baseline
 
 - Branch: main.
+- Runtime-proven experimental checkpoint: annotated tag
+  one-seek-hands-off-playback. Resolve its commit with
+  git rev-parse one-seek-hands-off-playback^{}. It preserves only the isolated
+  native-VOD/one-seek modules, their direct tests, and this handoff. It does not
+  accept production Review or include the abandoned dirty Place experiments.
 - Protected development checkpoint: d1c194abb96ed1147c10ea0b2232be61b7c5947e.
 - Annotated tag: long-vod-playback-foundation, peeled to that commit.
 - The checkpoint was pushed to origin/main. Later documentation commits may
@@ -73,6 +78,56 @@ task; do not reconstruct the whole repository or conversation history.
 These observations came from the deployed development environment. They do
 not establish production Review acceptance of the current 7,200-second V2
 policy.
+
+### One mapped seek, then hands off (2026-09-26)
+
+The isolated path is Frigate native VOD -> ordinary hls.js -> one paused video
+per camera -> one authoritative mapped seek toward common absolute T -> Play
+-> passive observation only. It bypasses the recent Place state machine.
+There is no first-frame-at-or-after rule, frame chasing, iterative refinement,
+exact-frame/50-ms acceptance, leader/follower, correction, or extra player.
+A mapped current-operation RVFC is accepted before/after T, before seeked,
+and at readyState 1. within1000ms is diagnostic only; distance never gates Play.
+
+The zero-seek control requested identical native [T,E] but the physical origins
+differed: drive_up began 2.371s before T, drive_down 9.371s before T. Natural
+represented-time separation was about 5.65s; common request bounds alone did
+not align the media origins.
+
+The one-seek run used drive_up/drive_down, T=1790448870.371,
+E=1790449470.371, ordinary fractional historical time with finalized continuous
+coverage. Independent targets were 2.371000051498413s and
+9.371000051498413s. Initial RVFC mediaTimes 2.35s/9.35s both mapped to
+1790448870.35 (T minus 21.000147ms): zero initial pair error. Both observations
+arrived before seeked at readyState 1 and were accepted without another seek.
+
+After 150.018 wall seconds at 1x, 144 approximately 1Hz paired samples showed
+50ms median / 60.056ms p95 / 100ms maximum sampled absolute error. Sign is
+drive_down minus drive_up: first playback error 0ms, range -100 to +50ms,
+ending sample -100ms. Play invocation skew was 0.400ms, uncompensated.
+Descriptive fitted trend -27.568ms/min is NOT proven persistent clock drift.
+Median/p95/max callback-pair separation was 0/33.4/66.6ms; extrema are sampled,
+not an every-frame bound.
+
+Actual browser property/method auditing, including hls.js, found exactly one
+initial currentTime write per camera and, after Play, zero currentTime/rate
+writes, seeking events, corrective pause/play, synchronization actions, or
+source replacements. One Play call and one source per camera. Exactly two
+videos/two Hls instances; teardown returned active counts to zero.
+Effective represented rates were 0.999017x/0.998351x; RVFC counts 2616/2593;
+frame deltas 2996/2999; dropped-frame deltas 0/0; waiting/stalled 0/0 and 1/0.
+Both decoded 3840x2160, with zero HLS/media/HTTP errors or unmapped playback
+observations. All 40 captured responses were HTTP 200; 40 HA bearer request
+setups succeeded, with no refresh required in this run.
+
+This runtime result supports materially aligned, healthy two-camera natural
+1x playback after one mapped seek, with no adjustment during this observation.
+It supplies no measured need for more precise placement or ongoing correction.
+Production Review has not adopted or runtime-accepted this architecture.
+Longer-duration hands-off stability, higher rates, more than two cameras,
+other camera combinations/targets, finite-presentation continuation, and
+production gaps remain unproven/unresolved. The prior hour-long experiment
+and older high-rate results do not automatically validate this exact path.
 
 ### Two-camera long VOD at 1x
 
@@ -147,6 +202,25 @@ it does not validate production playback of that policy.
 
 ## 6. Lab and deployment context
 
+- The new isolated modules are
+  src/investigation-lab/native-vod-sync-experiment.js and
+  src/investigation-lab/one-seek-vod-experiment.js. Instantiate the latter with
+  common start/end, per-camera preparations, Hls, createVideo, getAuth, and
+  expectedOrigin; then startPlayback(), observe passively, report(), destroy().
+  Each preparation has identical requestedStart/requestedEnd and an immutable
+  observationPresentation covering the native physical media, including lead-in;
+  a logical [T,E] crop cannot truthfully map frames before T. Existing safe
+  FrigateMax recording/clip association and piecewise mapping produced this
+  sanitized map; no backend behavior changed. Auth uses the HA auth object and
+  bearer-per-request xhrSetup. No credentials/provider paths enter reports.
+- The one-seek runtime build was ONE SEEK LAB 813add4-8d6b56, deployed through
+  mapped Z: without restart. Modules have build placeholders substituted by
+  the isolated harness; the existing dashboard Lab entry does not route through
+  them. Do not mistake the dirty legacy Lab UI for this checkpoint's path.
+- Focused checkpoint validation: one-seek 16/16, native 12/12, authoritative
+  mapping 15/15 (43/43 total), syntax and whitespace checks. Tests are separate
+  from the browser result above. Temporary raw runtime JSON/REPORT files are
+  deliberately not committed; section 4 preserves the sanitized findings.
 - The active custom:investigation-playback-lab card uses exactly two distinct
   safe camera IDs and the long-VOD observer in
   src/investigation-lab/long-vod-two-peer-experiment.js. It is isolated from
@@ -182,27 +256,22 @@ it does not validate production playback of that policy.
 
 ## 8. Recommended next technical experiment
 
-First characterize speed with two cameras on a known finalized continuous
-interval, using the simplified long-VOD architecture: one video and one Hls
-per camera; no staging, successors, correction, or synthetic clock; one
-absolute incident-time target; RVFC representedEpoch as frame truth.
-
-Run a 1x control, then 2x, 4x, 8x, and 16x. Measure requested playbackRate,
-represented-time advancement/effective rate, peer representedEpoch error
-distribution and trend, RVFC progress, observable dropped/skipped frames,
-HLS/network/auth errors, waiting/stalls, resource counts, and visual
-usefulness. Do not add correction before observing natural behavior. If the
-two-camera results are acceptable, run the same simple architecture with
-four cameras before considering nine or eleven. Keep presentation-boundary
-redesign out of this first speed/scaling experiment. A different explicit
-user task takes precedence.
+Run a longer bounded 1x hands-off observation using this exact one-seek
+architecture with two cameras and finalized continuous coverage. One mapped
+initial seek per camera, truthful resulting RVFC regardless of offset, common
+Play calls, then zero playback adjustments until teardown. Measure natural
+pair-error distribution/trend, represented rates, RVFC/frame progress,
+HLS/media/network/auth health, waiting/stalls, and balanced resources.
+Keep frame precision, correction, speed/scaling, continuation, and gap redesign
+outside that investigation. A different explicit user task takes precedence.
 
 ## 9. Git and evidence safety
 
 - At the start of each task verify branch, HEAD, origin/main, worktree,
   staged state, and relevant protected tags. Resolve disagreements against
   Git/source/runtime evidence before acting.
-- Preserve long-vod-playback-foundation and older tags. Do not create tags
+- Preserve one-seek-hands-off-playback, long-vod-playback-foundation, and older
+  tags. Do not create tags
   merely because code was committed; meaningful new tags require
   runtime-proven checkpoints and explicit authorization.
 - Separate source facts, automated tests, experimental runtime observations,
@@ -219,6 +288,8 @@ user task takes precedence.
 3. Read VISION.md.
 4. Read this CODEX_HANDOFF.md.
 5. Inspect only architecture, source, and tests relevant to the assigned task.
-6. Preserve the protected long-vod-playback-foundation checkpoint.
+6. Verify and preserve one-seek-hands-off-playback and the protected
+   long-vod-playback-foundation checkpoint. Preserve abandoned dirty Place work
+   and generated bytecode without treating them as part of the one-seek path.
 7. Unless the user gives a different task, begin with the bounded two-camera
-   speed experiment in section 8.
+   longer 1x hands-off observation in section 8.
