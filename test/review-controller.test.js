@@ -185,7 +185,9 @@ function createHistoricalHarness({
   unavailable = new Set(), prepareGate = null, reviewEvents = [], reviewError = false,
   reviewResponder = null, availabilityResponder = null,
   presentationResponder = null,
-  deferredSeek = new Set(), deferredPlayable = new Set(),
+  deferredSeek = new Set(), deferredPlayable = new Set(), deferredFrame = new Set(),
+  frameOffsetByCamera = new Map(), noRvfc = new Set(), playResponder = null,
+  scheduleInitialDeadline = null,
   mediaReadyTimeoutMs = 15000, now = () => performance.now(),
   wallClockMs = Date.parse("2026-09-10T12:00:00-07:00"), initialReviewRange = null
 } = {}) {
@@ -332,6 +334,33 @@ function createHistoricalHarness({
       let currentTime = Number(video.currentTime) || 0;
       let seeking = false;
       let readyState = deferredPlayable.has(camera) ? 2 : 3;
+      video.currentTimeWrites = [];
+      video.playbackRateWrites = [];
+      let playbackRate = video.playbackRate;
+      Object.defineProperty(video, "playbackRate", {
+        configurable: true,
+        get: () => playbackRate,
+        set: value => {
+          playbackRate = Number(value);
+          video.playbackRateWrites.push(playbackRate);
+        }
+      });
+      const frameCallbacks = new Map();
+      let nextFrameId = 0;
+      const emitFrame = (mediaTime = currentTime + (frameOffsetByCamera.get(camera) ?? 0),
+        presentationTime = controller._now()) => {
+        const pending = [...frameCallbacks.values()];
+        frameCallbacks.clear();
+        for (const callback of pending) callback(controller._now(), { mediaTime, presentationTime });
+      };
+      if (!noRvfc.has(camera)) {
+        video.requestVideoFrameCallback = callback => {
+          const id = ++nextFrameId;
+          frameCallbacks.set(id, callback);
+          return id;
+        };
+        video.cancelVideoFrameCallback = id => frameCallbacks.delete(id);
+      }
       Object.defineProperty(video, "seekable", {
         configurable: true,
         value: { length: 1, start: () => 0, end: () => 135 }
@@ -341,7 +370,9 @@ function createHistoricalHarness({
         get: () => currentTime,
         set: value => {
           currentTime = Number(value);
+          video.currentTimeWrites.push(currentTime);
           seeking = deferredSeek.has(camera);
+          if (!deferredFrame.has(camera)) queueMicrotask(() => emitFrame());
         }
       });
       Object.defineProperty(video, "seeking", {
@@ -363,7 +394,10 @@ function createHistoricalHarness({
         makePlayable() {
           readyState = 3;
           video.dispatchEvent(new window.Event("canplay"));
-        }
+          if (deferredFrame.delete(camera)) emitFrame();
+        },
+        emitFrame,
+        pendingFrameCallbacks: () => [...frameCallbacks.values()]
       });
       video.pauseCount = 0;
       video.loadCount = 0;
@@ -387,7 +421,7 @@ function createHistoricalHarness({
           clockRunning: controller?.clock.running ?? false
         });
         video.dispatchEvent(new window.Event("playing"));
-        return Promise.resolve();
+        return playResponder ? playResponder(camera, video) : Promise.resolve();
       };
       for (const handler of this.handlers.get(MockHls.Events.MEDIA_ATTACHED) ?? []) {
         handler(MockHls.Events.MEDIA_ATTACHED, {});
@@ -478,6 +512,7 @@ function createHistoricalHarness({
     wallClock: () => typeof wallClockMs === "function" ? wallClockMs() : wallClockMs,
     datePickerFactory,
     mediaReadyTimeoutMs,
+    ...(scheduleInitialDeadline ? { scheduleInitialDeadline } : {}),
     now
   });
   controller.configure(cameras());
@@ -1804,15 +1839,21 @@ test("gated historical sync report records origins, barrier, advancement and bou
 });
 
 test("sync reports distinguish preparation failure from post-seek readiness failure and stop on Now", async t => {
+  const deadlines = manualInitialDeadlines();
   const harness = createHistoricalHarness({
     unavailable: new Set(["drive_up"]), deferredPlayable: new Set(["Drive Down"]),
-    mediaReadyTimeoutMs: 100
+    deferredFrame: new Set(["Drive Down"]),
+    scheduleInitialDeadline: deadlines.schedule.bind(deadlines)
   });
   t.after(() => harness.close());
-  await harness.controller.playHistorical(1800000000);
+  const run = harness.controller.playHistorical(1800000000);
+  await waitForHistoricalMedia(harness, 1);
+  await waitForCondition(() => harness.mediaControls[0].video.currentTimeWrites.length === 1);
+  deadlines.fireActive();
+  await run;
   const report = harness.controller.getLatestHistoricalSyncReport();
-  assert.equal(report.cameras["Drive Up"].reason, "prepare_reported_no_recording");
-  assert.equal(report.cameras["Drive Down"].reason, "post_seek_playability_failure");
+  assert.equal(report.cameras["Drive Up"].prepareFailure, "prepare_reported_no_recording");
+  assert.equal(report.cameras["Drive Down"].reason, "initial_landing_deadline");
   assert.equal(report.disposition, "all unavailable");
   harness.controller.returnToLive();
   assert.equal(harness.controller._syncSession, null);
@@ -1841,6 +1882,7 @@ test("historical startup waits through seeked and post-seek playability for one 
   const harness = createHistoricalHarness({
     deferredSeek,
     deferredPlayable,
+    deferredFrame: new Set(["Drive Up", "Drive Down"]),
     now: () => 1200
   });
   t.after(() => harness.close());
@@ -1903,7 +1945,8 @@ test("partial availability excludes missing cameras while valid players share th
   const deferredPlayable = new Set(["Drive Up", "Back"]);
   const harness = createHistoricalHarness({
     unavailable: new Set(["drive_down"]),
-    deferredPlayable
+    deferredPlayable,
+    deferredFrame: new Set(["Drive Up", "Back"])
   });
   t.after(() => harness.close());
   harness.controller.setSelectedCameraNames(["Drive Up", "Drive Down", "Back"]);
@@ -1927,9 +1970,10 @@ test("partial availability excludes missing cameras while valid players share th
 });
 
 test("a player stalled after seek is retired before remaining players release together", async t => {
+  const deadlines = manualInitialDeadlines();
   const harness = createHistoricalHarness({
-    deferredPlayable: new Set(["Drive Down"]),
-    mediaReadyTimeoutMs: 25
+    deferredFrame: new Set(["Drive Down"]),
+    scheduleInitialDeadline: deadlines.schedule.bind(deadlines)
   });
   t.after(() => harness.close());
   harness.controller.setSelectedCameraNames(["Drive Up", "Drive Down", "Back"]);
@@ -1940,6 +1984,9 @@ test("a player stalled after seek is retired before remaining players release to
   await waitForHistoricalMedia(harness, 3);
   await Promise.resolve();
   assert.equal(harness.starts.length, 0);
+  await waitForCondition(() => harness.mediaControls.every(control =>
+    control.video.currentTimeWrites.length === 1));
+  deadlines.fireActive();
   await run;
   assert.equal(harness.starts.length, 2);
   assert.deepEqual(harness.playCalls.map(call => call.camera), ["Drive Up", "Back"]);
@@ -1949,7 +1996,8 @@ test("a player stalled after seek is retired before remaining players release to
 
 test("a stale canplay completion cannot release players or anchor the old ReviewClock", async t => {
   const deferredPlayable = new Set(["Drive Up", "Drive Down"]);
-  const harness = createHistoricalHarness({ deferredPlayable });
+  const deferredFrame = new Set(["Drive Up", "Drive Down"]);
+  const harness = createHistoricalHarness({ deferredPlayable, deferredFrame });
   t.after(() => harness.close());
   const firstTarget = 1800000000;
   const secondTarget = firstTarget + 300;
@@ -1960,6 +2008,7 @@ test("a stale canplay completion cannot release players or anchor the old Review
   assert.equal(harness.controller.clock.running, false);
 
   deferredPlayable.clear();
+  deferredFrame.clear();
   const second = harness.controller.playHistorical(secondTarget);
   await waitForHistoricalMedia(harness, 4);
   await second;
@@ -3374,6 +3423,10 @@ test("Gate 1 stale camera work cleans itself without mutating the newer request"
     assert.equal(player.message, "Preparing…");
     assert.equal(player.hls, null);
   }
+  await waitForCondition(() => harness.controller.getHistoricalSyncReports()
+    .find(report => report.requestId === firstRequestId)?.identityEvents.some(event =>
+    ["stale-transition-rejected", "stale-transition-cleaned"].includes(event.disposition) &&
+      event.current === false));
   const staleReport = harness.controller.getHistoricalSyncReports()
     .find(report => report.requestId === firstRequestId);
   assert.ok(staleReport.identityEvents.some(event =>
@@ -4742,4 +4795,252 @@ test("logical V2 exhaustion distinguishes a genuine gap from deferred continuous
   prepares);
   assert.equal(continuousHarness.controller._historicalPlayers.get("Drive Up").lifecycleState, "participating");
   assert.equal(continuousHarness.controller.clock.running, true);
+});
+
+function manualInitialDeadlines() {
+  const jobs = [];
+  return {
+    jobs,
+    schedule(callback) {
+      const job = {
+        active: true,
+        fire() {
+          if (!this.active) return;
+          this.active = false;
+          callback();
+        }
+      };
+      jobs.push(job);
+      return () => { job.active = false; };
+    },
+    fireActive() {
+      const job = jobs.findLast(candidate => candidate.active);
+      assert.ok(job, "an initial deadline must be active");
+      job.fire();
+    }
+  };
+}
+
+test("initial landing uses presented RVFC mediaTime once and leaves playing streams untouched", async t => {
+  const harness = createHistoricalHarness({
+    frameOffsetByCamera: new Map([["Drive Up", -0.25], ["Drive Down", 0.45]])
+  });
+  t.after(() => harness.close());
+  const target = 1800000000;
+  await harness.controller.playHistorical(target);
+  const up = harness.controller._historicalPlayers.get("Drive Up");
+  const down = harness.controller._historicalPlayers.get("Drive Down");
+  assert.equal(up.initialPlacement.verifiedFrame, true);
+  assert.equal(down.initialPlacement.verifiedFrame, true);
+  assert.ok(Math.abs(up.initialPlacement.landedMediaTime - (up.seek - 0.25)) < 1e-6);
+  assert.ok(Math.abs(down.initialPlacement.landedMediaTime - (down.seek + 0.45)) < 1e-6);
+  assert.ok(Math.abs(up.initialPlacement.offsetSeconds + 0.25) < 1e-4);
+  assert.ok(Math.abs(down.initialPlacement.offsetSeconds - 0.45) < 1e-4);
+  for (const player of [up, down]) {
+    assert.deepEqual(player.video.currentTimeWrites, [player.seek]);
+    assert.equal(player.initialPlacement.requestedEpoch, target);
+  }
+  assert.deepEqual(harness.playCalls.map(call => call.camera), ["Drive Up", "Drive Down"]);
+  const before = [up, down].map(player => ({
+    seeks: player.video.currentTimeWrites.length,
+    rates: player.video.playbackRateWrites.length,
+    hls: player.hls
+  }));
+  harness.controller.updateDiagnostics();
+  harness.controller.enforceHistoricalPresentationBoundary();
+  for (const player of [up, down]) {
+    player.video.dispatchEvent(new harness.window.Event("timeupdate"));
+  }
+  await Promise.resolve();
+  await Promise.resolve();
+  for (const [index, player] of [up, down].entries()) {
+    assert.equal(player.video.currentTimeWrites.length, before[index].seeks);
+    assert.equal(player.video.playbackRateWrites.length, before[index].rates);
+    assert.strictEqual(player.hls, before[index].hls);
+  }
+});
+
+test("initial preparation waits for a slow camera before either final placement", async t => {
+  let releaseSlow;
+  const slow = new Promise(resolve => { releaseSlow = resolve; });
+  const deadlines = manualInitialDeadlines();
+  const harness = createHistoricalHarness({
+    scheduleInitialDeadline: deadlines.schedule.bind(deadlines),
+    presentationResponder: message => message.camera === "drive_down"
+      ? slow.then(() => presentationPrepared(message.camera, message.target - 22, message.target))
+      : Promise.resolve(presentationPrepared(message.camera, message.target - 21, message.target))
+  });
+  t.after(() => harness.close());
+  const run = harness.controller.playHistorical(1800000000);
+  await waitForCalls(harness, "frigate_max/v2/vod/prepare", 2);
+  await waitForHistoricalMedia(harness, 1);
+  assert.deepEqual(harness.mediaControls[0].video.currentTimeWrites, []);
+  assert.equal(harness.playCalls.length, 0);
+  releaseSlow();
+  await run;
+  assert.deepEqual(harness.playCalls.map(call => call.camera), ["Drive Up", "Drive Down"]);
+  assert.deepEqual(harness.mediaControls.map(control => control.video.currentTimeWrites.length), [1, 1]);
+  assert.equal(deadlines.jobs.some(job => job.active), false);
+});
+
+test("a never-finishing VOD preparation is retired before final placement and peer release", async t => {
+  let releaseSlow;
+  const slow = new Promise(resolve => { releaseSlow = resolve; });
+  const deadlines = manualInitialDeadlines();
+  const harness = createHistoricalHarness({
+    scheduleInitialDeadline: deadlines.schedule.bind(deadlines),
+    presentationResponder: message => message.camera === "drive_down"
+      ? slow.then(() => presentationPrepared(message.camera, message.target - 22, message.target))
+      : Promise.resolve(presentationPrepared(message.camera, message.target - 21, message.target))
+  });
+  t.after(() => harness.close());
+  const run = harness.controller.playHistorical(1800000000);
+  await waitForCalls(harness, "frigate_max/v2/vod/prepare", 2);
+  await waitForHistoricalMedia(harness, 1);
+  assert.deepEqual(harness.mediaControls[0].video.currentTimeWrites, []);
+  deadlines.fireActive();
+  await run;
+  const up = harness.controller._historicalPlayers.get("Drive Up");
+  const down = harness.controller._historicalPlayers.get("Drive Down");
+  assert.deepEqual(harness.playCalls.map(call => call.camera), ["Drive Up"]);
+  assert.deepEqual(up.video.currentTimeWrites, [up.seek]);
+  assert.equal(down.boundaryReason, "initial_preparation_deadline");
+  releaseSlow();
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(harness.playCalls.length, 1);
+  assert.equal(down.hls, null);
+});
+
+test("a camera without a landed frame cannot hold a ready peer past the group deadline", async t => {
+  const deadlines = manualInitialDeadlines();
+  const harness = createHistoricalHarness({
+    deferredFrame: new Set(["Drive Down"]),
+    scheduleInitialDeadline: deadlines.schedule.bind(deadlines)
+  });
+  t.after(() => harness.close());
+  const run = harness.controller.playHistorical(1800000000);
+  await waitForHistoricalMedia(harness, 2);
+  await waitForCondition(() => harness.mediaControls.every(control =>
+    control.video.currentTimeWrites.length === 1));
+  assert.equal(harness.playCalls.length, 0);
+  deadlines.fireActive();
+  await run;
+  const up = harness.controller._historicalPlayers.get("Drive Up");
+  const down = harness.controller._historicalPlayers.get("Drive Down");
+  assert.deepEqual(harness.playCalls.map(call => call.camera), ["Drive Up"]);
+  assert.equal(up.initialPlacement.verifiedFrame, true);
+  assert.equal(down.boundaryReason, "initial_landing_deadline");
+  assert.deepEqual(up.video.currentTimeWrites, [up.seek]);
+});
+
+test("initial gap and source failure do not reseek a healthy camera", async t => {
+  const gap = createHistoricalHarness({ unavailable: new Set(["drive_down"]) });
+  t.after(() => gap.close());
+  await gap.controller.playHistorical(1800000000);
+  const gapUp = gap.controller._historicalPlayers.get("Drive Up");
+  assert.deepEqual(gap.playCalls.map(call => call.camera), ["Drive Up"]);
+  assert.deepEqual(gapUp.video.currentTimeWrites, [gapUp.seek]);
+  assert.equal(gap.controller._historicalPlayers.get("Drive Down").lifecycleState, "unavailable");
+
+  const failed = createHistoricalHarness({
+    presentationResponder: message => message.camera === "drive_down"
+      ? Promise.reject(new Error("synthetic source preparation failure"))
+      : Promise.resolve(presentationPrepared(message.camera, message.target - 21, message.target))
+  });
+  t.after(() => failed.close());
+  await failed.controller.playHistorical(1800000000);
+  const up = failed.controller._historicalPlayers.get("Drive Up");
+  assert.deepEqual(failed.playCalls.map(call => call.camera), ["Drive Up"]);
+  assert.deepEqual(up.video.currentTimeWrites, [up.seek]);
+  assert.equal(failed.controller._historicalPlayers.get("Drive Down").lifecycleState, "failed");
+});
+
+test("superseded post-seek RVFC cannot release an old acquisition", async t => {
+  const deferredFrame = new Set(["Drive Up", "Drive Down"]);
+  const harness = createHistoricalHarness({ deferredFrame });
+  t.after(() => harness.close());
+  const first = harness.controller.playHistorical(1800000000);
+  await waitForHistoricalMedia(harness, 2);
+  await waitForCondition(() => harness.mediaControls.every(control =>
+    control.video.currentTimeWrites.length === 1));
+  const oldCallbacks = harness.mediaControls.flatMap(control => control.pendingFrameCallbacks());
+  assert.equal(oldCallbacks.length, 2);
+  const second = harness.controller.playHistorical(1800000060);
+  await waitForHistoricalMedia(harness, 4);
+  await waitForCondition(() => harness.mediaControls.slice(2).every(control =>
+    control.video.currentTimeWrites.length === 1));
+  for (const callback of oldCallbacks) callback(0, {
+    mediaTime: 21,
+    presentationTime: harness.controller._now()
+  });
+  assert.equal(harness.playCalls.length, 0);
+  for (const control of harness.mediaControls.slice(2)) control.emitFrame();
+  await second;
+  await first;
+  assert.deepEqual(harness.playCalls.map(call => call.camera), ["Drive Up", "Drive Down"]);
+  assert.equal(harness.controller.clock.absoluteTime >= 1800000060, true);
+});
+
+test("an RVFC frame presented before the final seek cannot establish landing", async t => {
+  const harness = createHistoricalHarness({ deferredFrame: new Set(["Drive Up"]) });
+  t.after(() => harness.close());
+  const run = harness.controller.playHistorical(1800000000);
+  await waitForHistoricalMedia(harness, 2);
+  const up = harness.mediaControls.find(control => control.camera === "Drive Up");
+  await waitForCondition(() => up.video.currentTimeWrites.length === 1 &&
+    up.pendingFrameCallbacks().length === 1);
+  up.emitFrame(up.video.currentTime, -1);
+  assert.equal(harness.playCalls.length, 0);
+  assert.equal(up.pendingFrameCallbacks().length, 1);
+  up.emitFrame();
+  await run;
+  assert.equal(harness.controller._historicalPlayers.get("Drive Up").initialPlacement.verifiedFrame, true);
+  assert.equal(harness.playCalls.length, 2);
+});
+
+test("a frame from a replaced Hls source cannot establish initial readiness", async t => {
+  const harness = createHistoricalHarness({ deferredFrame: new Set(["Drive Up"]) });
+  t.after(() => harness.close());
+  const run = harness.controller.playHistorical(1800000000);
+  await waitForHistoricalMedia(harness, 2);
+  const upControl = harness.mediaControls.find(control => control.camera === "Drive Up");
+  await waitForCondition(() => upControl.video.currentTimeWrites.length === 1 &&
+    upControl.pendingFrameCallbacks().length === 1);
+  const up = harness.controller._historicalPlayers.get("Drive Up");
+  up.hls = { destroy() {} };
+  upControl.emitFrame();
+  await run;
+  assert.equal(up.lifecycleState, "failed");
+  assert.equal(up.initialPlacement, null);
+  assert.deepEqual(harness.playCalls.map(call => call.camera), ["Drive Down"]);
+});
+
+test("initial Play dispatch invokes every peer before awaiting a pending or rejected Play", async t => {
+  let releaseUp;
+  const upPlay = new Promise(resolve => { releaseUp = resolve; });
+  const harness = createHistoricalHarness({
+    playResponder: camera => camera === "Drive Up"
+      ? upPlay : Promise.reject(new Error("synthetic autoplay rejection"))
+  });
+  t.after(() => harness.close());
+  const run = harness.controller.playHistorical(1800000000);
+  await waitForCondition(() => harness.playCalls.length === 2);
+  assert.deepEqual(harness.playCalls.map(call => call.camera), ["Drive Up", "Drive Down"]);
+  releaseUp();
+  await run;
+  assert.equal(harness.controller._historicalPlayers.get("Drive Up").lifecycleState, "participating");
+  assert.equal(harness.controller._historicalPlayers.get("Drive Down").lifecycleState, "failed");
+});
+
+test("browser without RVFC retains legacy readiness but never claims a landed frame", async t => {
+  const harness = createHistoricalHarness({ noRvfc: new Set(["Drive Up", "Drive Down"]) });
+  t.after(() => harness.close());
+  await harness.controller.playHistorical(1800000000);
+  for (const player of harness.controller._historicalPlayers.values()) {
+    assert.equal(player.initialPlacement.verifiedFrame, false);
+    assert.equal(player.initialPlacement.landedMediaTime, null);
+    assert.equal(player.initialPlacement.landedEpoch, null);
+  }
+  assert.equal(harness.playCalls.length, 2);
 });
