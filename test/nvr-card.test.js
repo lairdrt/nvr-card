@@ -1118,6 +1118,32 @@ test("live status positions default safely and update the existing stalled spinn
   }
 });
 
+test("card video-state badge position updates Review Live badges without rebuilding the workspace", t => {
+  const harness = setup(t);
+  const card = harness.createCard();
+  card.setApplicationMode("review");
+  card._reviewController.setSelectedCameraNames(["Garage"]);
+  const panel = card.querySelector('.review-camera-panel[data-camera="Garage"]');
+  const badge = panel.querySelector(".review-camera-presentation-kind");
+  const assignments = [...card._reviewController.state.reviewAssignments];
+  assert.equal(badge.textContent, "Live");
+  const assertCorner = corner => {
+    const [vertical, horizontal] = corner.split("-");
+    for (const side of ["top", "right", "bottom", "left"]) {
+      assert.equal(badge.style[side],
+        side === vertical || side === horizontal ? "6px" : "auto");
+    }
+  };
+  assertCorner("bottom-left");
+  for (const value of ["top-left", "top-right", "bottom-left", "bottom-right", "invalid"]) {
+    card.setConfig({ ...card.config, video_state_badge_position: value });
+    assertCorner(value === "invalid" ? "bottom-left" : value);
+    assert.strictEqual(card.querySelector('.review-camera-panel[data-camera="Garage"]'), panel);
+    assert.strictEqual(panel.querySelector(".review-camera-presentation-kind"), badge);
+    assert.deepEqual(Array.from(card._reviewController.state.reviewAssignments), assignments);
+  }
+});
+
 function lifecyclePresentation(t) {
   const harness = setup(t);
   const card = harness.createCard();
@@ -3859,8 +3885,8 @@ test("sidebar and 600px responsive transitions preserve every player and cell", 
   const toggle = card.querySelector(".sidebar-toggle");
 
   assert.equal(shell.classList.contains("phone-layout"), false);
-  assert.equal(shell.classList.contains("sidebar-collapsed"), false);
-  assert.equal(toggle.getAttribute("aria-expanded"), "true");
+  assert.equal(shell.classList.contains("sidebar-collapsed"), true);
+  assert.equal(toggle.getAttribute("aria-expanded"), "false");
   assert.equal(sidebar.getAttribute("aria-hidden"), "false");
 
   harness.setShellWidth(card, 600);
@@ -3876,23 +3902,23 @@ test("sidebar and 600px responsive transitions preserve every player and cell", 
   harness.flushAnimationFrames();
 
   assert.equal(shell.classList.contains("phone-layout"), false);
-  assert.equal(shell.classList.contains("sidebar-collapsed"), false);
-  assert.equal(toggle.getAttribute("aria-expanded"), "true");
+  assert.equal(shell.classList.contains("sidebar-collapsed"), true);
+  assert.equal(toggle.getAttribute("aria-expanded"), "false");
   assert.equal(sidebar.getAttribute("aria-hidden"), "false");
 
   toggle.click();
   harness.flushAnimationFrames();
 
-  assert.equal(shell.classList.contains("sidebar-collapsed"), true);
-  assert.equal(toggle.getAttribute("aria-expanded"), "false");
+  assert.equal(shell.classList.contains("sidebar-collapsed"), false);
+  assert.equal(toggle.getAttribute("aria-expanded"), "true");
   assert.equal(sidebar.getAttribute("aria-hidden"), "false");
   assertIdentitiesUnchanged(harness, card, cameraNames, before);
 
   toggle.click();
   harness.flushAnimationFrames();
 
-  assert.equal(shell.classList.contains("sidebar-collapsed"), false);
-  assert.equal(toggle.getAttribute("aria-expanded"), "true");
+  assert.equal(shell.classList.contains("sidebar-collapsed"), true);
+  assert.equal(toggle.getAttribute("aria-expanded"), "false");
   assert.equal(sidebar.getAttribute("aria-hidden"), "false");
   assertIdentitiesUnchanged(harness, card, cameraNames, before);
 });

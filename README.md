@@ -155,6 +155,7 @@ type: custom:nvr-card
 camera_aspect_ratio: "16:9"
 time:
   format: 12-hour
+video_state_badge_position: bottom-left
 
 cameras:
   - name: Camera A
@@ -209,6 +210,7 @@ unknown fields inside `live` are rejected.
 | `cameras[].live.mainstream` | Required when `live` exists | Nonempty HA entity ID for maximized presentation. |
 | `camera_aspect_ratio` | Optional string, `"16:9"` | Exactly one colon; both sides must be positive finite numbers. Controls fitting. |
 | `time.format` | Optional string, `24-hour` | `12-hour` or `24-hour` for NVR-generated Review clock displays. Omit `time` to retain 24-hour When and Timeline presentation. |
+| `video_state_badge_position` | Optional string, `bottom-left` | Places the Review camera video-state badge in `top-left`, `top-right`, `bottom-left`, or `bottom-right`. Applies to its Live and Historical presentations; invalid values use `bottom-left`. |
 | `live_status.position` | Optional string, `bottom-left` | Valid values are `bottom-left`, `bottom-right`, `top-left`, and `top-right`. Invalid values use `bottom-left`. |
 
 ### Live recovery options

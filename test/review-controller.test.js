@@ -20,6 +20,8 @@ import {
   normalizeRecordingAvailability,
   inspectRecordingAvailability,
   normalizeReviewTimelineItems,
+  reviewEventNavigationTimestamps,
+  reviewEventNavigationTargets,
   planContinuousHandoffPrototype,
   reviewTimelineEpochFromCoordinate,
   reviewTimelineMarkerGeometry,
@@ -92,6 +94,12 @@ function presentationPrepared(camera, origin, target = 1800000000, logicalEnd = 
       ]]
     }
   };
+}
+
+function setReviewTi(controller, epoch) {
+  const running = controller.clock.running;
+  controller.clock.setAbsolute(epoch);
+  if (running) controller.clock.start();
 }
 
 test("deployed card cache-busts the Review controller with its build identifier", () => {
@@ -1124,13 +1132,16 @@ test("the first live Timeline drag owns the preview through move, release and la
   handle.dispatchEvent(new harness.window.PointerEvent("pointerup", {
     bubbles: true, pointerId: 41, button: 0, clientY: 300
   }));
-  for (let index = 0; index < 20 && harness.starts.length < 2; index += 1) {
+  for (let index = 0; index < 20 && harness.calls.filter(call =>
+    call.type === "frigate_max/v2/vod/prepare").length < 2; index += 1) {
     await new Promise(resolve => harness.window.setTimeout(resolve, 0));
   }
   const prepares = harness.calls.filter(call => call.type === "frigate_max/v1/vod/prepare");
   assert.equal(prepares.length, 2);
   assert.ok(prepares.every(call => call.target === preview));
   assert.equal(controller.state.presentationMode, "historical");
+  assert.equal(controller.clock.running, false);
+  assert.equal(harness.starts.length, 0);
 
   const secondHandle = harness.root.querySelector(".review-timeline-handle");
   const secondAxis = harness.root.querySelector(".review-timeline-axis");
@@ -1415,10 +1426,15 @@ test("one global sidebar state collapses and expands Live and Review without med
   const toggle = card.querySelector(".sidebar-toggle");
   const livePlayer = harness.getPlayer(card, "Front");
 
-  assert.equal(shell.classList.contains("sidebar-collapsed"), false);
-  toggle.click();
   assert.equal(shell.classList.contains("sidebar-collapsed"), true);
   assert.equal(toggle.getAttribute("aria-expanded"), "false");
+  toggle.click();
+  assert.equal(shell.classList.contains("sidebar-collapsed"), false);
+  card.assignCamera("Patio");
+  assert.equal(shell.classList.contains("sidebar-collapsed"), false);
+  const workspace = JSON.stringify(card.captureWorkspace());
+  toggle.click();
+  assert.equal(shell.classList.contains("sidebar-collapsed"), true);
 
   card.setApplicationMode("review");
   const reviewRail = card.querySelector(".review-control-rail");
@@ -1436,6 +1452,7 @@ test("one global sidebar state collapses and expands Live and Review without med
   );
   card.querySelector(".review-when-section .sidebar-section-header").click();
   assert.equal(card.querySelector(".review-when-section").classList.contains("expanded"), true);
+  assert.equal(shell.classList.contains("sidebar-collapsed"), false);
   toggle.click();
   assert.strictEqual(
     card.querySelector('hui-image.review-live-camera[data-entity="camera.front"]'),
@@ -1451,6 +1468,7 @@ test("one global sidebar state collapses and expands Live and Review without med
   card.setApplicationMode("review");
   assert.equal(shell.classList.contains("sidebar-collapsed"), false);
   assert.equal(card.querySelector(".review-when-section").classList.contains("expanded"), true);
+  assert.equal(JSON.stringify(card.captureWorkspace()), workspace);
 });
 
 test("rail toggle and native section titles retain one structure in both states", t => {
@@ -1467,7 +1485,7 @@ test("rail toggle and native section titles retain one structure in both states"
   assert.equal(top.querySelector(".sidebar-rail-title"), null);
   assert.strictEqual(top.firstElementChild, toggle);
   assert.strictEqual(top.lastElementChild, toggle);
-  assert.equal(toggle.title, "Collapse sidebar");
+  assert.equal(toggle.title, "Expand sidebar");
   assert.deepEqual(liveHeaders.map(header => header.getAttribute("aria-label")), [
     "Cameras", "Layouts", "Views"
   ]);
@@ -1477,9 +1495,9 @@ test("rail toggle and native section titles retain one structure in both states"
   assert.ok(liveHeaders.every(header => header.querySelector("ha-icon")));
 
   toggle.click();
-  assert.equal(shell.classList.contains("sidebar-collapsed"), true);
-  assert.equal(toggle.getAttribute("aria-expanded"), "false");
-  assert.equal(toggle.title, "Expand sidebar");
+  assert.equal(shell.classList.contains("sidebar-collapsed"), false);
+  assert.equal(toggle.getAttribute("aria-expanded"), "true");
+  assert.equal(toggle.title, "Collapse sidebar");
   assert.equal(liveRail.getAttribute("aria-hidden"), "false");
   assert.equal(
     JSON.stringify(card._sidebarSections),
@@ -1498,9 +1516,9 @@ test("rail toggle and native section titles retain one structure in both states"
   assert.ok(reviewHeaders.every(header => header.querySelector("ha-icon")));
 
   toggle.click();
-  assert.equal(shell.classList.contains("sidebar-collapsed"), false);
-  assert.equal(toggle.getAttribute("aria-expanded"), "true");
-  assert.equal(toggle.title, "Collapse sidebar");
+  assert.equal(shell.classList.contains("sidebar-collapsed"), true);
+  assert.equal(toggle.getAttribute("aria-expanded"), "false");
+  assert.equal(toggle.title, "Expand sidebar");
   assert.ok(reviewHeaders.every(header => header.querySelector(".section-title > span")));
 });
 
@@ -1548,7 +1566,6 @@ test("collapsed Live section activation expands the rail and ensures the target 
   const views = card.querySelector('.sidebar-section[data-section="views"]');
 
   card.setSidebarSectionExpanded("layouts", true);
-  toggle.click();
   cameras.querySelector("ha-icon").click();
 
   assert.equal(shell.classList.contains("sidebar-collapsed"), false);
@@ -1586,7 +1603,6 @@ test("collapsed Review section activation ensures content open without media or 
     startedAt: controller.clock._startedAt,
     running: controller.clock.running
   };
-  toggle.click();
   filters.querySelector(".sidebar-section-header").click();
 
   assert.equal(shell.classList.contains("sidebar-collapsed"), false);
@@ -1629,7 +1645,6 @@ test("collapsed Layouts activation expands the shared rail and remembers the sub
   const shell = card.querySelector(".nvr-shell");
   const layouts = card.querySelector(".review-layouts-section");
   const image = card.querySelector("hui-image.review-live-camera");
-  card.querySelector(".sidebar-toggle").click();
   layouts.querySelector("ha-icon").click();
   assert.equal(shell.classList.contains("sidebar-collapsed"), false);
   assert.equal(layouts.classList.contains("expanded"), true);
@@ -1742,7 +1757,7 @@ test("an explicit out-of-range seek prepares a fresh v2 presentation", async t =
   assert.equal(harness.calls.filter(call => call.type === "frigate_max/v2/vod/prepare").length, before + 2);
 });
 
-test("initial v2 preparation passes full two-hour Review When bounds", async t => {
+test("ordinary initial v2 preparation retains full Review When bounds", async t => {
   const target = 1800000000;
   const when = { from: target - 3600, to: target + 3600 };
   const harness = createHistoricalHarness();
@@ -1753,6 +1768,7 @@ test("initial v2 preparation passes full two-hour Review When bounds", async t =
     cameraNames: ["Drive Up"]
   });
   const prepare = harness.calls.find(call => call.type === "frigate_max/v2/vod/prepare");
+  assert.equal(prepare.target, target);
   assert.equal(prepare.bounds_start, when.from);
   assert.equal(prepare.bounds_end, when.to);
 });
@@ -1772,23 +1788,61 @@ test("mediaToEpoch is authoritative and provider look-ahead cannot advance the c
   assert.equal(harness.controller.clock.absoluteTime, before);
 });
 
-test("logical presentation end defers Phase C for one camera while its peer continues", async t => {
-  const harness = createHistoricalHarness();
+test("a finite presentation inside continuous Review coverage prepares a successor", async t => {
+  const target = 1800000000;
+  const range = { from: target - 15, to: target + 300 };
+  const harness = createHistoricalHarness({
+    now: () => 0,
+    presentationResponder: message => Promise.resolve(presentationPrepared(
+      message.camera, message.target - 21, message.target,
+      message.target < target + 120 ? target + 120 : range.to
+    ))
+  });
   t.after(() => harness.close());
-  await harness.controller.playHistorical(1800000000);
+  await harness.controller.playHistorical(target, { playbackRange: range });
   const player = harness.controller._historicalPlayers.get("Drive Up");
   const peer = harness.controller._historicalPlayers.get("Drive Down");
   const logicalEnd = player.timing.logical_wall_end;
+  const peerHls = peer.hls;
   Object.defineProperty(player.video, "duration", { configurable: true, value: 999 });
   player.video.currentTime = player.timing.logical_media_end_position;
-  player.video.dispatchEvent(new harness.window.Event("ended"));
-  await waitForCondition(() => player.lifecycleState === "failed");
-  assert.equal(player.boundaryReason, "continuous_presentation_end_deferred_phase_c");
-  assert.equal(player.lastTargetEpoch, logicalEnd);
+  setReviewTi(harness.controller, logicalEnd);
+  assert.equal(harness.controller.enforceHistoricalPresentationBoundary(), true);
+  await waitForCondition(() => player.lifecycleState === "participating" &&
+    player.timing.logical_wall_end === range.to);
+  assert.equal(player.timing.selected_epoch, logicalEnd);
+  assert.equal(player.lifecycleState, "participating");
+  assert.notEqual(player.boundaryReason, "continuous_presentation_end_deferred_phase_c");
+  assert.ok(harness.calls.some(call => call.type === "frigate_max/v2/vod/prepare" &&
+    call.camera === "drive_up" && call.target === logicalEnd &&
+    call.bounds_start === range.from && call.bounds_end === range.to));
   assert.equal(peer.lifecycleState, "participating");
+  assert.strictEqual(peer.hls, peerHls);
   assert.equal(harness.controller.clock.running, true);
-  assert.match(player.message, /continuation is not yet available/i);
-  assert.equal(harness.calls.filter(call => call.type === "frigate_max/v2/vod/prepare").length, 2);
+});
+
+test("a finite presentation prepares its covered successor while Review is paused", async t => {
+  const target = 1800000000;
+  const range = { from: target - 15, to: target + 300 };
+  const harness = createHistoricalHarness({
+    presentationResponder: message => Promise.resolve(presentationPrepared(
+      message.camera, message.target - 21, message.target,
+      message.target < target + 120 ? target + 120 : range.to
+    ))
+  });
+  t.after(() => harness.close());
+  await harness.controller.playHistorical(target, {
+    playbackRange: range, cameraNames: ["Drive Up"], autoplay: false
+  });
+  const player = harness.controller._historicalPlayers.get("Drive Up");
+  player.video.currentTime = player.timing.logical_media_end_position;
+  setReviewTi(harness.controller, target + 120);
+  player.video.dispatchEvent(new harness.window.Event("ended"));
+  await waitForCondition(() => player.lifecycleState === "participating" &&
+    player.timing.logical_wall_end === range.to);
+  assert.equal(harness.controller.clock.running, false);
+  assert.equal(player.video.paused, true);
+  assert.equal(harness.starts.length, 0);
 });
 
 test("an early physical ended event is treated as a historical failure", async t => {
@@ -3280,7 +3334,7 @@ test("a rendered Timeline marker click uses only the active range and starts one
   marker.dispatchEvent(new harness.window.MouseEvent("click", {
     bubbles: true, button: 0, clientY: 300
   }));
-  for (let index = 0; index < 10 && harness.starts.length < 2; index += 1) {
+  for (let index = 0; index < 10 && harness.controller.state.historicalPreparing; index += 1) {
     await new Promise(resolve => harness.window.setTimeout(resolve, 0));
   }
   const selected = from + 1800;
@@ -3300,6 +3354,9 @@ test("a rendered Timeline marker click uses only the active range and starts one
   assert.deepEqual(harness.controller.state.reviewRange, displayedBefore);
   assert.deepEqual(harness.controller.state.desiredReviewRange, desiredBefore);
   assert.equal(harness.controller.state.presentationMode, "historical");
+  assert.equal(harness.starts.length, 0);
+  assert.equal(harness.controller.clock.running, false);
+  assert.equal(harness.controller.resumePlayback(), true);
   assert.equal(harness.starts.length, 2);
 });
 
@@ -3498,6 +3555,24 @@ test("Gate 1 historical ownership never renders a Review-live image", async t =>
     panel.querySelector(".review-camera-presentation-kind").textContent === "Historical"));
 });
 
+test("Review Historical badges retain the configured corner and active presentation label", async t => {
+  const harness = createHistoricalHarness();
+  t.after(() => harness.close());
+  harness.controller.setVideoStateBadgePosition("top-right");
+  const liveBadge = harness.root.querySelector(".review-camera-presentation-kind");
+  assert.equal(liveBadge.textContent, "Live");
+  assert.equal(liveBadge.style.top, "6px");
+  assert.equal(liveBadge.style.right, "6px");
+  await harness.controller.playHistorical(1800000000);
+  const badge = harness.root.querySelector(".review-camera-presentation-kind");
+  assert.equal(badge.textContent, "Historical");
+  assert.equal(badge.style.top, "6px");
+  assert.equal(badge.style.right, "6px");
+  assert.equal(badge.style.bottom, "auto");
+  assert.equal(badge.style.left, "auto");
+  assert.equal(harness.controller.clock.running, true);
+});
+
 test("Gate 1 identity diagnostics are bounded to sanitized stable identifiers", async t => {
   const harness = createHistoricalHarness();
   t.after(() => harness.close());
@@ -3616,6 +3691,64 @@ test("Timeline cursor follows ReviewClock without rebuilding metadata markers", 
   assert.strictEqual(harness.root.querySelector(".review-timeline-marker"), marker);
 });
 
+test("manual Timeline click pauses placement, prepares the target, and waits for explicit Play", async t => {
+  const harness = createHistoricalHarness({ wallClockMs: 1800000000 * 1000 });
+  t.after(() => harness.close());
+  const controller = harness.controller;
+  await controller.playHistorical(1800000060);
+  const startsBefore = harness.starts.length;
+  const range = controller.state.displayedReviewQuery.range;
+  const target = 1800000000;
+  await controller.selectTimelineTime(target, "timeline click", false);
+  assert.equal(controller.clock.absoluteTime, target);
+  assert.equal(controller.clock.running, false);
+  assert.equal(harness.starts.length, startsBefore);
+  assert.ok([...controller._historicalPlayers.values()].every(player =>
+    player.lifecycleState === "participating" && player.video.paused));
+  assert.equal(controller.resumePlayback(), true);
+  assert.equal(controller.clock.running, true);
+  assert.equal(harness.starts.length, startsBefore + 2);
+});
+
+test("repeated paused Timeline placements keep the newest target and cannot autoplay a stale request", async t => {
+  const harness = createHistoricalHarness();
+  const firstTarget = harness.controller.state.reviewRange.from + 600;
+  const secondTarget = firstTarget + 300;
+  const pendingFirst = [];
+  harness.controller._hass.callWS = ((originalCallWS) => message => {
+    if (message.type === "frigate_max/v2/vod/prepare" && message.target === firstTarget) {
+      harness.calls.push(JSON.parse(JSON.stringify(message)));
+      return new Promise(resolve => pendingFirst.push(() => resolve(
+        presentationPrepared(message.camera, message.target - 20, message.target)
+      )));
+    }
+    return originalCallWS(message);
+  })(harness.controller._hass.callWS.bind(harness.controller._hass));
+  t.after(() => harness.close());
+  const first = harness.controller.selectTimelineTime(firstTarget, "timeline click", false);
+  await waitForCalls(harness, "frigate_max/v2/vod/prepare", 2);
+  const second = harness.controller.selectTimelineTime(secondTarget, "timeline click", false);
+  await second;
+  assert.equal(harness.controller.clock.absoluteTime, secondTarget);
+  assert.equal(harness.controller.clock.running, false);
+  assert.equal(harness.starts.length, 0);
+  pendingFirst.splice(0).forEach(resolve => resolve());
+  await first;
+  assert.equal(harness.controller.clock.absoluteTime, secondTarget);
+  assert.equal(harness.controller.clock.running, false);
+  assert.equal(harness.starts.length, 0);
+});
+
+test("manual placement does not alter ordinary explicit Play behavior", async t => {
+  const harness = createHistoricalHarness();
+  t.after(() => harness.close());
+  await harness.controller.playHistorical(1800000000, { autoplay: false });
+  assert.equal(harness.controller.clock.running, false);
+  assert.equal(harness.controller.resumePlayback(), true);
+  assert.equal(harness.controller.clock.running, true);
+  assert.equal(harness.starts.length, 2);
+});
+
 test("dragging the yellow cursor previews clamped time and selects historical VOD exactly once on release", async t => {
   let now = 1000;
   const harness = createHistoricalHarness({ now: () => now });
@@ -3661,7 +3794,8 @@ test("dragging the yellow cursor previews clamped time and selects historical VO
   axis.dispatchEvent(new harness.window.MouseEvent("click", {
     bubbles: true, button: 0, clientY: releaseY
   }));
-  for (let index = 0; index < 20 && harness.starts.length < startsBefore + 2; index += 1) {
+  for (let index = 0; index < 20 && harness.calls.filter(call =>
+    call.type === "frigate_max/v2/vod/prepare").length < 4; index += 1) {
     await new Promise(resolve => harness.window.setTimeout(resolve, 0));
   }
   const releasePrepares = harness.calls
@@ -3670,9 +3804,12 @@ test("dragging the yellow cursor previews clamped time and selects historical VO
   assert.equal(releasePrepares.length, 2);
   assert.deepEqual(releasePrepares.map(call => call.camera), ["drive_up", "drive_down"]);
   assert.ok(releasePrepares.every(call => call.target === releasedEpoch));
-  assert.equal(harness.starts.length, startsBefore + 2);
+  assert.equal(harness.starts.length, startsBefore);
   assert.equal(controller.state.presentationMode, "historical");
+  assert.equal(controller.clock.running, false);
+  assert.equal(controller.resumePlayback(), true);
   assert.equal(controller.clock.running, true);
+  assert.equal(harness.starts.length, startsBefore + 2);
 });
 
 test("pointer cancellation restores the paused Review time without a VOD request or playback start", async t => {
@@ -3728,7 +3865,8 @@ test("a future Timeline selection stays in Review live without requesting VOD", 
     harness.calls.filter(call => call.type === "frigate_max/v1/vod/prepare").length,
     before
   );
-  assert.match(harness.root.querySelector(".review-historical-state").textContent, /No recording/);
+  assert.match(harness.controller._historicalStatus, /No recording/);
+  assert.equal(harness.root.querySelector(".review-historical-state"), null);
   assert.deepEqual([...harness.root.querySelectorAll("hui-image.review-live-camera")], liveImages);
 });
 
@@ -3800,6 +3938,308 @@ test("When exposes direct controls and keeps edits draft-only until Apply", asyn
   assert.equal(harness.root.textContent.includes("T12:00:00"), false);
 });
 
+test("event navigation inventory sorts, deduplicates, and ignores unselected cameras", () => {
+  const items = [
+    { camera_id: "drive_up", start_time: 300 },
+    { camera_id: "drive_down", start_time: 100 },
+    { camera_id: "drive_up", start_time: 100 },
+    { camera_id: "garage", start_time: 200 },
+    { camera_id: "back", start_time: 400 }
+  ];
+  const inventory = reviewEventNavigationTimestamps(items,
+    ["drive_up", "drive_down"], { from: 100, to: 350 });
+  assert.deepEqual(inventory, [100, 300]);
+  assert.deepEqual(reviewEventNavigationTargets(inventory, 100), {
+    previous: null, next: 300
+  });
+  assert.deepEqual(reviewEventNavigationTargets(inventory, 300), {
+    previous: 100, next: null
+  });
+  assert.deepEqual(reviewEventNavigationTargets(inventory, 200), {
+    previous: 100, next: 300
+  });
+});
+
+function configureFourSelectedCameras(harness) {
+  const four = [...cameras().filter(camera => camera.active), {
+    name: "Patio", entity: "camera.patio", active: true
+  }];
+  harness.controller._hass.states["camera.patio"] = {
+    attributes: { camera_name: "patio" }
+  };
+  harness.controller.configure(four);
+  harness.controller.setSelectedCameraNames(["Drive Up", "Drive Down", "Back", "Patio"]);
+}
+
+test("Snap Forward uses selected-camera event starts across the full Review range and preserves cameras", async t => {
+  const target = Date.parse("2026-09-10T09:00:00-07:00") / 1000;
+  const range = { from: target - 60, to: target + 2000 };
+  const events = [
+    { camera_id: "drive_up", start_time: target, end_time: target + 5 },
+    { camera_id: "drive_down", start_time: target, end_time: target + 10 },
+    { camera_id: "garage", start_time: target + 10, end_time: target + 15 },
+    { camera_id: "back", start_time: target + 20, end_time: target + 25 },
+    { camera_id: "drive_up", start_time: target + 720, end_time: target + 730 }
+  ];
+  const harness = createHistoricalHarness({ reviewEvents: events, initialReviewRange: range });
+  t.after(() => harness.close());
+  configureFourSelectedCameras(harness);
+  await harness.controller.flushScheduledReviewQuery();
+  const selected = [...harness.controller.state.reviewAssignments];
+  const queryCount = harness.controller._queryRefreshCount;
+  assert.deepEqual(harness.controller.getEventNavigationInventory(),
+    [target, target + 20, target + 720]);
+  assert.ok(harness.calls.some(call => call.type === "frigate_max/v1/review/get" &&
+    call.from === range.from && call.to === Math.min(range.to,
+      harness.controller._wallClock() / 1000) &&
+    call.cameras.join(",") === "drive_up,drive_down,back,patio"));
+  harness.controller._reviewPosition = target - 1;
+
+  assert.equal(await harness.controller.snapToNextEvent(), true);
+  assert.equal(harness.controller.clock.absoluteTime, target);
+  assert.equal(harness.controller.clock.running, false);
+  assert.deepEqual(harness.controller.state.reviewAssignments, selected);
+  assert.deepEqual(harness.controller.state.displayedReviewQuery.cameraNames,
+    ["Drive Up", "Drive Down", "Back", "Patio"]);
+  assert.deepEqual(harness.controller.getTimelineLanes().map(lane => lane.name),
+    ["Drive Up", "Drive Down", "Back", "Patio"]);
+  assert.equal(harness.controller._queryRefreshCount, queryCount);
+  assert.equal(harness.root.querySelector(".review-play").disabled, false);
+  assert.deepEqual([...harness.controller._historicalPlayers.keys()],
+    ["Drive Up", "Drive Down", "Back", "Patio"]);
+  assert.ok([...harness.controller._historicalPlayers.values()].every(player =>
+    player.lifecycleState === "participating" && player.initialPlacement?.requestedEpoch === target));
+  const prepares = harness.calls.filter(call => call.type === "frigate_max/v2/vod/prepare");
+  assert.equal(prepares.length, 4);
+  assert.ok(prepares.every(call => call.target === target));
+  assert.ok(prepares.every(call => call.bounds_start === range.from &&
+    call.bounds_end === range.to));
+  assert.deepEqual(harness.controller._historicalPlaybackRange, range);
+  assert.equal(prepares.some(call => call.camera === "patio"), true,
+    "selected Patio remains eligible despite having no event at T");
+
+  harness.controller._reviewPosition = target;
+  assert.equal(await harness.controller.snapToNextEvent(), true);
+  assert.equal(harness.controller.clock.absoluteTime, target + 20);
+  assert.deepEqual(harness.controller.state.reviewAssignments, selected);
+  assert.equal(harness.root.querySelector(".review-play").disabled, false);
+  harness.controller._reviewPosition = target + 21;
+  assert.equal(await harness.controller.snapToNextEvent(), true,
+    "navigation reaches an event more than ten minutes ahead");
+  assert.equal(harness.controller.clock.absoluteTime, target + 720);
+  assert.deepEqual(harness.controller.state.reviewAssignments, selected);
+  assert.equal(harness.controller.clock.running, false);
+  assert.equal(harness.starts.length, 0);
+  assert.equal(harness.controller.resumePlayback(), true);
+  assert.equal(harness.controller.clock.running, true);
+  assert.equal(harness.starts.length, 4);
+});
+
+test("Snap Reverse walks strict previous event starts and preserves selected cameras", async t => {
+  const target = Date.parse("2026-09-10T09:00:00-07:00") / 1000;
+  const range = { from: target - 60, to: target + 300 };
+  const events = [
+    { camera_id: "drive_up", start_time: target },
+    { camera_id: "drive_down", start_time: target + 20 },
+    { camera_id: "back", start_time: target + 40 },
+    { camera_id: "garage", start_time: target + 45 }
+  ];
+  const harness = createHistoricalHarness({ reviewEvents: events, initialReviewRange: range });
+  t.after(() => harness.close());
+  configureFourSelectedCameras(harness);
+  await harness.controller.flushScheduledReviewQuery();
+  const selected = [...harness.controller.state.reviewAssignments];
+  harness.controller._reviewPosition = target + 50;
+  assert.equal(await harness.controller.snapToPreviousEvent(), true);
+  assert.equal(harness.controller.clock.absoluteTime, target + 40);
+  assert.deepEqual(harness.controller.state.reviewAssignments, selected);
+  assert.equal(harness.root.querySelector(".review-play").disabled, false);
+  harness.controller._reviewPosition = target + 40;
+  assert.equal(await harness.controller.snapToPreviousEvent(), true);
+  assert.equal(harness.controller.clock.absoluteTime, target + 20);
+  assert.deepEqual(harness.controller.state.reviewAssignments, selected);
+  assert.equal(harness.controller.clock.running, false);
+  assert.equal(harness.root.querySelector(".review-play").disabled, false);
+  const prepares = harness.calls.filter(call => call.type === "frigate_max/v2/vod/prepare");
+  assert.equal(prepares.length, 8);
+  assert.ok(prepares.every(call =>
+    call.target === target + 40 || call.target === target + 20));
+});
+
+test("Snap availability uses the same selected event inventory in both directions", t => {
+  const target = Date.parse("2026-09-10T09:00:00-07:00") / 1000;
+  const range = { from: target - 60, to: target + 100 };
+  const harness = createHistoricalHarness({
+    initialReviewRange: range,
+    reviewEvents: [
+      { camera_id: "drive_up", start_time: target },
+      { camera_id: "drive_down", start_time: target + 20 },
+      { camera_id: "drive_up", start_time: target + 20 },
+      { camera_id: "garage", start_time: target + 40 }
+    ]
+  });
+  t.after(() => harness.close());
+  harness.controller._timeline.items = normalizeReviewTimelineItems([
+    { camera_id: "drive_up", start_time: target },
+    { camera_id: "drive_down", start_time: target + 20 },
+    { camera_id: "drive_up", start_time: target + 20 },
+    { camera_id: "garage", start_time: target + 40 }
+  ], range);
+  harness.controller._timeline.status = "loaded";
+  for (const [position, previousDisabled, nextDisabled] of [
+    [target - 1, true, false], [target, true, false],
+    [target + 20, false, true], [target + 40, false, true]
+  ]) {
+    harness.controller._reviewPosition = position;
+    harness.controller.updateTransport();
+    assert.equal(harness.root.querySelector(".review-previous-event").disabled,
+      previousDisabled);
+    assert.equal(harness.root.querySelector(".review-next-event").disabled, nextDisabled);
+  }
+});
+
+test("ordinary Review holds a presented frame through a recording gap and clears it on a fresh frame", async t => {
+  const target = Date.parse("2026-09-10T09:00:00-07:00") / 1000;
+  const selected = ["Drive Up", "Drive Down"];
+  const harness = createHistoricalHarness({
+    reviewEvents: [
+      { camera_id: "drive_down", start_time: target, end_time: target + 5 },
+      { camera_id: "drive_up", start_time: target + 1, end_time: target + 5 }
+    ],
+    availabilityResponder: message => Promise.resolve({
+      camera: message.camera,
+      requested_start: message.start,
+      requested_end: message.end,
+      coverage: message.camera === "drive_up"
+        ? [{ start: target - 30, end: target + 5 },
+          { start: target + 20, end: target + 100 }]
+        : [{ start: message.start, end: message.end }]
+    }),
+    initialReviewRange: { from: target - 60, to: target + 300 }
+  });
+  t.after(() => harness.close());
+  harness.window.HTMLCanvasElement.prototype.getContext = () => ({ drawImage() {} });
+  await harness.controller.playHistorical(target, { autoplay: false });
+  const player = harness.controller._historicalPlayers.get("Drive Up");
+  const badge = harness.root.querySelector(
+    '.review-camera-panel[data-camera="Drive Up"] .review-camera-presentation-kind'
+  );
+  assert.equal(player.heldCanvas, undefined);
+  harness.mediaControls.find(control => control.camera === "Drive Up").emitFrame();
+  assert.ok(player.heldCanvas);
+  assert.equal(badge.textContent, "Historical");
+  const representedEpoch = player.heldFrameEpoch;
+  assert.equal(player.heldCanvas.hidden, true);
+  harness.controller.leaveHistoricalCamera(player, "authoritative_recording_gap", target + 10);
+  assert.equal(player.heldCanvas.hidden, false);
+  assert.equal(badge.textContent, "Ended");
+  assert.equal(player.heldFrameEpoch, representedEpoch);
+  assert.equal(player.statusElement.hidden, true);
+  assert.equal(player.message, "No recording at this time.");
+  assert.equal(harness.controller.inspectPlayerAvailability(player, target + 10).containing, null);
+  assert.deepEqual(harness.controller.state.reviewAssignments.slice(0, 2), selected);
+  assert.deepEqual([...harness.root.querySelectorAll(".review-camera-panel")]
+    .map(panel => panel.dataset.camera), selected);
+  assert.equal(harness.controller.clock.absoluteTime, target);
+  const oldVideo = player.video;
+  harness.mediaControls.find(control => control.video === oldVideo).emitFrame(target + 20);
+  assert.equal(player.heldFrameEpoch, representedEpoch);
+  assert.equal(await harness.controller.reconcileHistoricalCamera(player, target + 25,
+    { explicit: true, autoplay: false }), "prepared");
+  assert.equal(player.heldCanvas.hidden, false);
+  assert.equal(badge.textContent, "Ended");
+  harness.mediaControls.filter(control => control.camera === "Drive Up").at(-1).emitFrame();
+  assert.equal(player.heldCanvas.hidden, true);
+  assert.equal(badge.textContent, "Historical");
+  assert.equal(player.holdStartedAtMs, null);
+  assert.equal(player.statusElement.hidden, true);
+  assert.deepEqual(harness.controller.state.reviewAssignments.slice(0, 2), selected);
+  assert.equal(harness.controller.clock.absoluteTime, target);
+});
+
+test("ending event annotations do not remove recorded Review video or selected cameras", async t => {
+  const target = Date.parse("2026-09-10T09:00:00-07:00") / 1000;
+  const selected = ["Drive Up", "Drive Down"];
+  const harness = createHistoricalHarness({
+    reviewEvents: [
+      { camera_id: "drive_up", start_time: target, end_time: target + 5 },
+      { camera_id: "drive_down", start_time: target, end_time: target + 5 }
+    ],
+    initialReviewRange: { from: target - 60, to: target + 300 }
+  });
+  t.after(() => harness.close());
+  await harness.controller.playHistorical(target, { autoplay: false });
+  for (const player of harness.controller._historicalPlayers.values()) {
+    player.video.currentTime = target + 6 - player.timing.effective_absolute_origin;
+  }
+  await harness.controller.evaluateHistoricalAvailability(null, { reason: "past_event_end" });
+  assert.deepEqual(harness.controller.state.reviewAssignments.slice(0, 2), selected);
+  assert.deepEqual([...harness.root.querySelectorAll(".review-camera-panel")]
+    .map(panel => panel.dataset.camera), selected);
+  assert.ok([...harness.controller._historicalPlayers.values()]
+    .every(player => player.lifecycleState === "participating" &&
+      player.statusElement.hidden && (player.heldCanvas == null || player.heldCanvas.hidden)));
+  assert.ok([...harness.root.querySelectorAll(".review-camera-presentation-kind")]
+    .every(badge => badge.textContent === "Historical"));
+  assert.equal(harness.controller.clock.running, false);
+});
+
+test("explicit Play continues through an all-camera recording gap and resumes selected cameras", async t => {
+  const target = Date.parse("2026-09-10T09:00:00-07:00") / 1000;
+  let tick = 1000;
+  const harness = createHistoricalHarness({
+    now: () => tick,
+    availabilityResponder: message => Promise.resolve({
+      camera: message.camera,
+      requested_start: message.start,
+      requested_end: message.end,
+      coverage: [{ start: target - 30, end: target + 5 },
+        { start: target + 20, end: target + 100 }]
+    }),
+    initialReviewRange: { from: target - 60, to: target + 300 }
+  });
+  t.after(() => harness.close());
+  harness.window.HTMLCanvasElement.prototype.getContext = () => ({ drawImage() {} });
+  await harness.controller.playHistorical(target, { autoplay: false });
+  const players = [...harness.controller._historicalPlayers.values()];
+  const selected = [...harness.controller.state.reviewAssignments];
+  for (const control of harness.mediaControls) control.emitFrame();
+  assert.ok(players.every(player => player.heldCanvas?.hidden));
+  assert.equal(harness.controller.resumePlayback(), true);
+  tick = 11000;
+  for (const player of players) {
+    harness.controller.leaveHistoricalCamera(player, "authoritative_recording_gap", target + 10);
+  }
+  assert.equal(harness.controller.clock.running, true);
+  assert.equal(harness.root.querySelector(".review-pause").disabled, false);
+  assert.ok(players.every(player => player.holdStartedAtMs != null &&
+    player.heldCanvas.hidden === false && player.statusElement.hidden));
+  assert.ok(players.every(player => player.lifecycleState === "unavailable"));
+  assert.ok([...harness.root.querySelectorAll(".review-camera-presentation-kind")]
+    .every(badge => badge.textContent === "Ended"));
+  assert.deepEqual(harness.controller.state.reviewAssignments, selected);
+  assert.equal(harness.controller.reviewPosition, target + 10);
+  assert.equal(harness.controller.pausePlayback(), true);
+  assert.equal(harness.controller.clock.running, false);
+  assert.equal(harness.root.querySelector(".review-play").disabled, false);
+  assert.equal(harness.controller.resumePlayback(), true);
+  assert.equal(harness.controller.clock.running, true);
+  tick = 26000;
+  await harness.controller.evaluateHistoricalAvailability(null, { reason: "past_gap" });
+  assert.ok(players.every(player => player.lifecycleState === "participating"));
+  assert.equal(harness.controller.clock.running, true);
+  assert.equal(harness.starts.length, 4);
+  assert.ok([...harness.root.querySelectorAll(".review-camera-presentation-kind")]
+    .every(badge => badge.textContent === "Historical"));
+  for (const control of harness.mediaControls.slice(2)) control.emitFrame();
+  assert.ok(players.every(player => player.heldCanvas.hidden &&
+    player.holdStartedAtMs == null && player.statusElement.hidden));
+  assert.ok([...harness.root.querySelectorAll(".review-camera-presentation-kind")]
+    .every(badge => badge.textContent === "Historical"));
+  assert.deepEqual(harness.controller.state.reviewAssignments, selected);
+  assert.equal(harness.controller.getSceneExperimentReport(), null);
+});
+
 test("transport is in the shell header above one uninterrupted camera wall", t => {
   const harness = createHistoricalHarness();
   t.after(() => harness.close());
@@ -3821,12 +4261,12 @@ test("transport is in the shell header above one uninterrupted camera wall", t =
   assert.equal(harness.root.querySelectorAll(".review-query-go").length, 0);
   assert.equal(harness.root.querySelector(".review-when-apply").textContent, "Apply");
   for (const [selector, label] of [
-    [".review-previous-event", "Previous event"],
+    [".review-previous-event", "Snap to previous event"],
     [".review-back-ten", "Back 10 seconds"],
     [".review-pause", "Pause"],
     [".review-play", "Play"],
     [".review-forward-ten", "Forward 10 seconds"],
-    [".review-next-event", "Next event"]
+    [".review-next-event", "Snap to next event"]
   ]) {
     assert.equal(harness.root.querySelector(selector).getAttribute("aria-label"), label);
   }
@@ -3841,7 +4281,7 @@ test("transport is in the shell header above one uninterrupted camera wall", t =
     "review-toolbar-group review-speed-group"
   ]);
   assert.deepEqual([...speed.options].map(option => option.textContent), [
-    "1x", "2x", "4x", "8x", "16x"
+    "0.25x", "0.50x", "0.75x", "1x", "2x", "4x", "8x", "16x"
   ]);
   assert.equal(harness.root.querySelectorAll(".review-transport-controls button").length, 6);
   assert.equal(workspace.querySelectorAll(".review-layout-cell:not([hidden])").length, 13);
@@ -3851,7 +4291,7 @@ test("transport is in the shell header above one uninterrupted camera wall", t =
 test("historical speed is shared, rate-aware, and retained through live return and re-entry", async t => {
   const harness = createHistoricalHarness();
   t.after(() => harness.close());
-  assert.deepEqual(REVIEW_PLAYBACK_SPEEDS, [1, 2, 4, 8, 16]);
+  assert.deepEqual(REVIEW_PLAYBACK_SPEEDS, [0.25, 0.5, 0.75, 1, 2, 4, 8, 16]);
   assert.equal(harness.controller.state.playbackSpeed, 1);
   const assignments = [...harness.controller.state.reviewAssignments];
   await harness.controller.playHistorical(1800000000);
@@ -3875,6 +4315,66 @@ test("historical speed is shared, rate-aware, and retained through live return a
   assert.equal(harness.root.querySelector(".review-speed-select").value, "8");
 });
 
+test("slow Review speeds use the existing shared control through seek, pause, and reacquisition", async t => {
+  const harness = createHistoricalHarness();
+  t.after(() => harness.close());
+  const target = 1800000000;
+  await harness.controller.playHistorical(target);
+  const players = [...harness.controller._historicalPlayers.values()];
+  const videos = players.map(player => player.video);
+  const hls = players.map(player => player.hls);
+  const initialSeeks = videos.map(video => video.currentTimeWrites.length);
+  const instanceCount = harness.instances.length;
+  const speed = harness.root.querySelector(".review-speed-select");
+
+  for (const rate of [0.75, 0.5, 0.25]) {
+    speed.value = String(rate);
+    speed.dispatchEvent(new harness.window.Event("change"));
+    assert.equal(harness.controller.state.playbackSpeed, rate);
+    assert.equal(harness.controller.clock.rate, rate);
+    assert.ok(players.every(player => player.video.playbackRate === rate));
+    assert.deepEqual(videos.map(video => video.currentTimeWrites.length), initialSeeks);
+    assert.deepEqual(players.map(player => player.video), videos);
+    assert.deepEqual(players.map(player => player.hls), hls);
+    assert.equal(harness.instances.length, instanceCount);
+  }
+
+  harness.controller.pausePlayback();
+  assert.equal(harness.controller.clock.running, false);
+  assert.ok(players.every(player => player.video.paused && player.video.playbackRate === 0.25));
+  harness.controller.resumePlayback();
+  assert.equal(harness.controller.clock.running, true);
+  assert.ok(players.every(player => !player.video.paused && player.video.playbackRate === 0.25));
+
+  await harness.controller.seekHistoricalToEpoch(target + 5, { autoplay: true });
+  assert.ok(players.every((player, index) =>
+    player.video === videos[index] && player.hls === hls[index] &&
+    player.video.playbackRate === 0.25));
+
+  harness.controller.returnToLive();
+  assert.equal(harness.controller.state.playbackSpeed, 0.25);
+  assert.ok([...harness.root.querySelectorAll("hui-image.review-live-camera")].every(
+    image => !Object.hasOwn(image, "playbackRate")
+  ));
+  await harness.controller.playHistorical(target + 60);
+  const replacements = [...harness.controller._historicalPlayers.values()];
+  assert.ok(replacements.every((player, index) =>
+    player.video !== videos[index] && player.video.playbackRate === 0.25));
+  const replacementSeeks = replacements.map(player => player.video.currentTimeWrites.length);
+  const replacementHls = replacements.map(player => player.hls);
+  const replacementCount = harness.instances.length;
+
+  const currentSpeed = harness.root.querySelector(".review-speed-select");
+  currentSpeed.value = "1";
+  currentSpeed.dispatchEvent(new harness.window.Event("change"));
+  assert.equal(harness.controller.state.playbackSpeed, 1);
+  assert.equal(harness.controller.clock.rate, 1);
+  assert.ok(replacements.every(player => player.video.playbackRate === 1));
+  assert.deepEqual(replacements.map(player => player.video.currentTimeWrites.length), replacementSeeks);
+  assert.deepEqual(replacements.map(player => player.hls), replacementHls);
+  assert.equal(harness.instances.length, replacementCount);
+});
+
 test("ReviewClock advances at the selected historical speed", () => {
   let now = 1000;
   const clock = new ReviewClock(() => now);
@@ -3883,12 +4383,19 @@ test("ReviewClock advances at the selected historical speed", () => {
   clock.start();
   now = 2250;
   assert.equal(clock.absoluteTime, 120);
+  clock.setRate(0.25);
+  now = 4250;
+  assert.equal(clock.absoluteTime, 120.5);
 });
 
 test("historical Pause and Play preserve and resume the shared ReviewClock", async t => {
   const harness = createHistoricalHarness();
   t.after(() => harness.close());
+  harness.window.HTMLCanvasElement.prototype.getContext = () => ({ drawImage() {} });
   await harness.controller.playHistorical(1800000000);
+  for (const control of harness.mediaControls) control.emitFrame();
+  const players = [...harness.controller._historicalPlayers.values()];
+  assert.ok(players.every(player => player.heldCanvas?.hidden));
   const pause = harness.root.querySelector(".review-pause");
   const play = harness.root.querySelector(".review-play");
   assert.equal(pause.disabled, false);
@@ -3897,6 +4404,10 @@ test("historical Pause and Play preserve and resume the shared ReviewClock", asy
   const pausedAt = harness.controller.clock.absoluteTime;
   assert.equal(harness.controller.clock.running, false);
   assert.equal(harness.controller.clock.absoluteTime, pausedAt);
+  assert.ok(players.every(player => player.lifecycleState === "participating" &&
+    player.heldCanvas.hidden && player.holdStartedAtMs == null));
+  assert.ok([...harness.root.querySelectorAll(".review-camera-presentation-kind")]
+    .every(badge => badge.textContent === "Historical"));
   assert.equal(pause.disabled, true);
   assert.equal(play.disabled, false);
   play.click();
@@ -4009,7 +4520,8 @@ test("one unavailable recording does not guess or block another camera", async t
   assert.equal(up.message, "No recording at this time.");
   assert.equal(down.unavailable, false);
   assert.equal(harness.starts.length, 1);
-  assert.match(harness.root.querySelector(".review-historical-state").textContent, /Some cameras/);
+  assert.match(harness.controller._historicalStatus, /Some cameras/);
+  assert.equal(harness.root.querySelector(".review-historical-state"), null);
   assert.deepEqual(harness.controller.state.reviewAssignments.slice(0, 2), ["Drive Up", "Drive Down"]);
 });
 
@@ -4022,11 +4534,14 @@ test("all unavailable cameras retain cells and never start an empty historical c
   assert.equal(harness.starts.length, 0);
   assert.equal(harness.controller.clock.running, false);
   assert.equal(harness.controller.state.presentationMode, "historical");
-  assert.match(harness.root.querySelector(".review-historical-state").textContent, /No recording/);
+  assert.match(harness.controller._historicalStatus, /No recording/);
+  assert.equal(harness.root.querySelector(".review-historical-state"), null);
   assert.equal(harness.root.querySelectorAll(".review-camera-panel").length, 2);
+  assert.ok([...harness.root.querySelectorAll(".review-camera-presentation-kind")]
+    .every(badge => badge.textContent === "Historical"));
   assert.deepEqual(harness.controller.state.reviewAssignments, assignments);
   assert.equal(harness.root.querySelector(".review-back-ten").disabled, true);
-  assert.equal(harness.root.querySelector(".review-play").disabled, true);
+  assert.equal(harness.root.querySelector(".review-play").disabled, false);
   assert.equal(harness.root.querySelector(".review-speed-select").disabled, true);
 });
 
@@ -4041,7 +4556,8 @@ test("zero participating cameras produce no VOD request or layout mutation", asy
   assert.equal(harness.calls.some(call => call.type === "frigate_max/v1/vod/prepare"), false);
   assert.equal(harness.controller.clock.running, false);
   assert.equal(harness.controller._diagnosticTimer, null);
-  assert.match(harness.root.querySelector(".review-historical-state").textContent, /No recording/);
+  assert.match(harness.controller._historicalStatus, /No recording/);
+  assert.equal(harness.root.querySelector(".review-historical-state"), null);
   assert.deepEqual(harness.controller.state.reviewAssignments, assignments);
   assert.ok(harness.root.querySelector(".review-empty-state"));
 });
@@ -4052,22 +4568,46 @@ test("historical loading and VCR states are compact and keep event controls disa
   const harness = createHistoricalHarness({ prepareGate: gate });
   t.after(() => harness.close());
   const target = harness.controller.state.reviewRange.from + 1200;
-  const run = harness.controller.selectTimelineTime(target);
+  const run = harness.controller.selectTimelineTime(target, "timeline click", false);
   await Promise.resolve();
   await Promise.resolve();
   assert.equal(harness.controller.state.historicalPreparing, true);
-  assert.match(harness.root.querySelector(".review-historical-state").textContent, /Preparing playback/);
+  assert.match(harness.controller._historicalStatus, /Preparing playback/);
+  assert.equal(harness.root.querySelector(".review-historical-state"), null);
+  assert.ok([...harness.root.querySelectorAll(".review-camera-presentation-kind")]
+    .every(badge => badge.textContent === "Historical"));
   assert.equal(harness.root.querySelector(".review-pause").disabled, true);
   release();
   await run;
   assert.equal(harness.root.querySelector(".review-back-ten").disabled, false);
-  assert.equal(harness.root.querySelector(".review-pause").disabled, false);
-  assert.equal(harness.root.querySelector(".review-play").disabled, true);
+  assert.equal(harness.root.querySelector(".review-pause").disabled, true);
+  assert.equal(harness.root.querySelector(".review-play").disabled, false);
   assert.equal(harness.root.querySelector(".review-forward-ten").disabled, false);
   assert.equal(harness.root.querySelector(".review-speed-select").disabled, false);
   assert.equal(harness.root.querySelector(".review-now"), null);
   assert.equal(harness.root.querySelector(".review-previous-event").disabled, true);
   assert.equal(harness.root.querySelector(".review-next-event").disabled, true);
+});
+
+test("explicit Play intent during preparation releases through the normal path", async t => {
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const harness = createHistoricalHarness({ prepareGate: gate });
+  t.after(() => harness.close());
+  const target = harness.controller.state.reviewRange.from + 1200;
+  const run = harness.controller.selectTimelineTime(target, "timeline click", false);
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(harness.controller.state.historicalPreparing, true);
+  assert.equal(harness.root.querySelector(".review-play").disabled, false);
+  harness.root.querySelector(".review-play").click();
+  assert.equal(harness.controller.clock.running, false);
+  release();
+  await run;
+  assert.equal(harness.starts.length, 2);
+  assert.equal(harness.controller.clock.running, true);
+  assert.equal(harness.root.querySelector(".review-play").disabled, true);
+  assert.equal(harness.root.querySelector(".review-pause").disabled, false);
 });
 
 test("four historical players in 2x2 keep identical per-cell viewport structure without Ready flow", async t => {
@@ -4396,9 +4936,10 @@ test("recording availability cache uses bounded windows and half-open interval t
   assert.equal(inspectRecordingAvailability(availability, window.end).insideWindow, false);
 });
 
-test("an initially unavailable camera joins at the conservative achieved epoch without disturbing its peer", async t => {
+test("an initially unavailable camera joins at Review TI without disturbing its peer", async t => {
   const target = 1800000000;
   const harness = createHistoricalHarness({
+    now: () => 0,
     availabilityResponder: message => Promise.resolve({
       camera: message.camera,
       requested_start: message.start,
@@ -4415,22 +4956,32 @@ test("an initially unavailable camera joins at the conservative achieved epoch w
   const down = harness.controller._historicalPlayers.get("Drive Down");
   const upHls = up.hls;
   const upPauseCount = up.video.pauseCount;
+  const upSeekWrites = [...up.video.currentTimeWrites];
+  const upRateWrites = [...up.video.playbackRateWrites];
+  const upPlayCalls = harness.playCalls.filter(call => call.camera === "Drive Up").length;
+  const upSource = upHls.source;
   assert.equal(down.lifecycleState, "unavailable");
 
   up.video.currentTime = target + 6 - up.timing.effective_absolute_origin;
+  setReviewTi(harness.controller, target + 10);
   up.video.dispatchEvent(new harness.window.Event("timeupdate"));
   await waitForCondition(() => down.lifecycleState === "participating", "late join did not complete");
 
   assert.strictEqual(up.hls, upHls);
+  assert.equal(upHls.source, upSource);
   assert.equal(up.video.pauseCount, upPauseCount);
   assert.equal(up.lifecycleState, "participating");
+  assert.deepEqual(up.video.currentTimeWrites, [...upSeekWrites,
+    target + 6 - up.timing.effective_absolute_origin]);
+  assert.deepEqual(up.video.playbackRateWrites, upRateWrites);
+  assert.equal(harness.playCalls.filter(call => call.camera === "Drive Up").length, upPlayCalls);
   assert.equal(down.video.playbackRate, 8);
   assert.equal(down.video.paused, false);
   const downPrepare = harness.calls.filter(call =>
     call.type === "frigate_max/v2/vod/prepare" && call.camera === "drive_down");
   assert.equal(downPrepare.length, 1);
-  assert.equal(downPrepare[0].target, target + 6);
-  assert.equal(down.resolvedEpoch, target + 6);
+  assert.equal(downPrepare[0].target, target + 10);
+  assert.equal(down.resolvedEpoch, target + 10);
   const diagnostic = harness.controller.getLatestHistoricalSyncReport().cameras["Drive Down"];
   assert.equal(diagnostic.lifecycleState, "participating");
   assert.equal(diagnostic.transition.outcome, "participating");
@@ -4442,6 +4993,7 @@ test("an initially unavailable camera joins at the conservative achieved epoch w
 test("a late join honors paused intent", async t => {
   const target = 1800000000;
   const harness = createHistoricalHarness({
+    now: () => 0,
     availabilityResponder: message => Promise.resolve({
       camera: message.camera,
       requested_start: message.start,
@@ -4457,6 +5009,7 @@ test("a late join honors paused intent", async t => {
   const up = harness.controller._historicalPlayers.get("Drive Up");
   const down = harness.controller._historicalPlayers.get("Drive Down");
   up.video.currentTime = target + 6 - up.timing.effective_absolute_origin;
+  setReviewTi(harness.controller, target + 6);
   const starts = harness.starts.length;
   await harness.controller.evaluateHistoricalAvailability(null, {
     reason: "paused_boundary_test", autoplay: false
@@ -4467,9 +5020,390 @@ test("a late join honors paused intent", async t => {
   assert.equal(harness.controller.clock.running, false);
 });
 
+function createRejoinHarness(target, options = {}) {
+  return createHistoricalHarness({
+    now: () => 0,
+    availabilityResponder: message => Promise.resolve({
+      camera: message.camera,
+      requested_start: message.start,
+      requested_end: message.end,
+      coverage: message.camera === "drive_down"
+        ? [{ start: target + 5, end: target + 100 }]
+        : [{ start: message.start, end: message.end }]
+    }),
+    ...options
+  });
+}
+
+test("rejoin stays preparing until a fresh owned RVFC frame lands", async t => {
+  const target = 1800000000;
+  const harness = createRejoinHarness(target, {
+    deferredFrame: new Set(["Drive Down"])
+  });
+  t.after(() => harness.close());
+  await harness.controller.playHistorical(target);
+  setReviewTi(harness.controller, target + 6);
+  const down = harness.controller._historicalPlayers.get("Drive Down");
+  const join = harness.controller.evaluateHistoricalAvailability(null, { reason: "rvfc_rejoin" });
+  await waitForCondition(() => down.video?.currentTimeWrites?.length === 1);
+  const control = harness.mediaControls.find(item => item.camera === "Drive Down");
+  assert.equal(down.lifecycleState, "preparing");
+  assert.equal(down.initialPlacement, null);
+  assert.equal(harness.playCalls.filter(call => call.camera === "Drive Down").length, 0);
+  control.video.dispatchEvent(new harness.window.Event("seeked"));
+  control.video.dispatchEvent(new harness.window.Event("canplay"));
+  assert.equal(down.lifecycleState, "preparing");
+  control.emitFrame(control.video.currentTime, -1);
+  assert.equal(down.lifecycleState, "preparing");
+  control.emitFrame();
+  await join;
+  assert.equal(down.lifecycleState, "participating");
+  assert.equal(down.initialPlacement.verifiedFrame, true);
+  assert.equal(down.initialPlacement.requestId, down.requestId);
+  assert.equal(down.initialPlacement.presentationId, down.presentationId);
+  assert.equal(down.initialPlacement.landedEpoch, target + 6);
+});
+
+test("an obsolete rejoin RVFC callback cannot admit a newer presentation", async t => {
+  const target = 1800000000;
+  const harness = createRejoinHarness(target, {
+    deferredFrame: new Set(["Drive Down"])
+  });
+  t.after(() => harness.close());
+  await harness.controller.playHistorical(target);
+  setReviewTi(harness.controller, target + 6);
+  const down = harness.controller._historicalPlayers.get("Drive Down");
+  const oldJoin = harness.controller.evaluateHistoricalAvailability(null, { reason: "old_rejoin" });
+  await waitForCondition(() => down.video?.currentTimeWrites?.length === 1);
+  const oldControl = harness.mediaControls.find(item => item.camera === "Drive Down");
+  const oldCallback = oldControl.pendingFrameCallbacks()[0];
+  assert.ok(oldCallback);
+  const newer = harness.controller.playHistorical(target + 30, { autoplay: false });
+  await waitForCondition(() => harness.mediaControls.filter(item =>
+    item.camera === "Drive Down").length === 2);
+  const newControl = harness.mediaControls.findLast(item => item.camera === "Drive Down");
+  await waitForCondition(() => newControl.video.currentTimeWrites.length === 1);
+  const currentDown = harness.controller._historicalPlayers.get("Drive Down");
+  oldCallback(0, { mediaTime: oldControl.video.currentTime,
+    presentationTime: harness.controller._now() });
+  assert.equal(currentDown.lifecycleState, "preparing");
+  assert.equal(currentDown.initialPlacement, null);
+  newControl.emitFrame();
+  await Promise.all([oldJoin, newer]);
+  assert.equal(currentDown.lifecycleState, "participating");
+  assert.equal(currentDown.initialPlacement.requestedEpoch, target + 30);
+  assert.equal(currentDown.initialPlacement.verifiedFrame, true);
+});
+
+test("rejoin refreshes its final seek from TI and obeys Pause during preparation", async t => {
+  const target = 1800000000;
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const harness = createRejoinHarness(target, {
+    presentationResponder: message => message.camera === "drive_down"
+      ? gate.then(() => presentationPrepared(message.camera, message.target - 20, message.target))
+      : Promise.resolve(presentationPrepared(message.camera, message.target - 20, message.target))
+  });
+  t.after(() => harness.close());
+  await harness.controller.playHistorical(target);
+  setReviewTi(harness.controller, target + 6);
+  const down = harness.controller._historicalPlayers.get("Drive Down");
+  const join = harness.controller.evaluateHistoricalAvailability(null, { reason: "moving_ti" });
+  await waitForCondition(() => harness.calls.some(call =>
+    call.type === "frigate_max/v2/vod/prepare" && call.camera === "drive_down"));
+  setReviewTi(harness.controller, target + 9);
+  assert.equal(harness.controller.pausePlayback(), true);
+  release();
+  await join;
+  assert.equal(down.lifecycleState, "participating");
+  assert.equal(down.resolvedEpoch, target + 9);
+  assert.equal(down.initialPlacement.requestedEpoch, target + 9);
+  assert.equal(down.video.paused, true);
+  assert.equal(harness.playCalls.filter(call => call.camera === "Drive Down").length, 0);
+});
+
+test("rejoin uses current Play intent after Pause then Play during preparation", async t => {
+  const target = 1800000000;
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const harness = createRejoinHarness(target, {
+    presentationResponder: message => message.camera === "drive_down"
+      ? gate.then(() => presentationPrepared(message.camera, message.target - 20, message.target))
+      : Promise.resolve(presentationPrepared(message.camera, message.target - 20, message.target))
+  });
+  t.after(() => harness.close());
+  await harness.controller.playHistorical(target);
+  setReviewTi(harness.controller, target + 6);
+  const down = harness.controller._historicalPlayers.get("Drive Down");
+  const join = harness.controller.evaluateHistoricalAvailability(null, { reason: "intent_change" });
+  await waitForCondition(() => down.lifecycleState === "preparing");
+  assert.equal(harness.controller.pausePlayback(), true);
+  assert.equal(harness.controller.resumePlayback(), true);
+  release();
+  await join;
+  assert.equal(down.lifecycleState, "participating");
+  assert.equal(down.video.paused, false);
+  assert.equal(harness.playCalls.filter(call => call.camera === "Drive Down").length, 1);
+});
+
+test("rejoin follows the committed clock during an uncommitted Timeline preview", async t => {
+  const target = 1800000000;
+  const harness = createRejoinHarness(target);
+  t.after(() => harness.close());
+  await harness.controller.playHistorical(target);
+  setReviewTi(harness.controller, target + 6);
+  harness.controller._timelineDrag = { previewEpoch: target + 50 };
+  assert.equal(harness.controller.reviewPosition, target + 50);
+  const down = harness.controller._historicalPlayers.get("Drive Down");
+  await harness.controller.evaluateHistoricalAvailability(null, { reason: "timeline_preview" });
+  harness.controller._timelineDrag = null;
+  assert.equal(down.lifecycleState, "participating");
+  assert.equal(down.resolvedEpoch, target + 6);
+  assert.equal(down.initialPlacement.requestedEpoch, target + 6);
+});
+
+test("Pause interrupts an in-flight rejoin Play without admitting it early", async t => {
+  const target = 1800000000;
+  let resolvePlay;
+  const pending = new Promise(resolve => { resolvePlay = resolve; });
+  const harness = createRejoinHarness(target, {
+    playResponder: camera => camera === "Drive Down" ? pending : Promise.resolve()
+  });
+  t.after(() => harness.close());
+  await harness.controller.playHistorical(target);
+  setReviewTi(harness.controller, target + 6);
+  const down = harness.controller._historicalPlayers.get("Drive Down");
+  const join = harness.controller.evaluateHistoricalAvailability(null, { reason: "pending_play" });
+  await waitForCondition(() => harness.playCalls.some(call => call.camera === "Drive Down"));
+  assert.equal(down.lifecycleState, "preparing");
+  assert.equal(harness.controller.pausePlayback(), true);
+  await join;
+  assert.equal(down.lifecycleState, "participating");
+  assert.equal(down.video.paused, true);
+  resolvePlay();
+  await Promise.resolve();
+  assert.equal(down.video.paused, true);
+});
+
+test("Play after interrupting a pending rejoin Play retries before admission", async t => {
+  const target = 1800000000;
+  let resolveOldPlay;
+  const oldPlay = new Promise(resolve => { resolveOldPlay = resolve; });
+  let downPlayCount = 0;
+  const harness = createRejoinHarness(target, {
+    playResponder: camera => camera !== "Drive Down" ? Promise.resolve() :
+      ++downPlayCount === 1 ? oldPlay : Promise.resolve()
+  });
+  t.after(() => harness.close());
+  await harness.controller.playHistorical(target);
+  setReviewTi(harness.controller, target + 6);
+  const down = harness.controller._historicalPlayers.get("Drive Down");
+  const join = harness.controller.evaluateHistoricalAvailability(null, { reason: "play_retry" });
+  await waitForCondition(() => down.transition?.playPending === true);
+  assert.equal(harness.controller.pausePlayback(), true);
+  assert.equal(harness.controller.resumePlayback(), true);
+  await join;
+  assert.equal(downPlayCount, 2);
+  assert.equal(down.lifecycleState, "participating");
+  assert.equal(down.video.paused, false);
+  resolveOldPlay();
+});
+
+test("a pending rejoin Play does not block healthy camera evaluation", async t => {
+  const target = 1800000000;
+  let resolvePlay;
+  const pending = new Promise(resolve => { resolvePlay = resolve; });
+  const harness = createRejoinHarness(target, {
+    playResponder: camera => camera === "Drive Down" ? pending : Promise.resolve()
+  });
+  t.after(() => harness.close());
+  await harness.controller.playHistorical(target);
+  setReviewTi(harness.controller, target + 6);
+  const up = harness.controller._historicalPlayers.get("Drive Up");
+  const down = harness.controller._historicalPlayers.get("Drive Down");
+  const upHls = up.hls;
+  const upPauseCount = up.video.pauseCount;
+  const upPlayCount = harness.playCalls.filter(call => call.camera === "Drive Up").length;
+  const join = harness.controller.evaluateHistoricalAvailability(null, { reason: "slow_camera_play" });
+  await waitForCondition(() => down.transition?.playPending === true);
+  const second = await harness.controller.evaluateHistoricalAvailability(null, {
+    reason: "healthy_camera_progress"
+  });
+  assert.equal(second.find(item => item.camera === "Drive Up").result, "participating");
+  assert.equal(second.find(item => item.camera === "Drive Down").result, "preparing");
+  assert.equal(down.lifecycleState, "preparing");
+  assert.strictEqual(up.hls, upHls);
+  assert.equal(up.video.pauseCount, upPauseCount);
+  assert.equal(harness.playCalls.filter(call => call.camera === "Drive Up").length, upPlayCount);
+  resolvePlay();
+  await join;
+  assert.equal(down.lifecycleState, "participating");
+});
+
+test("queued availability lets a second camera rejoin while the first prepares", async t => {
+  const target = 1800000000;
+  let releaseDown;
+  const downGate = new Promise(resolve => { releaseDown = resolve; });
+  const harness = createHistoricalHarness({
+    now: () => 0,
+    availabilityResponder: message => Promise.resolve({
+      camera: message.camera,
+      requested_start: message.start,
+      requested_end: message.end,
+      coverage: message.camera === "drive_down"
+        ? [{ start: target + 5, end: target + 100 }]
+        : message.camera === "back"
+          ? [{ start: target + 10, end: target + 100 }]
+          : [{ start: message.start, end: message.end }]
+    }),
+    presentationResponder: message => message.camera === "drive_down"
+      ? downGate.then(() => presentationPrepared(message.camera, message.target - 20,
+        message.target))
+      : Promise.resolve(presentationPrepared(message.camera, message.target - 20,
+        message.target))
+  });
+  t.after(() => harness.close());
+  harness.controller.setSelectedCameraNames(["Drive Up", "Drive Down", "Back"]);
+  await harness.controller.playHistorical(target, {
+    cameraNames: ["Drive Up", "Drive Down", "Back"]
+  });
+  const up = harness.controller._historicalPlayers.get("Drive Up");
+  const down = harness.controller._historicalPlayers.get("Drive Down");
+  const back = harness.controller._historicalPlayers.get("Back");
+  const upHls = up.hls;
+  setReviewTi(harness.controller, target + 6);
+  await harness.controller.queueHistoricalAvailabilityEvaluation("first_rejoin");
+  await waitForCondition(() => down.lifecycleState === "preparing");
+  setReviewTi(harness.controller, target + 11);
+  await harness.controller.queueHistoricalAvailabilityEvaluation("second_rejoin");
+  await waitForCondition(() => back.lifecycleState === "participating");
+  assert.equal(down.lifecycleState, "preparing");
+  assert.strictEqual(up.hls, upHls);
+  assert.equal(up.lifecycleState, "participating");
+  releaseDown();
+  await waitForCondition(() => down.lifecycleState === "participating");
+  assert.equal(down.initialPlacement.requestedEpoch, target + 11);
+});
+
+test("a superseded rejoin Play settlement cannot change current camera state", async t => {
+  const target = 1800000000;
+  let resolveOldPlay;
+  const oldPlay = new Promise(resolve => { resolveOldPlay = resolve; });
+  let downPlayCount = 0;
+  const harness = createRejoinHarness(target, {
+    playResponder: camera => camera !== "Drive Down" ? Promise.resolve() :
+      ++downPlayCount === 1 ? oldPlay : Promise.resolve()
+  });
+  t.after(() => harness.close());
+  await harness.controller.playHistorical(target);
+  setReviewTi(harness.controller, target + 6);
+  const oldDown = harness.controller._historicalPlayers.get("Drive Down");
+  const oldJoin = harness.controller.evaluateHistoricalAvailability(null, { reason: "old_play" });
+  await waitForCondition(() => oldDown.transition?.playPending === true);
+  const newer = harness.controller.playHistorical(target + 30, { autoplay: false });
+  await newer;
+  const currentDown = harness.controller._historicalPlayers.get("Drive Down");
+  assert.notStrictEqual(currentDown, oldDown);
+  assert.equal(currentDown.lifecycleState, "participating");
+  const currentHls = currentDown.hls;
+  resolveOldPlay();
+  await oldJoin;
+  assert.strictEqual(currentDown.hls, currentHls);
+  assert.equal(currentDown.lifecycleState, "participating");
+  assert.equal(currentDown.video.paused, true);
+});
+
+test("rejoin Play rejection and timeout fail only that camera", async t => {
+  const target = 1800000000;
+  for (const outcome of ["reject", "timeout"]) {
+    const harness = createRejoinHarness(target, {
+      playResponder: camera => camera !== "Drive Down" ? Promise.resolve() :
+        outcome === "reject" ? Promise.reject(new Error("synthetic Play rejection")) :
+          new Promise(() => {})
+    });
+    t.after(() => harness.close());
+    await harness.controller.playHistorical(target);
+    harness.controller._mediaReadyTimeoutMs = 30;
+    setReviewTi(harness.controller, target + 6);
+    const up = harness.controller._historicalPlayers.get("Drive Up");
+    const down = harness.controller._historicalPlayers.get("Drive Down");
+    const upHls = up.hls;
+    const upPauseCount = up.video.pauseCount;
+    const upPlayCount = harness.playCalls.filter(call => call.camera === "Drive Up").length;
+    await harness.controller.evaluateHistoricalAvailability(null, { reason: `play_${outcome}` });
+    assert.equal(down.lifecycleState, "failed");
+    assert.equal(down.boundaryReason, outcome === "reject"
+      ? "rejoin_play_rejected" : "rejoin_play_timeout");
+    assert.equal(down.video.paused, true);
+    assert.equal(up.lifecycleState, "participating");
+    assert.strictEqual(up.hls, upHls);
+    assert.equal(up.video.pauseCount, upPauseCount);
+    assert.equal(harness.playCalls.filter(call => call.camera === "Drive Up").length, upPlayCount);
+    assert.equal(harness.controller.clock.running, true);
+  }
+});
+
+test("non-RVFC rejoin retains explicitly weaker readiness evidence", async t => {
+  const target = 1800000000;
+  const harness = createRejoinHarness(target, { noRvfc: new Set(["Drive Down"]) });
+  t.after(() => harness.close());
+  await harness.controller.playHistorical(target);
+  setReviewTi(harness.controller, target + 6);
+  const down = harness.controller._historicalPlayers.get("Drive Down");
+  await harness.controller.evaluateHistoricalAvailability(null, { reason: "fallback_rejoin" });
+  assert.equal(down.lifecycleState, "participating");
+  assert.equal(down.initialPlacement.verifiedFrame, false);
+  assert.equal(down.initialPlacement.landedEpoch, null);
+});
+
+test("a held gap frame remains separate from participation through rejoin", async t => {
+  const target = 1800000000;
+  const deferredFrame = new Set();
+  const harness = createHistoricalHarness({
+    now: () => 0,
+    deferredFrame,
+    availabilityResponder: message => Promise.resolve({
+      camera: message.camera,
+      requested_start: message.start,
+      requested_end: message.end,
+      coverage: message.camera === "drive_down"
+        ? [{ start: target, end: target + 10 },
+          { start: target + 20, end: target + 40 }]
+        : [{ start: message.start, end: message.end }]
+    })
+  });
+  t.after(() => harness.close());
+  harness.window.HTMLCanvasElement.prototype.getContext = () => ({ drawImage() {} });
+  await harness.controller.playHistorical(target);
+  const down = harness.controller._historicalPlayers.get("Drive Down");
+  const initialControl = harness.mediaControls.find(item => item.camera === "Drive Down");
+  initialControl.emitFrame();
+  assert.ok(down.heldCanvas?.hidden);
+  setReviewTi(harness.controller, target + 10);
+  down.video.currentTime = down.timing.logical_media_end_position;
+  await harness.controller.evaluateHistoricalAvailability(null, { reason: "gap_hold" });
+  assert.equal(down.lifecycleState, "unavailable");
+  assert.equal(down.heldCanvas.hidden, false);
+  assert.ok(down.holdStartedAtMs != null);
+  deferredFrame.add("Drive Down");
+  setReviewTi(harness.controller, target + 21);
+  const join = harness.controller.evaluateHistoricalAvailability(null, { reason: "gap_rejoin" });
+  await waitForCondition(() => down.video?.currentTimeWrites?.length === 1 &&
+    down.lifecycleState === "preparing");
+  assert.equal(down.heldCanvas.hidden, false);
+  const rejoinControl = harness.mediaControls.findLast(item => item.camera === "Drive Down");
+  rejoinControl.emitFrame();
+  await join;
+  assert.equal(down.lifecycleState, "participating");
+  assert.equal(down.heldCanvas.hidden, true);
+  assert.equal(down.holdStartedAtMs, null);
+  assert.equal(down.initialPlacement.verifiedFrame, true);
+});
+
 test("a camera leaves at a genuine gap while its peer continues, then rejoins the next cached interval", async t => {
   const target = 1800000000;
   const harness = createHistoricalHarness({
+    now: () => 0,
     availabilityResponder: message => Promise.resolve({
       camera: message.camera,
       requested_start: message.start,
@@ -4490,6 +5424,7 @@ test("a camera leaves at a genuine gap while its peer continues, then rejoins th
   const upPauseCount = up.video.pauseCount;
   down.video.currentTime = target + 10 - down.timing.effective_absolute_origin;
   up.video.currentTime = target + 10 - up.timing.effective_absolute_origin;
+  setReviewTi(harness.controller, target + 10);
   await harness.controller.evaluateHistoricalAvailability(null, { reason: "gap_entry" });
   assert.equal(down.lifecycleState, "unavailable");
   assert.equal(down.nextCoverageStart, target + 20);
@@ -4498,6 +5433,7 @@ test("a camera leaves at a genuine gap while its peer continues, then rejoins th
   assert.equal(harness.controller.clock.running, true);
 
   up.video.currentTime = target + 21 - up.timing.effective_absolute_origin;
+  setReviewTi(harness.controller, target + 21);
   await harness.controller.evaluateHistoricalAvailability(null, { reason: "next_interval" });
   assert.equal(down.lifecycleState, "participating");
   assert.equal(down.resolvedEpoch, target + 21);
@@ -4616,6 +5552,7 @@ test("a stale late join after a newer explicit seek cannot attach or overwrite t
   let downPrepareCount = 0;
   const oldGate = new Promise(resolve => { releaseOld = resolve; });
   const harness = createHistoricalHarness({
+    now: () => 0,
     availabilityResponder: message => Promise.resolve({
       camera: message.camera,
       requested_start: message.start,
@@ -4638,6 +5575,7 @@ test("a stale late join after a newer explicit seek cannot attach or overwrite t
   const up = harness.controller._historicalPlayers.get("Drive Up");
   const down = harness.controller._historicalPlayers.get("Drive Down");
   up.video.currentTime = target + 6 - up.timing.effective_absolute_origin;
+  setReviewTi(harness.controller, target + 6);
   const oldJoin = harness.controller.evaluateHistoricalAvailability(null, { reason: "old_join" });
   await waitForCondition(() => downPrepareCount === 1);
   const newerSeek = harness.controller.seekHistoricalToEpoch(target + 30, { autoplay: false });
@@ -4656,6 +5594,7 @@ test("a stale late join after reassignment cannot affect the replacement camera"
   let releaseDown;
   const downGate = new Promise(resolve => { releaseDown = resolve; });
   const harness = createHistoricalHarness({
+    now: () => 0,
     availabilityResponder: message => Promise.resolve({
       camera: message.camera,
       requested_start: message.start,
@@ -4673,6 +5612,7 @@ test("a stale late join after reassignment cannot affect the replacement camera"
   await harness.controller.playHistorical(target);
   const up = harness.controller._historicalPlayers.get("Drive Up");
   up.video.currentTime = target + 6 - up.timing.effective_absolute_origin;
+  setReviewTi(harness.controller, target + 6);
   const staleJoin = harness.controller.evaluateHistoricalAvailability(null, {
     reason: "join_before_reassignment"
   });
@@ -4697,6 +5637,7 @@ test("rapid boundary evaluation creates only one concurrent preparation per came
   let downPrepares = 0;
   const gate = new Promise(resolve => { release = resolve; });
   const harness = createHistoricalHarness({
+    now: () => 0,
     availabilityResponder: message => Promise.resolve({
       camera: message.camera,
       requested_start: message.start,
@@ -4716,6 +5657,7 @@ test("rapid boundary evaluation creates only one concurrent preparation per came
   await harness.controller.playHistorical(target);
   const up = harness.controller._historicalPlayers.get("Drive Up");
   up.video.currentTime = target + 6 - up.timing.effective_absolute_origin;
+  setReviewTi(harness.controller, target + 6);
   const first = harness.controller.evaluateHistoricalAvailability(null, { reason: "boundary_one" });
   await waitForCondition(() => downPrepares === 1);
   const second = harness.controller.evaluateHistoricalAvailability(null, { reason: "boundary_two" });
@@ -4725,9 +5667,10 @@ test("rapid boundary evaluation creates only one concurrent preparation per came
   await first;
 });
 
-test("media-achieved frontier ignores a 16x synthetic-clock lead for join and leave", async t => {
+test("Review TI determines rejoin while a healthy camera retains its own media boundary", async t => {
   const target = 1800000000;
   const harness = createHistoricalHarness({
+    now: () => 0,
     availabilityResponder: message => Promise.resolve({
       camera: message.camera,
       requested_start: message.start,
@@ -4742,21 +5685,23 @@ test("media-achieved frontier ignores a 16x synthetic-clock lead for join and le
   await harness.controller.playHistorical(target);
   const up = harness.controller._historicalPlayers.get("Drive Up");
   const down = harness.controller._historicalPlayers.get("Drive Down");
-  harness.controller.clock._absolute = target + 100;
+  setReviewTi(harness.controller, target + 100);
   up.video.currentTime = target + 5 - up.timing.effective_absolute_origin;
   await harness.controller.evaluateHistoricalAvailability(null, { reason: "clock_lead" });
   assert.equal(down.lifecycleState, "unavailable");
   up.video.currentTime = target + 11 - up.timing.effective_absolute_origin;
+  setReviewTi(harness.controller, target + 11);
   await harness.controller.evaluateHistoricalAvailability(null, { reason: "media_entry" });
   assert.equal(down.lifecycleState, "participating");
   down.video.currentTime = target + 19 - down.timing.effective_absolute_origin;
-  harness.controller.clock._absolute = target + 200;
+  setReviewTi(harness.controller, target + 19);
   await harness.controller.evaluateHistoricalAvailability(null, { reason: "clock_leave_lead" });
   assert.equal(down.lifecycleState, "participating");
 });
 
-test("logical V2 exhaustion distinguishes a genuine gap from deferred continuous coverage", async t => {
+test("logical V2 exhaustion preserves a genuine recording gap", async t => {
   const target = 1800000000;
+  const range = { from: target - 15, to: target + 300 };
   const gapHarness = createHistoricalHarness({
     availabilityResponder: message => Promise.resolve({
       camera: message.camera,
@@ -4768,33 +5713,74 @@ test("logical V2 exhaustion distinguishes a genuine gap from deferred continuous
     })
   });
   t.after(() => gapHarness.close());
-  await gapHarness.controller.playHistorical(target);
+  gapHarness.window.HTMLCanvasElement.prototype.getContext = () => ({ drawImage() {} });
+  await gapHarness.controller.playHistorical(target, { playbackRange: range });
   const gapPlayer = gapHarness.controller._historicalPlayers.get("Drive Down");
+  gapHarness.mediaControls.find(control => control.camera === "Drive Down").emitFrame();
   gapPlayer.video.currentTime = gapPlayer.timing.logical_media_end_position;
   gapPlayer.video.dispatchEvent(new gapHarness.window.Event("ended"));
   await waitForCondition(() => gapPlayer.lifecycleState !== "participating");
   assert.equal(gapPlayer.lifecycleState, "unavailable");
   assert.equal(gapPlayer.boundaryReason, "authoritative_recording_gap");
+  assert.equal(gapPlayer.heldCanvas.hidden, false);
+  assert.equal(gapHarness.root.querySelector(
+    '.review-camera-panel[data-camera="Drive Down"] .review-camera-presentation-kind'
+  ).textContent, "Ended");
   assert.equal(gapHarness.controller._historicalPlayers.get("Drive Up").lifecycleState, "participating");
   assert.equal(gapHarness.controller.clock.running, true);
 
-  const continuousHarness = createHistoricalHarness();
-  t.after(() => continuousHarness.close());
-  await continuousHarness.controller.playHistorical(target);
-  const continuous = continuousHarness.controller._historicalPlayers.get("Drive Down");
-  const prepares = continuousHarness.calls.filter(call =>
+});
+
+test("a bounded continuous presentation crosses the old 120-second cutoff without reacquisition", async t => {
+  const target = 1800000000;
+  const range = { from: target - 15, to: target + 300 };
+  const harness = createHistoricalHarness({
+    presentationResponder: message => Promise.resolve(presentationPrepared(
+      message.camera, message.target - 21, message.target, message.bounds_end
+    ))
+  });
+  t.after(() => harness.close());
+  await harness.controller.playHistorical(target, { playbackRange: range });
+  const player = harness.controller._historicalPlayers.get("Drive Down");
+  const hls = player.hls;
+  const prepareCount = harness.calls.filter(call =>
     call.type === "frigate_max/v2/vod/prepare" && call.camera === "drive_down").length;
-  continuous.video.currentTime = continuous.timing.logical_media_end_position;
-  await continuousHarness.controller.resolveHistoricalVideoEnd(
-    continuous, continuous.generation
-  );
-  assert.equal(continuous.lifecycleState, "failed");
-  assert.equal(continuous.boundaryReason, "continuous_presentation_end_deferred_phase_c");
-  assert.equal(continuousHarness.calls.filter(call =>
+  assert.equal(player.timing.logical_wall_end, range.to);
+  player.video.currentTime = target + 121 - player.timing.effective_absolute_origin;
+  assert.equal(harness.controller.enforceHistoricalPresentationBoundary(), false);
+  assert.equal(player.lifecycleState, "participating");
+  assert.strictEqual(player.hls, hls);
+  assert.equal(harness.calls.filter(call =>
     call.type === "frigate_max/v2/vod/prepare" && call.camera === "drive_down").length,
-  prepares);
-  assert.equal(continuousHarness.controller._historicalPlayers.get("Drive Up").lifecycleState, "participating");
-  assert.equal(continuousHarness.controller.clock.running, true);
+  prepareCount);
+  player.video.currentTime = player.timing.logical_media_end_position;
+  await harness.controller.resolveHistoricalVideoEnd(player, player.generation);
+  await harness.controller.evaluateHistoricalAvailability(range.to, {
+    reason: "requested_playback_end"
+  });
+  assert.equal(player.lifecycleState, "participating",
+    "the requested investigation end is handled by the playback boundary");
+  assert.strictEqual(player.hls, hls);
+});
+
+test("a finite end without a presented frame never claims a held last frame", async t => {
+  const target = 1800000000;
+  const range = { from: target - 15, to: target + 300 };
+  const harness = createHistoricalHarness({ now: () => 0 });
+  t.after(() => harness.close());
+  await harness.controller.playHistorical(target, { playbackRange: range });
+  const player = harness.controller._historicalPlayers.get("Drive Down");
+  const badge = harness.root.querySelector(
+    '.review-camera-panel[data-camera="Drive Down"] .review-camera-presentation-kind'
+  );
+  assert.equal(player.heldCanvas, undefined);
+  player.video.currentTime = player.timing.logical_media_end_position;
+  setReviewTi(harness.controller, target + 120);
+  await harness.controller.resolveHistoricalVideoEnd(player, player.generation);
+  assert.equal(player.holdStartedAtMs, undefined);
+  assert.equal(badge.textContent, "Historical");
+  await waitForCondition(() => player.lifecycleState === "participating" &&
+    player.timing.selected_epoch === target + 120);
 });
 
 function manualInitialDeadlines() {

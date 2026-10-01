@@ -33,6 +33,9 @@ Object.defineProperty(window, "nvrDiagnostics", {
     getHistoricalSyncReports() {
       return soleHistoricalSyncController()?.getHistoricalSyncReports() ?? [];
     },
+    getSceneExperimentReport() {
+      return soleHistoricalSyncController()?.getSceneExperimentReport() ?? null;
+    },
     runContinuousHandoffPrototype(options) {
       const controller = soleHistoricalSyncController();
       if (!controller) throw new Error("No connected NVR card is available.");
@@ -1985,6 +1988,7 @@ class NVRCard extends HTMLElement {
 
     this.config = config;
     this._reviewController.setTimeFormat(normalized.timeFormat);
+    this._reviewController.setVideoStateBadgePosition(normalized.videoStateBadgePosition);
     this._reviewController.setDebug(config.review_debug === true);
     if (JSON.stringify(this._autoDimConfig) !== JSON.stringify(normalized.autoDim)) {
       this.applyAutoDimConfig(normalized.autoDim);
@@ -2075,7 +2079,10 @@ class NVRCard extends HTMLElement {
       cameras,
       cameraAspectRatio,
       autoDim,
-      timeFormat
+      timeFormat,
+      videoStateBadgePosition: ReviewController.normalizeVideoStateBadgePosition(
+        config.video_state_badge_position
+      )
     };
   }
 
@@ -3462,7 +3469,7 @@ class NVRCard extends HTMLElement {
       }
 
       .review-speed-select {
-        width: 58px;
+        width: 65px;
         height: 30px;
         min-height: 30px;
         padding: 0 5px;
@@ -3658,6 +3665,16 @@ class NVRCard extends HTMLElement {
         pointer-events: none;
       }
 
+      .review-held-frame {
+        position: absolute;
+        inset: 0;
+        z-index: 1;
+        width: 100%;
+        height: 100%;
+        object-fit: contain;
+        pointer-events: none;
+      }
+
       .review-camera-status {
         position: absolute;
         inset: 0;
@@ -3681,6 +3698,12 @@ class NVRCard extends HTMLElement {
 
       .review-camera-status.unavailable {
         color: #ef7770;
+      }
+
+      .review-camera-status.held {
+        inset: auto 8px 8px auto;
+        padding: 4px 6px;
+        background: rgba(0, 0, 0, 0.75);
       }
 
       .review-empty-state {
@@ -7781,10 +7804,7 @@ class NVRCard extends HTMLElement {
     const phoneLayout =
       shell.clientWidth <= 600;
 
-    const collapsed =
-      this._sidebarCollapsed === null
-        ? phoneLayout
-        : this._sidebarCollapsed;
+    const collapsed = this._sidebarCollapsed ?? true;
 
     shell.classList.toggle(
       "phone-layout",
