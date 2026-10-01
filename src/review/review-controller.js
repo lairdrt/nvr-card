@@ -2853,7 +2853,27 @@ export class ReviewController {
     if (badge) badge.textContent = this.historicalVideoStateBadge(player);
   }
 
+  reconcileHistoricalAssignments() {
+    if (this._presentationMode !== "historical") return;
+    for (const [name, player] of this._historicalPlayers) {
+      const slot = this.assignedSlotForCamera(name);
+      if (slot === null) {
+        this.cleanupHistoricalPlayer(player);
+        this._historicalPlayers.delete(name);
+        continue;
+      }
+      // A slot move keeps the same selected player, source and pending operation.
+      const transition = player.transition;
+      if (transition && player.requestId === this._reviewRequestId &&
+          transition.requestId === this._reviewRequestId) {
+        transition.assignmentRevision = this._assignmentRevision;
+        transition.slot = slot;
+      }
+    }
+  }
+
   syncMediaPanels() {
+    this.reconcileHistoricalAssignments();
     const wall = this._root?.querySelector(".review-camera-wall");
     if (!wall) return;
     const historicalNames = this._presentationMode === "historical"
@@ -2958,7 +2978,7 @@ export class ReviewController {
     const back = this._transportRoot?.querySelector(".review-back-ten");
     const forward = this._transportRoot?.querySelector(".review-forward-ten");
     if (pause) {
-      pause.disabled = !inHistorical || !this.clock.running;
+      pause.disabled = !inHistorical || (!this.clock.running && !this._playRequested);
       pause.classList.toggle("selected", inHistorical && this.clock.running);
     }
     if (play) {
@@ -2989,7 +3009,7 @@ export class ReviewController {
   }
 
   pausePlayback() {
-    if (this._presentationMode !== "historical" || !this.clock.running) return false;
+    if (this._presentationMode !== "historical" || (!this.clock.running && !this._playRequested)) return false;
     this._playRequested = false;
     const players = [...this._historicalPlayers.values()].filter(player =>
       (player.lifecycleState === "participating" || player.transition?.playPending) && player.video);
@@ -3018,11 +3038,8 @@ export class ReviewController {
       return false;
     }
     this._playRequested = false;
-    players.forEach(player => {
-      player.video.playbackRate = this._playbackSpeed;
-      void Promise.resolve(player.video.play()).catch(() => {});
-    });
     this.clock.start();
+    players.forEach(player => { void this.startOwnedPlayback(player); });
     this.scheduleHistoricalBoundaryTimer();
     this.updateTransport();
     this.updateDiagnostics();
@@ -3055,12 +3072,18 @@ export class ReviewController {
     const target = Number(targetEpoch);
     if (this._presentationMode !== "historical" || !Number.isFinite(target)) return false;
     const generation = this._generation;
+    // Explicit placement supersedes older work even when it reuses the source.
+    const requestId = ++this._reviewRequestId;
+    this._playRequested = autoplay;
+    this._historicalPreparing = true;
     this.endSyncReport(source);
     const players = [...this._historicalPlayers.values()];
     const report = this.startSyncReport(
       generation, target, players.map(player => player.camera), source
     );
     for (const player of players) {
+      for (const cancel of [...player.waitCancellations]) cancel();
+      player.requestId = requestId;
       player.diagnosticReport = report;
       const diagnostic = report?.cameras?.[player.camera.name];
       if (diagnostic) Object.assign(diagnostic, {
@@ -3078,6 +3101,12 @@ export class ReviewController {
         panelCamera: player.panelCamera,
         renderedSlot: player.renderedSlot
       });
+      if (player.transition?.reason === "play_release") {
+        // Supersede only the Play command; an explicit seek can retain its source.
+        player.transition.hls = null;
+        this.cancelCameraTransition(player);
+        this.setCameraLifecycle(player, "participating");
+      }
       if (player.lifecycleState === "preparing") {
         this.cancelCameraTransition(player);
         this.cleanupHistoricalPlayer(player);
@@ -3092,7 +3121,8 @@ export class ReviewController {
     const results = await this.evaluateHistoricalAvailability(target, {
       explicit: true, reason: source, autoplay: false
     });
-    if (generation !== this._generation || !this._active || this._suspended) return false;
+    if (generation !== this._generation || requestId !== this._reviewRequestId ||
+        !this._active || this._suspended) return false;
     const playable = players.filter(player =>
       player.lifecycleState === "participating" && player.video && player.hls);
     const resolvedEpochs = playable
@@ -3100,18 +3130,13 @@ export class ReviewController {
       .filter(Number.isFinite);
     const resolvedEpoch = resolvedEpochs.length ? Math.min(...resolvedEpochs) : target;
     this.clock.setAbsolute(resolvedEpoch);
-    if (autoplay && playable.length) {
+    this._historicalPreparing = false;
+    if (this._playRequested && playable.length) {
       this.clock.start();
-      await Promise.allSettled(playable.map(async player => {
-        player.video.defaultPlaybackRate = this._playbackSpeed;
-        player.video.playbackRate = this._playbackSpeed;
-        try {
-          await Promise.resolve(player.video.play());
-        } catch {
-          this.leaveHistoricalCamera(player, "play_rejected", target, null, "failed");
-        }
-      }));
+      await Promise.allSettled(playable.map(player => this.startOwnedPlayback(player)));
     }
+    if (requestId !== this._reviewRequestId || generation !== this._generation) return false;
+    this._playRequested = false;
     if (report && generation === this._generation && this._syncSession === report) {
       const atMs = this._now();
       report.barrier = {
@@ -3449,9 +3474,9 @@ export class ReviewController {
     }
   }
 
-  beginCameraTransition(player, reason, targetEpoch) {
+  beginCameraTransition(player, reason, targetEpoch, { preservePlacement = false } = {}) {
     this.cancelCameraTransition(player);
-    player.initialPlacement = null;
+    if (!preservePlacement) player.initialPlacement = null;
     const transition = {
       token: ++this._cameraTransitionSequence,
       reason,
@@ -3900,7 +3925,14 @@ export class ReviewController {
     };
   }
 
-  async requestPreparedTiming(player, range, { legacy = false } = {}) {
+  async requestPreparedTiming(player, range, { legacy = false, transition = null } = {}) {
+    const requestId = player.requestId;
+    const acceptIdentity = result => {
+      if (requestId !== this._reviewRequestId) throw new Error("Historical preparation was superseded.");
+      this.assertCurrentCameraBoundary(player, player.generation, transition);
+      player.returnedCamera = typeof result?.camera === "string" &&
+        /^[A-Za-z0-9_-]+$/.test(result.camera) ? result.camera : null;
+    };
     this.recordSceneEvent(player, "vod-prepare-request", { targetEpoch: Number(range.targetEpoch) });
     if (!this._hass || typeof this._hass.callWS !== "function") {
       throw new Error("Home Assistant WebSocket API is unavailable.");
@@ -3913,8 +3945,7 @@ export class ReviewController {
         requested_end: range.end,
         target: range.targetEpoch
       });
-      player.returnedCamera = typeof result?.camera === "string" &&
-        /^[A-Za-z0-9_-]+$/.test(result.camera) ? result.camera : null;
+      acceptIdentity(result);
       return normalizePreparedTiming(result, player.frigateCamera);
     }
     const target = Number(range.targetEpoch ?? range.target);
@@ -3927,8 +3958,7 @@ export class ReviewController {
       bounds_start: boundsStart,
       bounds_end: boundsEnd
     });
-    player.returnedCamera = typeof result?.camera === "string" &&
-      /^[A-Za-z0-9_-]+$/.test(result.camera) ? result.camera : null;
+    acceptIdentity(result);
     return validateHistoricalPresentation(result, player.frigateCamera);
   }
 
@@ -3981,7 +4011,9 @@ export class ReviewController {
     const diagnostic = this.syncCamera(report, generation, player);
     this.syncStage(report, generation, player, "prepareStartMs");
     try {
-      player.timing = await this.requestPreparedTiming(player, range);
+      const timing = await this.requestPreparedTiming(player, range, { transition });
+      this.assertCurrentCameraBoundary(player, generation, transition);
+      player.timing = timing;
     } catch (error) {
       if (diagnostic) {
         diagnostic.prepareSucceeded = false;
@@ -4145,7 +4177,12 @@ export class ReviewController {
 
   async seekHistoricalPlayer(player, generation = null, report = null, transition = null,
     { observeLanding = false, landingAfterSeek = false } = {}) {
-    if (generation !== null) this.assertCurrentCameraBoundary(player, generation, transition);
+    const requestId = player.requestId;
+    const assertOwned = () => {
+      if (requestId !== this._reviewRequestId) throw new Error("Historical seek was superseded.");
+      if (generation !== null) this.assertCurrentCameraBoundary(player, generation, transition);
+    };
+    assertOwned();
     const diagnostic = this.syncCamera(report, generation, player);
     if (diagnostic) {
       diagnostic.requestedMediaTime = player.seek;
@@ -4174,8 +4211,9 @@ export class ReviewController {
         landing = this.observeInitialLanding(player, generation, transition);
       }
       if (landing) {
-        player.initialPlacement = await landing.promise;
-        if (generation !== null) this.assertCurrentCameraBoundary(player, generation, transition);
+        const placement = await landing.promise;
+        assertOwned();
+        player.initialPlacement = placement;
         this.syncStage(report, generation, player, "barrierReadyMs");
         if (diagnostic) {
           diagnostic.actualSeekTime = Number(player.video.currentTime);
@@ -4190,7 +4228,7 @@ export class ReviewController {
         return;
       }
       await wait;
-      if (generation !== null) this.assertCurrentCameraBoundary(player, generation, transition);
+      assertOwned();
       this.syncStage(report, generation, player, "seekingFalseMs");
       this.syncStage(report, generation, player, "targetToleranceMs");
       if (diagnostic) {
@@ -4204,7 +4242,7 @@ export class ReviewController {
         this._mediaReadyTimeoutMs,
         transition?.cancellations ?? player.waitCancellations
       );
-      if (generation !== null) this.assertCurrentCameraBoundary(player, generation, transition);
+      assertOwned();
       this.syncStage(report, generation, player, "readyStateThresholdMs");
       this.syncStage(report, generation, player, "barrierReadyMs");
       if (diagnostic) {
@@ -4223,7 +4261,7 @@ export class ReviewController {
           requestId: player.requestId,
           cameraWorkId: player.cameraWorkId
         };
-        if (generation !== null) this.assertCurrentCameraBoundary(player, generation, transition);
+        assertOwned();
         if (diagnostic) {
           diagnostic.landedMediaTime = player.initialPlacement.landedMediaTime;
           diagnostic.landedEpoch = player.initialPlacement.landedEpoch;
@@ -4241,6 +4279,40 @@ export class ReviewController {
     const mediaTime = Number(player?.video?.currentTime);
     const epoch = historicalEpochFromMedia(player, mediaTime);
     return Number.isFinite(epoch) ? epoch : null;
+  }
+
+  async startOwnedPlayback(player) {
+    const transition = this.beginCameraTransition(player, "play_release", this.clock.absoluteTime,
+      { preservePlacement: true });
+    transition.hls = player.hls;
+    const diagnostic = player.diagnosticReport?.cameras?.[player.camera.name];
+    const playDiagnostic = { issuedAtMs: this._now(), outcome: "pending", settledAtMs: null };
+    if (diagnostic) diagnostic.play = playDiagnostic;
+    try {
+      player.video.defaultPlaybackRate = this._playbackSpeed;
+      player.video.playbackRate = this._playbackSpeed;
+      await this.settleRejoinPlay(player, transition);
+      if (this.clock.running && player.video.paused) await this.settleRejoinPlay(player, transition);
+      this.assertCurrentCameraTransition(player, transition);
+      if (this.clock.running && player.video.paused) throw new Error("Historical Play did not start.");
+      if (!this.clock.running) player.video.pause();
+      player.transition = null;
+      this.setCameraLifecycle(player, "participating", { boundaryReason: "play_release" });
+      this.observeHistoricalFrames(player);
+      playDiagnostic.outcome = "fulfilled";
+    } catch (error) {
+      if (!this.isCurrentCameraTransition(player, transition)) return false;
+      const reason = error.rejoinFailure === "rejoin_play_timeout" ? "play_timeout" : "play_rejected";
+      playDiagnostic.outcome = reason === "play_timeout" ? "timeout" : "rejected";
+      this.leaveHistoricalCamera(player, reason, this.clock.absoluteTime, null, "failed");
+      return false;
+    } finally {
+      playDiagnostic.settledAtMs = this._now();
+      this.updateHistoricalAvailabilityStatus();
+      this.updateTransport();
+      this.updateDiagnostics();
+    }
+    return true;
   }
 
   async settleRejoinPlay(player, transition) {
@@ -4286,6 +4358,7 @@ export class ReviewController {
   }
 
   observeHistoricalFrames(player) {
+    player.cancelHistoricalFrameObserver?.();
     const video = player.video;
     if (typeof video?.requestVideoFrameCallback !== "function") return;
     let callbackId = null;
@@ -4739,10 +4812,12 @@ export class ReviewController {
     if (player.lifecycleState === "failed" && !explicit) return "failed";
     if (!explicit && this._historicalPlaybackRange &&
         targetEpoch >= this._historicalPlaybackRange.to) return "at_playback_end";
+    const requestId = player.requestId;
     const lifecycleRevision = player.lifecycleRevision;
     try {
       await this.ensureCameraAvailability(player, targetEpoch, { reason });
     } catch (error) {
+      if (requestId !== this._reviewRequestId || !this.isCurrentCameraWork(player)) return "stale";
       if (player.lifecycleState === "participating") {
         this.recordCameraBoundary(player, "availability-refresh-failed-player-retained", {
           reason, targetEpoch, error: sanitizeReviewError(error)
@@ -4756,7 +4831,7 @@ export class ReviewController {
       });
       return "availability_failure";
     }
-    if (!this.isCurrentCameraWork(player, player.generation)) return "stale";
+    if (requestId !== this._reviewRequestId || !this.isCurrentCameraWork(player, player.generation)) return "stale";
     if (player.lifecycleRevision !== lifecycleRevision) return "superseded";
     if (!explicit && player.lifecycleState !== "participating") {
       targetEpoch = this.clock.absoluteTime;
@@ -4797,6 +4872,7 @@ export class ReviewController {
         player.seek = mapped.mediaTime;
         player.resolvedEpoch = mapped.resolvedEpoch;
         await this.seekHistoricalPlayer(player, player.generation, player.diagnosticReport);
+        if (requestId !== this._reviewRequestId || !this.isCurrentCameraWork(player)) return "stale";
         this.setCameraLifecycle(player, "participating", {
           boundaryReason: "explicit_seek_reused_presentation",
           targetEpoch,
@@ -4804,6 +4880,7 @@ export class ReviewController {
         });
         return "reused";
       } catch (error) {
+        if (requestId !== this._reviewRequestId || !this.isCurrentCameraWork(player)) return "stale";
         if (!explicit) {
           const logicalEnd = Number(player.timing?.logical_wall_end);
           if (Number.isFinite(logicalEnd) && targetEpoch >= logicalEnd) {
@@ -4889,7 +4966,7 @@ export class ReviewController {
     source = "other historical path"
   } = {}) {
     const generation = ++this._generation;
-    this._reviewRequestId += 1;
+    const requestId = ++this._reviewRequestId;
     this._playRequested = false;
     this.cleanupHistorical();
     try {
@@ -5021,38 +5098,19 @@ export class ReviewController {
       };
       }
       const starts = shouldPlay
-        ? playable.map(player => {
-          const diagnostic = this.syncCamera(report, generation, player);
-          if (diagnostic) diagnostic.play = { issuedAtMs: this._now(), outcome: "pending", settledAtMs: null };
-          const start = Promise.resolve(player.video.play());
-          if (diagnostic) start.then(
-            () => { diagnostic.play.outcome = "fulfilled"; diagnostic.play.settledAtMs = this._now(); },
-            () => { diagnostic.play.outcome = "rejected"; diagnostic.play.settledAtMs = this._now(); }
-          );
-          return start;
-        })
+        ? playable.map(player => this.startOwnedPlayback(player))
         : [];
-      playable.forEach(player => this.observeHistoricalFrames(player));
-      const startResults = await Promise.allSettled(starts);
-      if (generation !== this._generation || !this._active || this._suspended) return;
-      startResults.forEach((result, index) => {
-        if (result.status === "rejected") {
-          this.syncUnavailable(report, generation, playable[index], "play_rejected");
-          this.leaveHistoricalCamera(
-            playable[index], "play_rejected", targetEpoch, null, "failed"
-          );
-        }
-      });
-      if (players.every(player => player.lifecycleState !== "participating")) this.clock.pause();
+      if (!shouldPlay) playable.forEach(player => this.observeHistoricalFrames(player));
+      // The barrier is complete. Per-camera Play waits must not gate availability.
       this._historicalPreparing = false;
       this._playRequested = false;
       const availableCount = players.filter(player => player.lifecycleState === "participating").length;
       if (report) {
-        playable.filter(player => !player.unavailable).forEach(player => {
+        playable.filter(player => player.lifecycleState === "participating").forEach(player => {
           const diagnostic = this.syncCamera(report, generation, player);
           if (diagnostic) diagnostic.status = "released";
         });
-        report.disposition = availableCount === 0 ? "all unavailable" :
+        report.disposition = starts.length > 0 ? "play pending" : availableCount === 0 ? "all unavailable" :
           availableCount < players.length ? "partial release" : "released";
         this.updateSyncSummary(report);
       }
@@ -5075,6 +5133,19 @@ export class ReviewController {
           }
         }, 500);
       }
+      await Promise.allSettled(starts);
+      if (generation !== this._generation || requestId !== this._reviewRequestId ||
+          !this._active || this._suspended) return;
+      if ([...this._historicalPlayers.values()].every(player =>
+          player.lifecycleState !== "participating" && player.lifecycleState !== "preparing")) this.clock.pause();
+      if (report && this._syncSession === report) {
+        const count = [...this._historicalPlayers.values()].filter(player =>
+          player.lifecycleState === "participating").length;
+        report.disposition = count === 0 ? "all unavailable" : count < this._historicalPlayers.size
+          ? "partial release" : "released";
+        this.updateSyncSummary(report);
+      }
+      this.updateTransport();
     } catch (error) {
       if (generation !== this._generation) return;
       if (this._syncSession?.generation === generation) {

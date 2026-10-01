@@ -5582,9 +5582,11 @@ test("a stale late join after a newer explicit seek cannot attach or overwrite t
   await waitForCondition(() => downPrepareCount === 2);
   await newerSeek;
   const currentHls = down.hls;
+  const currentTiming = down.timing;
   releaseOld();
   await oldJoin;
   assert.strictEqual(down.hls, currentHls);
+  assert.strictEqual(down.timing, currentTiming);
   assert.equal(down.lifecycleState, "participating");
   assert.equal(down.resolvedEpoch, target + 30);
 });
@@ -6029,4 +6031,192 @@ test("browser without RVFC retains legacy readiness but never claims a landed fr
     assert.equal(player.initialPlacement.landedEpoch, null);
   }
   assert.equal(harness.playCalls.length, 2);
+});
+
+test("D2 layout changes preserve a selected camera's pending RVFC admission", async t => {
+  const target = 1800000000;
+  const harness = createRejoinHarness(target, { deferredFrame: new Set(["Drive Down"]) });
+  t.after(() => harness.close());
+  await harness.controller.playHistorical(target);
+  setReviewTi(harness.controller, target + 6);
+  const down = harness.controller._historicalPlayers.get("Drive Down");
+  const join = harness.controller.evaluateHistoricalAvailability();
+  await waitForCondition(() => down.video?.currentTimeWrites?.length === 1);
+  harness.controller.setReviewLayout("2x2");
+  harness.controller.setPrimaryCamera("Drive Down");
+  harness.mediaControls.find(item => item.camera === "Drive Down").emitFrame();
+  await join;
+  assert.equal(down.lifecycleState, "participating");
+});
+
+test("D3 latest explicit placement owns autoplay in both directions", async t => {
+  for (const latestAutoplay of [false, true]) {
+    const deferredSeek = new Set();
+    const harness = createHistoricalHarness({ now: () => 0, deferredSeek });
+    t.after(() => harness.close());
+    const target = 1800000000;
+    await harness.controller.playHistorical(target);
+    const players = [...harness.controller._historicalPlayers.values()];
+    deferredSeek.add("Drive Up"); deferredSeek.add("Drive Down");
+    const oldSeek = harness.controller.seekHistoricalToEpoch(target + 10, { autoplay: !latestAutoplay });
+    await waitForCondition(() => players.every(player => player.video.currentTimeWrites.length === 2));
+    const newSeek = harness.controller.seekHistoricalToEpoch(target + 20, { autoplay: latestAutoplay });
+    await waitForCondition(() => players.every(player => player.video.currentTimeWrites.length === 3));
+    harness.mediaControls.forEach(control => control.completeSeek());
+    await Promise.all([oldSeek, newSeek]);
+    assert.equal(harness.controller.clock.running, latestAutoplay);
+    assert.ok(players.every(player => player.video.paused === !latestAutoplay));
+    assert.equal(harness.controller.clock.absoluteTime, target + 20);
+  }
+});
+
+test("D4 resume rejection is camera-local and does not retain false participation", async t => {
+  const harness = createHistoricalHarness({ now: () => 0, playResponder: (camera, video) => {
+    if (camera === "Drive Down") {
+      video.pause();
+      return Promise.reject(new Error("synthetic resume rejection"));
+    }
+    return Promise.resolve();
+  }});
+  t.after(() => harness.close());
+  await harness.controller.playHistorical(1800000000, { autoplay: false });
+  const up = harness.controller._historicalPlayers.get("Drive Up");
+  const down = harness.controller._historicalPlayers.get("Drive Down");
+  const hls = up.hls;
+  const pauses = up.video.pauseCount;
+  const seeks = up.video.currentTimeWrites.length;
+  harness.controller.resumePlayback();
+  await waitForCondition(() => down.lifecycleState === "failed");
+  assert.equal(up.lifecycleState, "participating");
+  assert.strictEqual(up.hls, hls);
+  assert.equal(up.video.pauseCount, pauses);
+  assert.equal(up.video.currentTimeWrites.length, seeks);
+  assert.equal(up.video.paused, false);
+});
+
+test("D5 pending initial Play does not block another selected camera rejoin", async t => {
+  const target = 1800000000;
+  let releaseUp;
+  const upPlay = new Promise(resolve => { releaseUp = resolve; });
+  const harness = createRejoinHarness(target, {
+    playResponder: camera => camera === "Drive Up" ? upPlay : Promise.resolve()
+  });
+  t.after(() => harness.close());
+  const initial = harness.controller.playHistorical(target);
+  await waitForCondition(() => harness.playCalls.length === 1);
+  setReviewTi(harness.controller, target + 6);
+  await harness.controller.evaluateHistoricalAvailability();
+  const state = harness.controller._historicalPlayers.get("Drive Down").lifecycleState;
+  releaseUp();
+  await initial;
+  assert.equal(state, "participating");
+});
+
+test("D6 shrinking layout retires removed playback without disturbing retained camera", async t => {
+  const harness = createHistoricalHarness({ now: () => 0 });
+  t.after(() => harness.close());
+  await harness.controller.playHistorical(1800000000);
+  const up = harness.controller._historicalPlayers.get("Drive Up");
+  const down = harness.controller._historicalPlayers.get("Drive Down");
+  const hls = up.hls;
+  const pauses = up.video.pauseCount;
+  const seeks = up.video.currentTimeWrites.length;
+  harness.controller.setReviewLayout("1x1");
+  assert.equal(harness.controller.state.selectedCameraNames.includes("Drive Down"), false);
+  assert.equal(down.video.paused, true);
+  assert.equal(down.hls, null);
+  assert.equal(harness.controller._historicalPlayers.has("Drive Down"), false);
+  assert.strictEqual(up.hls, hls);
+  assert.equal(up.video.pauseCount, pauses);
+  assert.equal(up.video.currentTimeWrites.length, seeks);
+  assert.equal(up.video.paused, false);
+});
+
+test("D3 Play and Pause during explicit placement override captured intent", async t => {
+  for (const play of [true, false]) {
+    const deferredSeek = new Set();
+    const harness = createHistoricalHarness({ now: () => 0, deferredSeek });
+    t.after(() => harness.close());
+    await harness.controller.playHistorical(1800000000, { autoplay: false });
+    deferredSeek.add("Drive Up"); deferredSeek.add("Drive Down");
+    const placement = harness.controller.seekHistoricalToEpoch(1800000010, { autoplay: !play });
+    await waitForCondition(() => harness.mediaControls.every(control => control.video.currentTimeWrites.length === 2));
+    assert.equal(play ? harness.controller.resumePlayback() : harness.controller.pausePlayback(), true);
+    harness.mediaControls.forEach(control => control.completeSeek());
+    await placement;
+    assert.equal(harness.controller.clock.running, play);
+    assert.ok([...harness.controller._historicalPlayers.values()].every(player => player.video.paused === !play));
+  }
+});
+
+test("D4 obsolete resume rejection cannot retire a newer paused presentation", async t => {
+  let reject;
+  const pending = new Promise((_, fail) => { reject = fail; });
+  const harness = createHistoricalHarness({ now: () => 0,
+    playResponder: camera => camera === "Drive Down" ? pending : Promise.resolve() });
+  t.after(() => harness.close());
+  await harness.controller.playHistorical(1800000000, { autoplay: false });
+  harness.controller.resumePlayback();
+  await harness.controller.seekHistoricalToEpoch(1800000030, { autoplay: false });
+  const down = harness.controller._historicalPlayers.get("Drive Down");
+  const hls = down.hls;
+  const timing = down.timing;
+  reject(new Error("obsolete Play rejection"));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.strictEqual(down.hls, hls);
+  assert.strictEqual(down.timing, timing);
+  assert.equal(down.lifecycleState, "participating");
+  assert.equal(down.video.paused, true);
+});
+
+test("D5 initial Play timeout is bounded and leaves a healthy peer untouched", async t => {
+  let release;
+  const pending = new Promise(resolve => { release = resolve; });
+  const harness = createHistoricalHarness({ now: () => 0, mediaReadyTimeoutMs: 100,
+    playResponder: camera => camera === "Drive Down" ? pending : Promise.resolve() });
+  t.after(() => harness.close());
+  const initial = harness.controller.playHistorical(1800000000);
+  await waitForCondition(() => harness.playCalls.length === 2);
+  const up = harness.controller._historicalPlayers.get("Drive Up");
+  const down = harness.controller._historicalPlayers.get("Drive Down");
+  const hls = up.hls;
+  const pauses = up.video.pauseCount;
+  const seeks = up.video.currentTimeWrites.length;
+  await initial;
+  assert.equal(down.lifecycleState, "failed");
+  assert.equal(down.boundaryReason, "play_timeout");
+  assert.equal(up.lifecycleState, "participating");
+  assert.strictEqual(up.hls, hls);
+  assert.equal(up.video.pauseCount, pauses);
+  assert.equal(up.video.currentTimeWrites.length, seeks);
+  assert.equal(up.video.paused, false);
+  release();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(down.lifecycleState, "failed");
+  assert.equal(down.hls, null);
+});
+
+test("D6 obsolete preparation cannot restore a camera removed by layout shrink", async t => {
+  const target = 1800000000;
+  let release;
+  let requested = false;
+  const gate = new Promise(resolve => { release = resolve; });
+  const harness = createRejoinHarness(target, { presentationResponder: message => {
+    const result = presentationPrepared(message.camera, message.target - 20, message.target);
+    if (message.camera === "drive_down") { requested = true; return gate.then(() => result); }
+    return Promise.resolve(result);
+  }});
+  t.after(() => harness.close());
+  await harness.controller.playHistorical(target);
+  setReviewTi(harness.controller, target + 6);
+  const down = harness.controller._historicalPlayers.get("Drive Down");
+  const join = harness.controller.evaluateHistoricalAvailability();
+  await waitForCondition(() => requested);
+  harness.controller.setReviewLayout("1x1");
+  release();
+  await join;
+  assert.equal(harness.controller._historicalPlayers.has("Drive Down"), false);
+  assert.equal(down.hls, null);
+  assert.equal(down.timing, undefined);
+  assert.equal(harness.playCalls.some(call => call.camera === "Drive Down"), false);
 });
