@@ -3573,6 +3573,46 @@ test("Review Historical badges retain the configured corner and active presentat
   assert.equal(harness.controller.clock.running, true);
 });
 
+test("Review hides the video badge only while no recording is actually displayed", async t => {
+  const target = 1800000000;
+  const harness = createHistoricalHarness({
+    availabilityResponder: message => Promise.resolve({
+      camera: message.camera,
+      requested_start: message.start,
+      requested_end: message.end,
+      coverage: message.camera === "drive_down" ? [] :
+        [{ start: message.start, end: message.end }]
+    })
+  });
+  t.after(() => harness.close());
+  harness.window.HTMLCanvasElement.prototype.getContext = () => ({ drawImage() {} });
+  const badge = name => harness.root.querySelector(
+    `.review-camera-panel[data-camera="${name}"] .review-camera-presentation-kind`
+  );
+  assert.equal(badge("Drive Up").textContent, "Live");
+  assert.equal(badge("Drive Up").hidden, false);
+
+  await harness.controller.playHistorical(target, { autoplay: false });
+  const missing = harness.controller._historicalPlayers.get("Drive Down");
+  assert.equal(missing.statusElement.textContent, "No recording at this time.");
+  assert.equal(missing.statusElement.hidden, false);
+  assert.equal(badge("Drive Down").textContent, "");
+  assert.equal(badge("Drive Down").hidden, true);
+  assert.equal(badge("Drive Up").textContent, "Historical");
+  assert.equal(badge("Drive Up").hidden, false);
+
+  const up = harness.controller._historicalPlayers.get("Drive Up");
+  harness.mediaControls.find(control => control.camera === "Drive Up").emitFrame();
+  harness.controller.leaveHistoricalCamera(up, "authoritative_recording_gap", target + 10);
+  assert.equal(up.statusElement.hidden, true);
+  assert.equal(badge("Drive Up").textContent, "Ended");
+  assert.equal(badge("Drive Up").hidden, false);
+
+  harness.controller.returnToLive();
+  assert.equal(badge("Drive Up").textContent, "Live");
+  assert.equal(badge("Drive Up").hidden, false);
+});
+
 test("Gate 1 identity diagnostics are bounded to sanitized stable identifiers", async t => {
   const harness = createHistoricalHarness();
   t.after(() => harness.close());

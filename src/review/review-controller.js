@@ -2782,6 +2782,7 @@ export class ReviewController {
     presentationKind.className = "review-camera-presentation-kind";
     presentationKind.textContent = this._presentationMode === "live"
       ? "Live" : this.historicalVideoStateBadge(this._historicalPlayers.get(camera.name));
+    presentationKind.hidden = !presentationKind.textContent;
     this.positionVideoStateBadge(presentationKind);
     const close = this._document.createElement("button");
     close.type = "button";
@@ -2842,6 +2843,8 @@ export class ReviewController {
   }
 
   historicalVideoStateBadge(player) {
+    if (player?.message === "No recording at this time." &&
+        player.statusElement?.hidden === false) return "";
     return player?.holdStartedAtMs != null &&
       Number.isFinite(player.heldFrameEpoch) && player.heldCanvas?.hidden === false
       ? "Ended" : "Historical";
@@ -2850,7 +2853,10 @@ export class ReviewController {
   updateHistoricalVideoStateBadge(player) {
     const badge = this._mediaPanels.get(player.camera.name)
       ?.querySelector(".review-camera-presentation-kind");
-    if (badge) badge.textContent = this.historicalVideoStateBadge(player);
+    if (badge) {
+      badge.textContent = this.historicalVideoStateBadge(player);
+      badge.hidden = !badge.textContent;
+    }
   }
 
   reconcileHistoricalAssignments() {
@@ -3290,6 +3296,7 @@ export class ReviewController {
       player.statusElement.classList.toggle("unavailable", unavailable);
       player.statusElement.classList.toggle("held", player.holdStartedAtMs != null);
     }
+    this.updateHistoricalVideoStateBadge(player);
   }
 
   recordCameraBoundary(player, kind, details = {}) {
