@@ -33,6 +33,9 @@ Object.defineProperty(window, "nvrDiagnostics", {
     getHistoricalSyncReports() {
       return soleHistoricalSyncController()?.getHistoricalSyncReports() ?? [];
     },
+    getRecentReviewFailures() {
+      return soleHistoricalSyncController()?.getRecentReviewFailures() ?? [];
+    },
     getSceneExperimentReport() {
       return soleHistoricalSyncController()?.getSceneExperimentReport() ?? null;
     },

@@ -31,6 +31,7 @@ test("global historical sync diagnostics address only the sole connected card", 
   assert.equal(api.enableHistoricalSync(), false);
   assert.equal(api.getLatestHistoricalSyncReport(), null);
   assert.equal(api.getHistoricalSyncReports().length, 0);
+  assert.equal(api.getRecentReviewFailures().length, 0);
   assert.equal(api.disableHistoricalSync(), false);
   assert.equal(api.getContinuousHandoffPrototypeReport(), null);
   assert.throws(
@@ -52,6 +53,15 @@ test("global historical sync diagnostics address only the sole connected card", 
   const latest = api.getLatestHistoricalSyncReport();
   assert.equal(latest.selectedEpoch, 1800000000);
   assert.equal(api.getHistoricalSyncReports().length, 1);
+  controller.recordReviewFailure({
+    camera: { name: "Front", entity: "camera.private", password: "fixture-only-password" },
+    requestId: 1, lifecycleState: "preparing", lifecycleRevision: 0,
+    reviewStage: "prepare", reviewLanding: "not_started", reviewPlay: "not_attempted"
+  }, { reason: "camera_prepare_failed", targetEpoch: 1800000000 });
+  const failures = api.getRecentReviewFailures();
+  assert.equal(failures[0].camera, "Front");
+  failures[0].camera = "mutated";
+  assert.equal(api.getRecentReviewFailures()[0].camera, "Front");
   assert.equal(JSON.stringify(api.getHistoricalSyncReports()).includes("fixture-only-password"), false);
   assert.equal(JSON.stringify(api.getHistoricalSyncReports()).includes('"auth"'), false);
   latest.cameras.Front.status = "mutated";
@@ -81,6 +91,7 @@ test("global historical sync diagnostics address only the sole connected card", 
   const second = harness.createCard();
   assert.throws(() => api.enableHistoricalSync(), /exactly one connected/);
   assert.throws(() => api.getLatestHistoricalSyncReport(), /exactly one connected/);
+  assert.throws(() => api.getRecentReviewFailures(), /exactly one connected/);
   assert.throws(() => api.getContinuousHandoffPrototypeReport(), /exactly one connected/);
   second.remove();
   assert.equal(api.enableHistoricalSync(), true);
@@ -89,6 +100,7 @@ test("global historical sync diagnostics address only the sole connected card", 
   assert.equal(api.enableHistoricalSync(), false);
   assert.equal(api.getLatestHistoricalSyncReport(), null);
   assert.equal(api.getHistoricalSyncReports().length, 0);
+  assert.equal(api.getRecentReviewFailures().length, 0);
   assert.equal(api.getContinuousHandoffPrototypeReport(), null);
 });
 

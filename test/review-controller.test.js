@@ -4577,8 +4577,9 @@ test("all unavailable cameras retain cells and never start an empty historical c
   assert.match(harness.controller._historicalStatus, /No recording/);
   assert.equal(harness.root.querySelector(".review-historical-state"), null);
   assert.equal(harness.root.querySelectorAll(".review-camera-panel").length, 2);
-  assert.ok([...harness.root.querySelectorAll(".review-camera-presentation-kind")]
-    .every(badge => badge.textContent === "Historical"));
+  const badges = [...harness.root.querySelectorAll(".review-camera-presentation-kind")];
+  assert.equal(badges.length, 2);
+  assert.ok(badges.every(badge => badge.textContent === "" && badge.hidden));
   assert.deepEqual(harness.controller.state.reviewAssignments, assignments);
   assert.equal(harness.root.querySelector(".review-back-ten").disabled, true);
   assert.equal(harness.root.querySelector(".review-play").disabled, false);
@@ -6259,4 +6260,320 @@ test("D6 obsolete preparation cannot restore a camera removed by layout shrink",
   assert.equal(down.hls, null);
   assert.equal(down.timing, undefined);
   assert.equal(harness.playCalls.some(call => call.camera === "Drive Down"), false);
+});
+
+test("Review failure ledger captures media and held-frame facts before destructive cleanup", async t => {
+  const harness = createHistoricalHarness();
+  t.after(() => harness.close());
+  harness.controller.setDebug(false);
+  await harness.controller.playHistorical(1800000000, { autoplay: false });
+  assert.equal(harness.controller.getLatestHistoricalSyncReport(), null);
+  const player = harness.controller._historicalPlayers.get("Drive Up");
+  const video = player.video;
+  const hls = player.hls;
+  Object.defineProperty(video, "error", { configurable: true, value: { code: 3,
+    message: "https://secret.example/token=private" } });
+  player.heldCanvas = harness.window.document.createElement("canvas");
+  player.heldCanvas.hidden = true;
+  player.heldFrameEpoch = 1800000000.25;
+  for (const handler of hls.handlers.get(hls.constructor.Events.ERROR) ?? []) {
+    handler("error", { type: "networkError", details: "fragLoadError", fatal: false,
+      response: { code: 503, body: "token=private" }, url: "https://secret.example" });
+  }
+  assert.equal(harness.controller.leaveHistoricalCamera(player, "unexpected_media_end",
+    1800000001, 1800000000.25, "failed"), true);
+  const record = harness.controller.getRecentReviewFailures()
+    .find(item => item.reason === "unexpected_media_end");
+  assert.equal(hls.destroyCount, 1);
+  assert.equal(player.hls, null);
+  assert.equal(record.video.errorCode, 3);
+  assert.equal(record.video.seekable, true);
+  assert.equal(record.hasTimingMap, true);
+  assert.equal(record.validHeldFrame, true);
+  assert.equal(record.frameEpoch, 1800000000.25);
+  assert.deepEqual(record.hls, { type: "networkError", detail: "fragLoadError",
+    fatal: false, httpStatus: 503 });
+  assert.equal(JSON.stringify(record).includes("secret"), false);
+});
+
+test("Review failure ledger keeps coverage, VOD discrepancy, exhaustion, and Play failure distinct", async t => {
+  const cases = [
+    { options: { availabilityResponder: message => Promise.resolve({ camera: message.camera,
+      requested_start: message.start, requested_end: message.end, coverage: [] }) },
+    reason: "authoritative_recording_gap", outcome: "no_coverage", coverage: "gap" },
+    { options: { unavailable: new Set(["drive_down"]) },
+    reason: "prepare_reported_no_recording", outcome: "failure", coverage: "covered" },
+    { options: { presentationResponder: message => message.camera === "drive_down"
+      ? Promise.reject(new Error("synthetic preparation failure"))
+      : Promise.resolve(presentationPrepared(message.camera, message.target - 21, message.target)) },
+    reason: "camera_prepare_failed", outcome: "failure", coverage: "covered" },
+    { options: { playResponder: camera => camera === "Drive Down"
+      ? Promise.reject(new Error("private token in rejected Play")) : Promise.resolve() },
+    reason: "play_rejected", outcome: "failure", coverage: "covered" }
+  ];
+  for (const item of cases) {
+    const harness = createHistoricalHarness(item.options);
+    t.after(() => harness.close());
+    harness.controller.setDebug(false);
+    await harness.controller.playHistorical(1800000000);
+    const record = harness.controller.getRecentReviewFailures()
+      .find(entry => entry.camera === "Drive Down" && entry.reason === item.reason);
+    assert.ok(record, item.reason);
+    assert.equal(record.outcome, item.outcome);
+    assert.equal(record.coverage, item.coverage);
+    if (item.outcome === "no_coverage") {
+      assert.equal(harness.controller.getRecentReviewFailures().filter(entry =>
+        entry.camera === "Drive Down" && entry.reason === item.reason).length, 1);
+    }
+    assert.equal(JSON.stringify(record).includes("private token"), false);
+  }
+  const harness = createHistoricalHarness();
+  t.after(() => harness.close());
+  await harness.controller.playHistorical(1800000000, { autoplay: false });
+  const player = harness.controller._historicalPlayers.get("Drive Up");
+  harness.controller.leaveHistoricalCamera(player, "continuous_presentation_exhausted",
+    1800000010, null);
+  const record = harness.controller.getRecentReviewFailures()
+    .find(entry => entry.reason === "continuous_presentation_exhausted");
+  assert.equal(record.outcome, "normal_terminal");
+  assert.equal(record.coverage, "covered");
+});
+
+test("Review failure ledger distinguishes signing, manifest, seekability, seek, and landing exits", async t => {
+  const target = 1800000000;
+  const cases = [
+    { reason: "manifest_sign_failure", setup: harness => {
+      harness.controller.signManifest = async player => {
+        if (player.camera.name === "Drive Down") throw new Error("private signed URL");
+        return "/fixture.m3u8";
+      };
+    } },
+    { reason: "manifest_failure", setup: async harness => {
+      const Base = await harness.controller._loadHls();
+      harness.controller._loadHls = async () => class extends Base {
+        loadSource(source) {
+          if (this.video.closest(".review-camera-panel")?.dataset.camera !== "Drive Down") {
+            super.loadSource(source);
+            return;
+          }
+          for (const handler of this.handlers.get(Base.Events.ERROR) ?? []) {
+            handler(Base.Events.ERROR, { fatal: true, type: "networkError",
+              details: "manifestLoadError", response: { code: 503,
+                body: "token=private" } });
+          }
+        }
+      };
+    } },
+    { reason: "seekable_or_media_readiness_failure", options: {
+      mediaReadyTimeoutMs: 100,
+      scheduleInitialDeadline: (callback, delay) => {
+        const timer = setTimeout(callback, delay * 5);
+        return () => clearTimeout(timer);
+      }
+    }, setup: async harness => {
+      const Base = await harness.controller._loadHls();
+      harness.controller._loadHls = async () => class extends Base {
+        attachMedia(video) {
+          super.attachMedia(video);
+          if (video.closest(".review-camera-panel")?.dataset.camera === "Drive Down") {
+            Object.defineProperty(video, "seekable", { configurable: true,
+              value: { length: 0 } });
+          }
+        }
+      };
+    } },
+    { reason: "mapped_seek_failure", setup: harness => {
+      const original = harness.controller.seekHistoricalPlayer;
+      harness.controller.seekHistoricalPlayer = async function(player, ...args) {
+        if (player.camera.name === "Drive Down") {
+          player.reviewStage = "seek";
+          throw new Error("private seek failure");
+        }
+        return original.call(this, player, ...args);
+      };
+    } },
+    { reason: "initial_landing_deadline", options: {
+      deferredFrame: new Set(["Drive Down"]), mediaReadyTimeoutMs: 100
+    }, setup: () => {} }
+  ];
+  for (const item of cases) {
+    const harness = createHistoricalHarness(item.options);
+    t.after(() => harness.close());
+    harness.controller.setDebug(false);
+    await item.setup(harness);
+    await harness.controller.playHistorical(target, { autoplay: false });
+    const record = harness.controller.getRecentReviewFailures()
+      .find(entry => entry.camera === "Drive Down" && entry.reason === item.reason);
+    assert.ok(record, item.reason);
+    assert.equal(record.outcome, "failure");
+    assert.equal(record.coverage, "covered");
+    assert.equal(JSON.stringify(record).includes("private"), false);
+    if (item.reason === "manifest_failure") {
+      assert.deepEqual(record.hls, { type: "networkError", detail: "manifestLoadError",
+        fatal: true, httpStatus: 503 });
+    }
+    if (item.reason === "initial_landing_deadline") {
+      assert.equal(record.landing, "pending");
+    }
+  }
+});
+
+test("Review failure ledger retains initial deadline stages without sync reports", async t => {
+  const never = new Promise(() => {});
+  const cases = [
+    { reason: "initial_availability_deadline", options: {
+      mediaReadyTimeoutMs: 100,
+      availabilityResponder: message => message.camera === "drive_down" ? never :
+        Promise.resolve({ camera: message.camera, requested_start: message.start,
+          requested_end: message.end, coverage: [{ start: message.start, end: message.end }] })
+    } },
+    { reason: "initial_preparation_deadline", options: {
+      mediaReadyTimeoutMs: 100,
+      presentationResponder: message => message.camera === "drive_down" ? never :
+        Promise.resolve(presentationPrepared(message.camera, message.target - 21, message.target))
+    } },
+    { reason: "post_seek_playability_failure", options: {
+      mediaReadyTimeoutMs: 100,
+      noRvfc: new Set(["Drive Down"]), deferredPlayable: new Set(["Drive Down"])
+    } }
+  ];
+  for (const item of cases) {
+    const harness = createHistoricalHarness(item.options);
+    t.after(() => harness.close());
+    harness.controller.setDebug(false);
+    await harness.controller.playHistorical(1800000000, { autoplay: false });
+    assert.equal(harness.controller.getLatestHistoricalSyncReport(), null);
+    const record = harness.controller.getRecentReviewFailures()
+      .find(entry => entry.camera === "Drive Down" && entry.reason === item.reason);
+    assert.ok(record, item.reason);
+    assert.equal(record.outcome, "failure");
+  }
+});
+
+test("Review failure ledger bounds, deduplicates, detaches, and allowlists records", () => {
+  const controller = new ReviewController({ wallClock: () => 1000 });
+  const player = { camera: { name: "Drive Up", entity: "camera.secret", password: "private" },
+    requestId: 1, lifecycleRevision: 0, lifecycleState: "preparing",
+    reviewStage: "prepare", reviewLanding: "not_started", reviewPlay: "not_attempted",
+    reviewHlsError: { type: "https://secret", detail: "token=private", fatal: true,
+      httpStatus: 999 }, video: { readyState: 100, seekable: { length: 0 },
+      error: { code: 77, message: "secret" } } };
+  controller.recordReviewFailure(player, { reason: "camera_prepare_failed", targetEpoch: 1800000000 });
+  controller.recordReviewFailure(player, { reason: "camera_prepare_failed", targetEpoch: 1800000000 });
+  assert.equal(controller.getRecentReviewFailures().length, 1);
+  player.lifecycleRevision = 1;
+  controller.recordReviewFailure(player, { reason: "camera_prepare_failed", targetEpoch: 1800000001 });
+  assert.equal(controller.getRecentReviewFailures().length, 2);
+  for (let requestId = 2; requestId <= 18; requestId++) {
+    player.requestId = requestId;
+    controller.recordReviewFailure(player, { reason: "camera_prepare_failed",
+      targetEpoch: 1800000000 + requestId });
+  }
+  assert.equal(controller._reviewFailures.length, 16);
+  assert.equal(controller.getRecentReviewFailures()[0].requestId, 18);
+  for (let requestId = 20; requestId <= 29; requestId++) {
+    player.requestId = requestId;
+    controller.recordReviewFailure(player, { reason: "authoritative_recording_gap",
+      outcome: "no_coverage", stage: "availability", targetEpoch: 1800000000 + requestId });
+  }
+  assert.equal(controller._reviewOutcomes.length, 8);
+  assert.equal(controller._reviewFailures.length, 16);
+  const records = controller.getRecentReviewFailures();
+  assert.equal(records.length, 24);
+  assert.equal(records[0].requestId, 29);
+  assert.deepEqual(records.at(-1).hls, { type: null, detail: null, fatal: true,
+    httpStatus: null });
+  assert.equal(records.at(-1).video.errorCode, null);
+  assert.equal(records.at(-1).video.readyState, null);
+  assert.equal(JSON.stringify(records).includes("secret"), false);
+  records[0].video.readyState = 4;
+  assert.equal(controller.getRecentReviewFailures()[0].video.readyState, null);
+});
+
+test("Review fatal Hls and media errors are observational and once per presentation", async t => {
+  const harness = createHistoricalHarness();
+  t.after(() => harness.close());
+  harness.controller.setDebug(false);
+  await harness.controller.playHistorical(1800000000);
+  const player = harness.controller._historicalPlayers.get("Drive Up");
+  const hls = player.hls;
+  const video = player.video;
+  const calls = harness.calls.length;
+  const plays = harness.playCalls.length;
+  for (let index = 0; index < 2; index++) {
+    for (const handler of hls.handlers.get(hls.constructor.Events.ERROR) ?? []) {
+      handler("error", { fatal: true, type: "networkError", details: "fragLoadError",
+        response: { code: 404, body: "token=private" } });
+    }
+    video.dispatchEvent(new harness.window.Event("error"));
+  }
+  const records = harness.controller.getRecentReviewFailures();
+  assert.equal(records.filter(record => record.reason === "hls_fatal").length, 1);
+  assert.equal(records.filter(record => record.reason === "media_error").length, 1);
+  assert.equal(player.lifecycleState, "participating");
+  assert.strictEqual(player.hls, hls);
+  assert.strictEqual(player.video, video);
+  assert.equal(harness.calls.length, calls);
+  assert.equal(harness.playCalls.length, plays);
+});
+
+test("Review failure ledger captures resume rejection and retained availability failure", async t => {
+  let rejectPlay = false;
+  let rejectAvailability = false;
+  const harness = createHistoricalHarness({
+    playResponder: camera => rejectPlay && camera === "Drive Down"
+      ? Promise.reject(new Error("private resume rejection")) : Promise.resolve(),
+    availabilityResponder: message => rejectAvailability && message.camera === "drive_up"
+      ? Promise.reject(new Error("private availability failure"))
+      : Promise.resolve({ camera: message.camera, requested_start: message.start,
+        requested_end: message.end, coverage: [{ start: message.start, end: message.end }] })
+  });
+  t.after(() => harness.close());
+  await harness.controller.playHistorical(1800000000, { autoplay: false });
+  const up = harness.controller._historicalPlayers.get("Drive Up");
+  const down = harness.controller._historicalPlayers.get("Drive Down");
+  const upHls = up.hls;
+  rejectAvailability = true;
+  up.availability = null;
+  assert.equal(await harness.controller.reconcileHistoricalCamera(up, 1800000005),
+    "retained_after_availability_failure");
+  const retained = harness.controller.getRecentReviewFailures()
+    .find(record => record.camera === "Drive Up" &&
+      record.outcome === "retained_after_failure");
+  assert.equal(retained.reason, "availability_api_failure");
+  assert.equal(up.lifecycleState, "participating");
+  assert.strictEqual(up.hls, upHls);
+  rejectPlay = true;
+  harness.controller.resumePlayback();
+  await waitForCondition(() => down.lifecycleState === "failed");
+  const play = harness.controller.getRecentReviewFailures()
+    .find(record => record.camera === "Drive Down" && record.reason === "play_rejected");
+  assert.equal(play.play, "rejected");
+  assert.equal(play.stage, "play");
+  assert.equal(up.lifecycleState, "participating");
+});
+
+test("Review failure ledger retains finite exhaustion separately from failed continuation", async t => {
+  let laterFails = false;
+  const harness = createHistoricalHarness({ presentationResponder: message => {
+    if (laterFails && message.camera === "drive_down") {
+      return Promise.reject(new Error("private continuation failure"));
+    }
+    return Promise.resolve(presentationPrepared(message.camera, message.target - 21, message.target));
+  }});
+  t.after(() => harness.close());
+  await harness.controller.playHistorical(1800000000, { autoplay: false });
+  const down = harness.controller._historicalPlayers.get("Drive Down");
+  laterFails = true;
+  assert.equal(harness.controller.continueHistoricalPresentation(down, 1800000010,
+    1800000009.9), true);
+  await waitForCondition(() => down.lifecycleState === "failed" &&
+    harness.controller.getRecentReviewFailures().some(record =>
+      record.camera === "Drive Down" && record.reason === "camera_prepare_failed"));
+  const records = harness.controller.getRecentReviewFailures()
+    .filter(record => record.camera === "Drive Down");
+  assert.equal(records.find(record => record.reason === "continuous_presentation_exhausted")
+    .outcome, "normal_terminal");
+  assert.equal(records.find(record => record.reason === "camera_prepare_failed").outcome,
+    "failure");
 });
