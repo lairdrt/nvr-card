@@ -2714,6 +2714,8 @@ test("Review Save Current View uses the Review capture contract and persists onc
   card.setApplicationMode("review");
   card._reviewController.setSelectedCameraNames(["Front", "Garage"]);
   card._reviewController._desiredReviewRange = { from: 100, to: 200 };
+  card._reviewController.setTimelineZoomSpanSeconds(7200);
+  const zoomedWhen = { ...card._reviewController.state.desiredReviewRange };
   harness.window.prompt = () => "  Investigation  ";
   const beforeWrites = harness.userStateCalls.filter(call => call.type === "frontend/set_user_data").length;
   card.querySelector(".review-saved-views-body .saved-view-save-current").click();
@@ -2722,8 +2724,10 @@ test("Review Save Current View uses the Review capture contract and persists onc
   assert.equal(card._reviewSavedViews.length, 1);
   assert.equal(card._reviewSavedViews[0].name, "Investigation");
   assert.equal(JSON.stringify(card._reviewSavedViews[0].state.when), JSON.stringify({
-    version: 1, kind: "absolute-range", from: 100, to: 200
+    version: 1, kind: "absolute-range", ...zoomedWhen
   }));
+  assert.equal(zoomedWhen.to - zoomedWhen.from, 7200);
+  assert.equal(Object.hasOwn(card._reviewSavedViews[0].state, "zoomSpanSeconds"), false);
   assert.equal(card._savedViews.length, 0);
 });
 
@@ -2745,6 +2749,7 @@ test("Review load uses transactional restore once and does not overwrite the sna
   const controller = card._reviewController;
   controller._desiredReviewRange = { from: 100, to: 200 };
   const saved = card.saveReviewViewAs("Saved Review", controller.captureReviewViewState());
+  controller.setTimelineZoomSpanSeconds(7200);
   controller._reviewLayout = "2x2";
   controller._reviewAssignments = ["Garage", null, ...new Array(14).fill(null)];
   controller.syncSelectionFromAssignments();
@@ -2758,6 +2763,8 @@ test("Review load uses transactional restore once and does not overwrite the sna
   card.querySelector(".review-saved-views-body .saved-view-load").click();
   assert.equal(restoreCount, 1);
   assert.equal(controller._reviewLayout, saved.state.layout);
+  assert.equal(JSON.stringify(controller.state.desiredReviewRange),
+    JSON.stringify({ from: saved.state.when.from, to: saved.state.when.to }));
   assert.equal(JSON.stringify(card._reviewSavedViews[0].state), originalState);
   assert.equal(card._savedViews.length, 0);
 });

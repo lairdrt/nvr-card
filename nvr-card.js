@@ -3764,11 +3764,13 @@ class NVRCard extends HTMLElement {
 
       .review-time-truth {
         display: flex;
-        flex: 0 0 34px;
+        flex: 0 0 66px;
         min-width: 0;
-        padding: 0 10px;
+        padding: 5px 10px;
         align-items: center;
         justify-content: center;
+        flex-direction: column;
+        gap: 4px;
         border-top: 1px solid #26313b;
         background: #11161c;
         box-sizing: border-box;
@@ -3780,6 +3782,24 @@ class NVRCard extends HTMLElement {
         min-width: 0;
         color: #e4ebef;
         font-weight: 600;
+      }
+
+      .review-timeline-zoom {
+        display: flex;
+        width: 100%;
+        min-width: 0;
+        align-items: center;
+        gap: 5px;
+        font-size: 11px;
+        white-space: nowrap;
+      }
+
+      .review-timeline-zoom-input {
+        flex: 1 1 auto;
+        min-width: 40px;
+        height: 16px;
+        margin: 0;
+        accent-color: #69a7d0;
       }
 
       .review-placeholder {

@@ -13,6 +13,8 @@ const REVIEW_HLS_PROMISE = Symbol.for("nvr.review.hlsScript");
 const REVIEW_KNOWN_TARGET = "2026-09-08T14:00:00-07:00";
 const REVIEW_SLOT_CAPACITY = 16;
 const REVIEW_DEFAULT_RANGE_SECONDS = 3600;
+const REVIEW_MIN_ZOOM_SECONDS = 3600;
+const REVIEW_MAX_ZOOM_SECONDS = 24 * 3600;
 const REVIEW_CAMERA_DRAG_TYPE = "application/x-nvr-camera";
 const REVIEW_LAYOUT_DRAG_TYPE = "application/x-nvr-layout";
 const REVIEW_FILTERS = Object.freeze(["person", "car", "animal", "package"]);
@@ -1618,6 +1620,48 @@ export class ReviewController {
     }
   }
 
+  setTimelineZoomSpanSeconds(seconds) {
+    if (!Number.isFinite(seconds)) return false;
+    if (this._timelineDrag) {
+      this.updateTimelineZoomControl();
+      return false;
+    }
+    this.ensureReviewQuery();
+    const span = Math.min(REVIEW_MAX_ZOOM_SECONDS,
+      Math.max(REVIEW_MIN_ZOOM_SECONDS, seconds));
+    const anchor = Number.isFinite(this.reviewPosition)
+      ? this.reviewPosition : this._desiredReviewRange.to;
+    const to = Math.min(anchor + span / 2, Math.max(anchor, this._wallClock() / 1000));
+    const range = { from: to - span, to };
+    if (range.from === this._desiredReviewRange.from &&
+        range.to === this._desiredReviewRange.to) return false;
+    if (this._historicalPreparing) this.retireHistoricalForReviewEdit();
+    const preserveHistorical = this._presentationMode === "historical";
+    this._whenDraftRange = null;
+    this._desiredReviewRange = { ...range };
+    this._reviewRange = { ...range };
+    this.updateWhenControls();
+    if (preserveHistorical) this._historicalPlaybackRange = { ...range };
+    this.reviewCriteriaChanged({ preserveHistorical });
+    this._displayedReviewQuery = {
+      ...this._displayedReviewQuery, range: { ...range }
+    };
+    this.updateTimelineZoomControl();
+    this.updateRhs();
+    this.updateClockDisplay();
+    return true;
+  }
+
+  updateTimelineZoomControl() {
+    const input = this._root?.querySelector(".review-timeline-zoom-input");
+    if (!input) return;
+    this.ensureReviewRange();
+    const hours = (this._desiredReviewRange.to - this._desiredReviewRange.from) / 3600;
+    input.value = String(Math.min(24, Math.max(1, Math.round(hours))));
+    const label = `${Number(hours.toFixed(2))} ${hours === 1 ? "hour" : "hours"} in When`;
+    input.setAttribute("aria-valuetext", label);
+  }
+
   cancelScheduledReviewQuery() {
     if (this._queryTimer === null) return;
     const view = this._root?.ownerDocument?.defaultView ?? globalThis;
@@ -1631,9 +1675,9 @@ export class ReviewController {
     }
   }
 
-  reviewCriteriaChanged() {
+  reviewCriteriaChanged({ preserveHistorical = false } = {}) {
     this.ensureReviewRange();
-    this._reviewRequestId += 1;
+    if (!preserveHistorical) this._reviewRequestId += 1;
     this._desiredReviewQuery = this.getDesiredReviewQuery();
     const generation = ++this._queryGeneration;
     this.cancelScheduledReviewQuery();
@@ -2336,6 +2380,13 @@ export class ReviewController {
     const clock = this._document.createElement("time");
     clock.className = "review-clock-display";
     timeTruth.appendChild(clock);
+    const zoom = this._document.createElement("label");
+    zoom.className = "review-timeline-zoom";
+    zoom.innerHTML = '<span class="review-timeline-zoom-end">1h</span><input class="review-timeline-zoom-input" type="range" min="1" max="24" step="1" aria-label="Review investigation duration"><span class="review-timeline-zoom-end">24h</span>';
+    zoom.querySelector("input").addEventListener("input", event => {
+      this.setTimelineZoomSpanSeconds(Number(event.target.value) * 3600);
+    });
+    timeTruth.appendChild(zoom);
     rhs.append(modes, rhsContent, timeTruth);
     product.append(controls, media, rhs);
     this._root.appendChild(product);
@@ -2584,6 +2635,7 @@ export class ReviewController {
 
   updateRhs() {
     if (!this._root) return;
+    this.updateTimelineZoomControl();
     this.updateEventNavigationControls();
     if (this._timelineDrag) {
       const current = this._displayedReviewQuery;
@@ -2648,7 +2700,8 @@ export class ReviewController {
       return `<div class="review-timeline-lane-heading" style="--review-camera-color:${lane.color}" title="${name}"><span>${name}</span></div>`;
     }).join("");
     const laneBodies = lanes.map(lane => {
-      const markers = this._timeline.items.filter(item => item.camera_id === lane.cameraId)
+      const markers = this._timeline.items.filter(item => item.camera_id === lane.cameraId &&
+        item.start_time <= range.to && (item.end_time ?? item.start_time) >= range.from)
         .map(item => {
           const geometry = reviewTimelineMarkerGeometry(item, range);
           if (!geometry) return "";
@@ -2658,7 +2711,13 @@ export class ReviewController {
             ? ` data-camera-id="${camera}" data-start-epoch="${geometry.startEpoch}" data-end-epoch="${geometry.endEpoch}"`
             : "";
           const point = geometry.height === 0 ? " point" : "";
-          return `<div class="review-timeline-marker${point}" style="top:${geometry.top * 100}%;height:${geometry.height * 100}%;--review-camera-color:${lane.color}"${diagnostics} title="${type}"></div>`;
+          const top = geometry.height > 0
+            ? `min(${geometry.top * 100}%, calc(100% - 1px))`
+            : `${geometry.top * 100}%`;
+          const height = geometry.height > 0
+            ? `max(${geometry.height * 100}%, 1px)`
+            : "0%";
+          return `<div class="review-timeline-marker${point}" style="top:${top};height:${height};--review-camera-color:${lane.color}"${diagnostics} title="${type}"></div>`;
         }).join("");
       return `<div class="review-timeline-lane" data-camera-id="${escapeViewerHtml(lane.cameraId ?? "")}" style="--review-camera-color:${lane.color}">${markers}</div>`;
     }).join("");

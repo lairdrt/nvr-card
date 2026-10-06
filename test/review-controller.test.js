@@ -1193,6 +1193,162 @@ test("Timeline coordinates map newest/top to oldest/bottom for any height", () =
   assert.equal(reviewTimelineEpochFromCoordinate(100, 100, 0, range), null);
 });
 
+test("timeline zoom commits 1h, 4h, and 24h When ranges around absolute TI", async t => {
+  const wall = 1800000000;
+  const original = { from: wall - 24 * 3600, to: wall + 24 * 3600 };
+  const harness = createHistoricalHarness({ wallClockMs: wall * 1000, initialReviewRange: original });
+  t.after(() => harness.close());
+  const controller = harness.controller;
+  const ti = wall - 10000;
+  controller._reviewPosition = ti;
+  controller.updateClockDisplay();
+  const slider = harness.root.querySelector(".review-timeline-zoom-input");
+  assert.equal(slider.min, "1");
+  assert.equal(slider.max, "24");
+  assert.equal(harness.root.querySelector(".review-timeline-zoom-value"), null);
+  const cameras = controller.state.displayedReviewQuery.cameraNames;
+  const prepareCount = harness.calls.filter(call => call.type === "frigate_max/v1/vod/prepare").length;
+  for (const hours of [1, 4, 24]) {
+    slider.value = String(hours);
+    slider.dispatchEvent(new harness.window.Event("input", { bubbles: true }));
+    const to = Math.min(ti + hours * 1800, wall);
+    const expected = { from: to - hours * 3600, to };
+    assert.deepEqual(controller.state.desiredReviewRange, expected);
+    assert.deepEqual(controller.state.displayedReviewQuery.range, expected);
+    assert.deepEqual(controller.getWhenControlRange(), expected);
+    assert.equal(controller.reviewPosition, ti);
+    assert.deepEqual(controller.state.displayedReviewQuery.cameraNames, cameras);
+    const ticks = [...harness.root.querySelectorAll(".review-timeline-tick")];
+    assert.equal(ticks[0].textContent, formatNvrClockTime(expected.to, controller.timeZone));
+    assert.equal(ticks.at(-1).textContent, formatNvrClockTime(expected.from, controller.timeZone));
+  }
+  await controller.flushScheduledReviewQuery();
+  assert.equal(harness.calls.filter(call => call.type === "frigate_max/v1/vod/prepare").length, prepareCount);
+  assert.deepEqual(controller.state.timeline.queryRange, controller.state.desiredReviewRange);
+});
+
+test("timeline zoom clamps at now without moving TI and leaves shorter manual When ranges valid", t => {
+  const wall = 1800000000;
+  const short = { from: wall - 900, to: wall };
+  const harness = createHistoricalHarness({ wallClockMs: wall * 1000, initialReviewRange: short });
+  t.after(() => harness.close());
+  const controller = harness.controller;
+  assert.deepEqual(controller.state.displayedReviewQuery.range, short);
+  assert.equal(harness.root.querySelector(".review-timeline-zoom-input").value, "1");
+  controller.setTimelineZoomSpanSeconds(3600);
+  assert.deepEqual(controller.state.desiredReviewRange, { from: wall - 3600, to: wall });
+  assert.equal(controller.reviewPosition, wall);
+  controller._reviewPosition = wall - 900;
+  controller.setTimelineZoomSpanSeconds(4 * 3600);
+  assert.deepEqual(controller.state.desiredReviewRange, { from: wall - 4 * 3600, to: wall });
+  assert.equal(controller.reviewPosition, wall - 900);
+  assert.equal(controller.clock.running, false);
+});
+
+test("timeline click, drag and markers follow the zoomed When range", async t => {
+  const wall = 1800000000;
+  const range = { from: wall - 7200, to: wall + 7200 };
+  const event = { camera_id: "drive_up", start_time: wall - 600, end_time: wall - 300, type: "person" };
+  const outside = { camera_id: "drive_up", start_time: wall - 6000, end_time: wall - 5900, type: "person" };
+  const harness = createHistoricalHarness({
+    wallClockMs: wall * 1000, initialReviewRange: range, reviewEvents: [event, outside]
+  });
+  t.after(() => harness.close());
+  const controller = harness.controller;
+  await controller.refreshReviewQuery();
+  controller.setTimelineZoomSpanSeconds(3600);
+  const visible = { from: wall - 3600, to: wall };
+  assert.deepEqual(controller.state.displayedReviewQuery.range, visible);
+  const markers = [...harness.root.querySelectorAll(".review-timeline-marker")];
+  assert.equal(markers.length, 1);
+  assert.match(markers[0].getAttribute("style"), new RegExp(
+    `top:min\\(${reviewTimelineMarkerGeometry(event, visible).top * 100}%, calc\\(100% - 1px\\)\\)`
+  ));
+  assert.equal(harness.root.querySelector(".review-timeline-cursor").style.top, "0%");
+  const axis = harness.root.querySelector(".review-timeline-axis");
+  axis.getBoundingClientRect = () => ({ top: 100, height: 400 });
+  const selected = [];
+  controller.selectTimelineTime = epoch => { selected.push(epoch); return Promise.resolve(true); };
+  axis.dispatchEvent(new harness.window.MouseEvent("click", { bubbles: true, button: 0, clientY: 200 }));
+  assert.equal(selected[0], wall - 900);
+  const handle = harness.root.querySelector(".review-timeline-handle");
+  handle.dispatchEvent(new harness.window.PointerEvent("pointerdown", {
+    bubbles: true, pointerId: 88, button: 0, clientY: 100
+  }));
+  handle.dispatchEvent(new harness.window.PointerEvent("pointermove", {
+    bubbles: true, pointerId: 88, clientY: 400
+  }));
+  assert.equal(controller.reviewPosition, wall - 2700);
+  handle.dispatchEvent(new harness.window.PointerEvent("pointerup", {
+    bubbles: true, pointerId: 88, button: 0, clientY: 400
+  }));
+  assert.equal(selected[1], wall - 2700);
+  assert.deepEqual(controller.state.displayedReviewQuery.range, visible);
+});
+
+test("paused and playing zoom preserve active historical players and transport intent", async t => {
+  const wall = 1800000000;
+  const harness = createHistoricalHarness({
+    wallClockMs: wall * 1000, now: () => 1000,
+    initialReviewRange: { from: wall - 7200, to: wall + 7200 }
+  });
+  t.after(() => harness.close());
+  const controller = harness.controller;
+  await controller.selectTimelineTime(wall - 60);
+  controller.pausePlayback();
+  assert.equal(controller.clock.running, false);
+  const players = [...controller._historicalPlayers.values()];
+  const requestId = controller._reviewRequestId;
+  const prepares = harness.calls.filter(call => call.type === "frigate_max/v1/vod/prepare").length;
+  const pausedTi = controller.clock.absoluteTime;
+  controller.setTimelineZoomSpanSeconds(4 * 3600);
+  assert.equal(controller.clock.absoluteTime, pausedTi);
+  assert.equal(controller.clock.running, false);
+  assert.deepEqual([...controller._historicalPlayers.values()], players);
+  assert.equal(controller._reviewRequestId, requestId);
+  assert.equal(harness.calls.filter(call => call.type === "frigate_max/v1/vod/prepare").length, prepares);
+  assert.equal(controller.resumePlayback(), true);
+  const starts = harness.starts.length;
+  const playingTi = controller.clock.absoluteTime;
+  controller.setTimelineZoomSpanSeconds(3600);
+  assert.equal(controller.clock.absoluteTime, playingTi);
+  assert.equal(controller.clock.running, true);
+  assert.equal(harness.starts.length, starts);
+  assert.equal(harness.calls.filter(call => call.type === "frigate_max/v1/vod/prepare").length, prepares);
+  assert.deepEqual([...controller._historicalPlayers.values()], players);
+  assert.equal(controller._reviewRequestId, requestId);
+  assert.deepEqual(controller._historicalPlaybackRange, controller.state.desiredReviewRange);
+});
+
+test("Review Views use only absolute When bounds after zoom and preserve transient TI on load", t => {
+  const wall = 1800000000;
+  const harness = createHistoricalHarness({
+    wallClockMs: wall * 1000,
+    initialReviewRange: { from: wall - 7200, to: wall + 7200 }
+  });
+  t.after(() => harness.close());
+  const controller = harness.controller;
+  controller._reviewPosition = wall - 1800;
+  controller.setTimelineZoomSpanSeconds(4 * 3600);
+  const saved = controller.captureReviewViewState();
+  assert.equal(Object.hasOwn(saved, "zoomSpanSeconds"), false);
+  assert.deepEqual(saved.when, {
+    version: 1, kind: "absolute-range",
+    from: controller.state.desiredReviewRange.from,
+    to: controller.state.desiredReviewRange.to
+  });
+  controller.setTimelineZoomSpanSeconds(3600);
+  controller._reviewPosition = wall - 1200;
+  const result = controller.restoreReviewView(saved);
+  assert.equal(result.result, "restored");
+  assert.deepEqual(controller.state.desiredReviewRange,
+    { from: saved.when.from, to: saved.when.to });
+  assert.equal(controller.reviewPosition, wall - 1200);
+  assert.equal(Object.hasOwn(result.state, "zoomSpanSeconds"), false);
+  const oldView = { ...saved, zoomSpanSeconds: 3600 };
+  assert.equal(Object.hasOwn(controller.normalizeReviewViewState(oldView).state,
+    "zoomSpanSeconds"), false);
+});
 test("Review criteria update desired query and coalesce into one automatic refresh", async t => {
   const harness = createHistoricalHarness();
   t.after(() => harness.close());
@@ -3121,9 +3277,11 @@ test("Review Timeline refresh queries desired range and renders newest at top", 
   assert.equal(controller.state.timeline.items.length, 2);
   const markers = [...harness.root.querySelectorAll(".review-timeline-marker")];
   const firstGeometry = reviewTimelineMarkerGeometry(controller.state.timeline.items[0], desired);
-  assert.match(markers[0].getAttribute("style"), new RegExp(`top:${firstGeometry.top * 100}%`));
-  assert.match(markers[0].getAttribute("style"), new RegExp(`height:${firstGeometry.height * 100}%`));
-  assert.match(markers[1].getAttribute("style"), /top:0%/);
+  assert.match(markers[0].getAttribute("style"),
+    new RegExp(`top:min\\(${firstGeometry.top * 100}%, calc\\(100% - 1px\\)\\)`));
+  assert.match(markers[0].getAttribute("style"),
+    new RegExp(`height:max\\(${firstGeometry.height * 100}%, 1px\\)`));
+  assert.match(markers[1].getAttribute("style"), /top:0%;height:0%/);
   assert.equal(harness.root.querySelector(".review-timeline-endpoints"), null);
 });
 
@@ -3165,12 +3323,56 @@ test("06:53 selection does not intersect later activity or gain synthetic marker
   assert.match(source, /\.review-timeline-marker\.point\s*{[^}]*height:\s*0\s*!important/s);
 });
 
+test("duration markers retain proportional height with a 1px display floor and clipped boundaries", t => {
+  const wall = 1800000000;
+  const range = { from: wall - 86400, to: wall };
+  const harness = createHistoricalHarness({ wallClockMs: wall * 1000, initialReviewRange: range });
+  t.after(() => harness.close());
+  const controller = harness.controller;
+  const events = {
+    long: { camera_id: "drive_up", start_time: wall - 8000, end_time: wall - 800 },
+    above: { camera_id: "drive_up", start_time: wall - 5000, end_time: wall - 4700 },
+    short: { camera_id: "drive_up", start_time: wall - 120, end_time: wall - 90 },
+    clipped: { camera_id: "drive_up", start_time: range.from - 20, end_time: range.from + 10 },
+    outside: { camera_id: "drive_up", start_time: range.from - 300, end_time: range.from - 10 },
+    boundary: { camera_id: "drive_up", start_time: range.from, end_time: range.from }
+  };
+  controller._timeline = { status: "loaded", refreshing: false,
+    items: Object.values(events), error: null, queryRange: { ...range } };
+  controller.updateRhs();
+  const markerFor = epoch => [...harness.root.querySelectorAll(".review-timeline-marker")]
+    .find(marker => marker.dataset.startEpoch === String(epoch));
+  const visiblePixels = marker => {
+    const match = marker.getAttribute("style").match(/height:max\(([^%]+)%, 1px\)/);
+    assert.ok(match);
+    return Math.max(Number(match[1]) * 6, 1); // 600px axis: percent * 600 / 100.
+  };
+  assert.ok(Math.abs(visiblePixels(markerFor(events.long.start_time)) - 50) < 1e-9);
+  assert.ok(Math.abs(visiblePixels(markerFor(events.above.start_time)) - 300 / 86400 * 600) < 1e-9);
+  assert.equal(visiblePixels(markerFor(events.short.start_time)), 1);
+  assert.equal(visiblePixels(markerFor(events.clipped.start_time)), 1);
+  assert.match(markerFor(events.clipped.start_time).getAttribute("style"),
+    /top:min\([^;]+%, calc\(100% - 1px\)\)/);
+  assert.equal(markerFor(events.outside.start_time), undefined);
+  assert.ok(markerFor(events.boundary.start_time).classList.contains("point"));
+  assert.equal(markerFor(events.short.start_time).dataset.endEpoch, String(events.short.end_time));
+  assert.ok(controller.getEventNavigationInventory().includes(events.short.start_time));
+  assert.equal(controller.getEventNavigationTargets(wall - 121).next, events.short.start_time);
+
+  controller.setTimelineZoomSpanSeconds(3600);
+  assert.ok(Math.abs(visiblePixels(markerFor(events.short.start_time)) - 5) < 1e-9);
+  assert.equal(markerFor(events.short.start_time).dataset.startEpoch, String(events.short.start_time));
+  assert.equal(markerFor(events.short.start_time).dataset.endEpoch, String(events.short.end_time));
+  assert.ok(controller.getEventNavigationInventory().includes(events.short.start_time));
+  assert.equal(controller.getEventNavigationTargets(wall - 121).next, events.short.start_time);
+});
+
 test("Timeline consumes all remaining RHS height between its tabs and time footer", () => {
   const source = readFileSync(new URL("../nvr-card.js", import.meta.url), "utf8");
   assert.match(source, /\.review-rhs\s*{[^}]*display:\s*flex;[^}]*flex-direction:\s*column;/s);
   assert.match(source, /\.review-rhs-modes\s*{[^}]*flex:\s*0 0 34px;/s);
   assert.match(source, /\.review-rhs-content\s*{[^}]*display:\s*flex;[^}]*flex:\s*1 1 auto;[^}]*min-height:\s*0;[^}]*overflow:\s*hidden;/s);
-  assert.match(source, /\.review-time-truth\s*{[^}]*flex:\s*0 0 34px;/s);
+  assert.match(source, /\.review-time-truth\s*{[^}]*flex:\s*0 0 66px;/s);
   assert.match(source, /\.review-timeline\s*{[^}]*display:\s*flex;[^}]*flex:\s*1 1 auto;[^}]*flex-direction:\s*column;[^}]*min-height:\s*0;/s);
   assert.match(source, /\.review-timeline-lane-headings\s*{[^}]*flex:\s*0 0 28px;/s);
   assert.match(source, /\.review-timeline-axis\s*{[^}]*flex:\s*1 1 auto;[^}]*min-height:\s*0;/s);
@@ -3216,7 +3418,8 @@ test("the fixed RHS footer is the sole authoritative Review time in live, paused
   const footer = harness.root.querySelector(".review-time-truth");
   let output = footer.querySelector(".review-clock-display");
   assert.equal(harness.transportRoot.querySelector(".review-clock-display"), null);
-  assert.equal(footer.textContent, output.textContent);
+  assert.equal(footer.querySelectorAll(".review-clock-display").length, 1);
+  assert.strictEqual(footer.firstElementChild, output);
   assert.doesNotMatch(footer.textContent, /Review Time:/);
   assert.equal(output.dateTime, "2026-09-10T19:00:00.000Z");
 
