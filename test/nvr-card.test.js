@@ -32,6 +32,8 @@ test("global historical sync diagnostics address only the sole connected card", 
   assert.equal(api.getLatestHistoricalSyncReport(), null);
   assert.equal(api.getHistoricalSyncReports().length, 0);
   assert.equal(api.getRecentReviewFailures().length, 0);
+  assert.equal(api.getRecentAutoSnapDecisions().length, 0);
+  assert.equal(api.getReviewNavigationDiagnostics(), null);
   assert.equal(api.disableHistoricalSync(), false);
   assert.equal(api.getContinuousHandoffPrototypeReport(), null);
   assert.throws(
@@ -45,6 +47,7 @@ test("global historical sync diagnostics address only the sole connected card", 
   assert.equal(controller._historicalSyncDiagnosticsEnabled, null);
   assert.equal(api.enableHistoricalSync(), true);
   assert.equal(controller._historicalSyncDiagnosticsEnabled, true);
+  assert.equal(api.getReviewNavigationDiagnostics().recent.length, 0);
   assert.strictEqual(card.querySelector(".video-cell"), liveCell);
   const camera = { name: "Front", password: "fixture-only-password", auth: { token: "fixture-token" } };
   const report = controller.startSyncReport(controller._generation, 1800000000,
@@ -62,6 +65,15 @@ test("global historical sync diagnostics address only the sole connected card", 
   assert.equal(failures[0].camera, "Front");
   failures[0].camera = "mutated";
   assert.equal(api.getRecentReviewFailures()[0].camera, "Front");
+  controller.recordAutoSnapDecision(1, 1800000000, 1800000000, 1800007200,
+    2, "blocked_unknown");
+  const decisions = api.getRecentAutoSnapDecisions();
+  assert.equal(decisions[0].outcome, "blocked_unknown");
+  decisions[0].outcome = "mutated";
+  assert.equal(api.getRecentAutoSnapDecisions()[0].outcome, "blocked_unknown");
+  const navigation = api.getReviewNavigationDiagnostics();
+  navigation.cursor.displayedFrom = "mutated";
+  assert.notEqual(api.getReviewNavigationDiagnostics().cursor.displayedFrom, "mutated");
   assert.equal(JSON.stringify(api.getHistoricalSyncReports()).includes("fixture-only-password"), false);
   assert.equal(JSON.stringify(api.getHistoricalSyncReports()).includes('"auth"'), false);
   latest.cameras.Front.status = "mutated";
@@ -92,6 +104,8 @@ test("global historical sync diagnostics address only the sole connected card", 
   assert.throws(() => api.enableHistoricalSync(), /exactly one connected/);
   assert.throws(() => api.getLatestHistoricalSyncReport(), /exactly one connected/);
   assert.throws(() => api.getRecentReviewFailures(), /exactly one connected/);
+  assert.throws(() => api.getRecentAutoSnapDecisions(), /exactly one connected/);
+  assert.throws(() => api.getReviewNavigationDiagnostics(), /exactly one connected/);
   assert.throws(() => api.getContinuousHandoffPrototypeReport(), /exactly one connected/);
   second.remove();
   assert.equal(api.enableHistoricalSync(), true);
@@ -101,6 +115,8 @@ test("global historical sync diagnostics address only the sole connected card", 
   assert.equal(api.getLatestHistoricalSyncReport(), null);
   assert.equal(api.getHistoricalSyncReports().length, 0);
   assert.equal(api.getRecentReviewFailures().length, 0);
+  assert.equal(api.getRecentAutoSnapDecisions().length, 0);
+  assert.equal(api.getReviewNavigationDiagnostics(), null);
   assert.equal(api.getContinuousHandoffPrototypeReport(), null);
 });
 
@@ -2695,8 +2711,9 @@ test("Review Views render in the Review rail after Layouts and stay separate fro
   card.setApplicationMode("review");
   const headers = [...card.querySelectorAll(".review-control-rail .sidebar-section-header")];
   assert.deepEqual(headers.map(header => header.getAttribute("aria-label")), [
-    "Cameras", "Layouts", "Views", "When", "Filters"
+    "Cameras", "Layouts", "Views", "When", "Filters", "Options"
   ]);
+  assert.ok(card.querySelector(".review-options-section"));
   assert.equal(card.querySelectorAll(".review-saved-views-body .saved-view-row").length, 0);
   assert.equal(card.querySelector(".review-saved-views-body .sidebar-placeholder")?.textContent.trim(), "No saved views");
   card.saveReviewViewAs("Shared Name", card._reviewController.captureReviewViewState());
@@ -2728,7 +2745,30 @@ test("Review Save Current View uses the Review capture contract and persists onc
   }));
   assert.equal(zoomedWhen.to - zoomedWhen.from, 7200);
   assert.equal(Object.hasOwn(card._reviewSavedViews[0].state, "zoomSpanSeconds"), false);
+  assert.equal(JSON.stringify(card._reviewSavedViews[0].state.options), '{"autoSnapTo":false}');
+  assert.equal(JSON.stringify(storedWorkspace(harness, card).reviewSavedViews.views[0].state.options), '{"autoSnapTo":false}');
   assert.equal(card._savedViews.length, 0);
+});
+
+test("Review Auto Snap option persists in the existing Review Views workspace field", t => {
+  const harness = setup(t);
+  const card = harness.createCard();
+  card.setApplicationMode("review");
+  const controller = card._reviewController;
+  controller.setAutoSnapTo(true);
+  const saved = card.saveReviewViewAs("With Auto Snap", controller.captureReviewViewState());
+  assert.equal(JSON.stringify(saved.state.options), '{"autoSnapTo":true}');
+  assert.equal(JSON.stringify(storedWorkspace(harness, card).reviewSavedViews.views[0].state.options),
+    '{"autoSnapTo":true}');
+  assert.equal(card._savedViews.length, 0);
+  controller.setAutoSnapTo(false);
+  const beforeTi = controller.reviewPosition;
+  const beforeMode = controller.state.presentationMode;
+  card.querySelector(".review-saved-views-body .saved-view-load").click();
+  assert.equal(JSON.stringify(controller.getReviewOptions()), '{"autoSnapTo":true}');
+  assert.equal(controller._autoSnapArmed, false);
+  assert.equal(controller.reviewPosition, beforeTi);
+  assert.equal(controller.state.presentationMode, beforeMode);
 });
 
 test("Review Save refuses an invalid desired When range without changing saved Views", t => {
@@ -2766,6 +2806,7 @@ test("Review load uses transactional restore once and does not overwrite the sna
   assert.equal(JSON.stringify(controller.state.desiredReviewRange),
     JSON.stringify({ from: saved.state.when.from, to: saved.state.when.to }));
   assert.equal(JSON.stringify(card._reviewSavedViews[0].state), originalState);
+  assert.equal(JSON.stringify(controller.state.reviewOptions), '{"autoSnapTo":false}');
   assert.equal(card._savedViews.length, 0);
 });
 
@@ -2782,6 +2823,7 @@ test("Review Update, Rename, and Delete affect only the selected Review View", t
   card.querySelector(".review-saved-views-body [data-saved-view-action=overwrite]").click();
   assert.equal(card._reviewSavedViews[0].id, review.id);
   assert.equal(card._reviewSavedViews[0].state.layout, "2x2");
+  assert.equal(JSON.stringify(card._reviewSavedViews[0].state.options), '{"autoSnapTo":false}');
   harness.window.prompt = () => "Renamed Review";
   card.querySelector(".review-saved-views-body [data-saved-view-action=rename]").click();
   assert.equal(card._reviewSavedViews[0].name, "Renamed Review");
@@ -2802,7 +2844,8 @@ test("Review View load reports partial and failed restores without changing save
     layout: "primary12",
     assignedCameras: ["camera.missing", "camera.front", ...new Array(14).fill(null)],
     when: { version: 1, kind: "absolute-range", from: 100, to: 200 },
-    filters: ["person", "obsolete"]
+    filters: ["person", "obsolete"],
+    options: { futurePolicy: true }
   });
   card._reviewSavedViews.push({
     id: "view-2", name: "Broken", state: { version: 1, layout: "invalid" }
@@ -2811,6 +2854,8 @@ test("Review View load reports partial and failed restores without changing save
   card.querySelector('.review-saved-views-body [data-saved-view-id="view-1"][data-saved-view-action="load"]').click();
   assert.match(card._reviewSavedViewsMessage, /skipped/);
   assert.equal(controller._reviewAssignments[1], "Front");
+  assert.equal(JSON.stringify(controller.state.reviewOptions), '{"autoSnapTo":false}');
+  assert.equal(JSON.stringify(partial.state.options), '{"futurePolicy":true}');
   const savedPartial = JSON.stringify(partial.state);
   controller._reviewLayout = "2x2";
   card.querySelector('.review-saved-views-body [data-saved-view-id="view-2"][data-saved-view-action="load"]').click();

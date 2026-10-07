@@ -22,6 +22,9 @@ const REVIEW_QUERY_DEBOUNCE_MS = 400;
 const REVIEW_MEDIA_READY_TIMEOUT_MS = 15000;
 const REVIEW_AVAILABILITY_WINDOW_SECONDS = 2 * 60 * 60;
 const REVIEW_AVAILABILITY_EDGE_REFRESH_SECONDS = 30;
+const REVIEW_AUTO_SNAP_CAMERA_CONCURRENCY = 4;
+const REVIEW_AUTO_SNAP_DECISION_LIMIT = 16;
+const REVIEW_NAVIGATION_DIAGNOSTIC_LIMIT = 32;
 const HAVE_FUTURE_DATA = 3;
 const CONTINUOUS_HANDOFF_PROTOTYPE_CAMERA = "Garage";
 const CONTINUOUS_HANDOFF_PROTOTYPE_RATES = Object.freeze([0.25, 1]);
@@ -773,8 +776,18 @@ export class ReviewController {
     this._now = now;
     this._rhsMode = "timeline";
     this._selectedFilters = new Set();
+    this._reviewOptions = { autoSnapTo: false };
+    this._autoSnapArmed = false;
+    this._autoSnapDecisionToken = 0;
+    this._autoSnapDecisionPending = 0;
+    this._autoSnapAttempted = false;
+    this._autoSnapRetryAfterEpoch = null;
+    this._autoSnapDecisions = [];
+    this._navigationDiagnostics = [];
+    this._navigationDiagnosticSequence = 0;
     this._sectionExpanded = {
-      cameras: false, layouts: false, views: false, when: false, filters: false, diagnostics: false
+      cameras: false, layouts: false, views: false, when: false, filters: false,
+      options: false, diagnostics: false
     };
     this._reviewRange = null;
     this._desiredReviewRange = null;
@@ -866,6 +879,7 @@ export class ReviewController {
       reviewRequestId: this._reviewRequestId,
       assignmentRevision: this._assignmentRevision,
       selectedFilters: [...this._selectedFilters],
+      reviewOptions: this.getReviewOptions(),
       rhsMode: this._rhsMode,
       sectionExpanded: { ...this._sectionExpanded }
     };
@@ -1253,6 +1267,100 @@ export class ReviewController {
     return REVIEW_FILTERS.filter(name => requested.has(name));
   }
 
+  getReviewOptions() {
+    return { ...this._reviewOptions };
+  }
+
+  setAutoSnapTo(enabled) {
+    if (typeof enabled !== "boolean" || this._reviewOptions.autoSnapTo === enabled) return false;
+    this.invalidateAutoSnapDecision();
+    this._autoSnapArmed = false;
+    this._reviewOptions = { autoSnapTo: enabled };
+    const input = this._root?.querySelector(".review-auto-snap-to");
+    if (input) input.checked = enabled;
+    return true;
+  }
+
+  getRecentAutoSnapDecisions() {
+    return this._autoSnapDecisions.slice().reverse().map(record => ({ ...record }));
+  }
+
+  reviewCursorDiagnostic() {
+    const range = this._displayedReviewQuery?.range ?? this._reviewRange;
+    const epoch = this.reviewPosition;
+    const inDisplayedRange = Number.isFinite(epoch) &&
+      Number.isFinite(range?.from) && Number.isFinite(range?.to) &&
+      range.from < range.to && epoch >= range.from && epoch <= range.to;
+    const cursor = this._root?.querySelector(".review-timeline-cursor");
+    return {
+      reviewPositionEpoch: Number.isFinite(epoch) ? epoch : null,
+      displayedFrom: range?.from ?? null,
+      displayedTo: range?.to ?? null,
+      inDisplayedRange,
+      cursorShouldBeVisible: inDisplayedRange,
+      cursorPresent: Boolean(cursor),
+      cursorHidden: cursor ? Boolean(cursor.hidden) : null
+    };
+  }
+
+  getReviewNavigationDiagnostics() {
+    return JSON.parse(JSON.stringify({
+      cursor: this.reviewCursorDiagnostic(),
+      recent: this._navigationDiagnostics.slice().reverse()
+    }));
+  }
+
+  recordReviewNavigation(diagnostic, completed) {
+    const range = this._historicalPlaybackRange;
+    const states = { participating: 0, preparing: 0, unavailable: 0, failed: 0 };
+    for (const player of this._historicalPlayers.values()) {
+      if (Object.hasOwn(states, player.lifecycleState)) states[player.lifecycleState] += 1;
+    }
+    this._navigationDiagnostics.push({
+      ...diagnostic,
+      settledAtMs: this._now(),
+      outcome: completed ? "completed" :
+        (diagnostic.ownerRequestId !== null &&
+          diagnostic.ownerRequestId !== this._reviewRequestId) ||
+        (diagnostic.decisionToken !== null &&
+          diagnostic.decisionToken !== this._autoSnapDecisionToken)
+          ? "superseded" : "not_completed",
+      requestIdAtSettlement: this._reviewRequestId,
+      settledEpoch: this.clock.absoluteTime,
+      clockRunning: this.clock.running,
+      playRequested: this._playRequested,
+      historicalPreparing: this._historicalPreparing,
+      historicalFrom: range?.from ?? null,
+      historicalTo: range?.to ?? null,
+      participantCount: states.participating,
+      participantStates: states,
+      intentionalWhenToStop: this._presentationMode === "historical" &&
+        !this.clock.running && Number.isFinite(range?.to) &&
+        diagnostic.selectedEpoch === range.to,
+      cursor: this.reviewCursorDiagnostic()
+    });
+    if (this._navigationDiagnostics.length > REVIEW_NAVIGATION_DIAGNOSTIC_LIMIT) {
+      this._navigationDiagnostics.shift();
+    }
+  }
+
+  recordAutoSnapDecision(token, sourceEpoch, searchedStart, searchedEnd, selectedCount,
+    outcome, targetEpoch = null) {
+    this._autoSnapDecisions.push({
+      atMs: this._now(), token, sourceEpoch, targetEpoch,
+      searchedStart, searchedEnd, selectedCount, outcome
+    });
+    if (this._autoSnapDecisions.length > REVIEW_AUTO_SNAP_DECISION_LIMIT) {
+      this._autoSnapDecisions.shift();
+    }
+  }
+
+  invalidateAutoSnapDecision() {
+    this._autoSnapDecisionToken += 1;
+    this._autoSnapAttempted = false;
+    this._autoSnapRetryAfterEpoch = null;
+  }
+
   captureReviewViewState() {
     const range = this._desiredReviewRange;
     if (!Object.hasOwn(VIEWER_LAYOUTS, this._reviewLayout) ||
@@ -1276,7 +1384,8 @@ export class ReviewController {
         from: range.from,
         to: range.to
       },
-      filters: this.canonicalFilters(this._selectedFilters)
+      filters: this.canonicalFilters(this._selectedFilters),
+      options: this.getReviewOptions()
     }));
   }
 
@@ -1341,6 +1450,13 @@ export class ReviewController {
       requestedFilters.add(filter);
     }
     if (unknownFilters.length > 0) partial = true;
+    const options = value.options;
+    const validOptions = options === undefined ||
+      (options && typeof options === "object" && !Array.isArray(options));
+    if (!validOptions || (validOptions && options &&
+        (Object.keys(options).some(key => key !== "autoSnapTo") ||
+         (Object.hasOwn(options, "autoSnapTo") &&
+          typeof options.autoSnapTo !== "boolean")))) partial = true;
 
     return {
       result: partial ? "partial" : "restored",
@@ -1354,7 +1470,9 @@ export class ReviewController {
           from: value.when.from,
           to: value.when.to
         },
-        filters: REVIEW_FILTERS.filter(filter => requestedFilters.has(filter))
+        filters: REVIEW_FILTERS.filter(filter => requestedFilters.has(filter)),
+        options: { autoSnapTo: validOptions && typeof options?.autoSnapTo === "boolean"
+          ? options.autoSnapTo : false }
       })),
       issues: {
         staleCameras,
@@ -1382,6 +1500,8 @@ export class ReviewController {
   restoreReviewView(value) {
     const normalized = this.normalizeReviewViewState(value);
     if (normalized.result === "invalid") return normalized;
+    this.invalidateAutoSnapDecision();
+    this._autoSnapArmed = false;
     this._reviewRequestId += 1;
 
     this.ensureReviewQuery();
@@ -1400,6 +1520,7 @@ export class ReviewController {
     this._assignmentRevision += 1;
     this.syncSelectionFromAssignments();
     this._selectedFilters = new Set(state.filters);
+    this._reviewOptions = { ...state.options };
     this._desiredReviewRange = { from: state.when.from, to: state.when.to };
     this._selectedReviewCamera = null;
     this._selectedReviewLayout = null;
@@ -1635,6 +1756,7 @@ export class ReviewController {
     const range = { from: to - span, to };
     if (range.from === this._desiredReviewRange.from &&
         range.to === this._desiredReviewRange.to) return false;
+    this.invalidateAutoSnapDecision();
     if (this._historicalPreparing) this.retireHistoricalForReviewEdit();
     const preserveHistorical = this._presentationMode === "historical";
     this._whenDraftRange = null;
@@ -1676,6 +1798,7 @@ export class ReviewController {
   }
 
   reviewCriteriaChanged({ preserveHistorical = false } = {}) {
+    this.invalidateAutoSnapDecision();
     this.ensureReviewRange();
     if (!preserveHistorical) this._reviewRequestId += 1;
     this._desiredReviewQuery = this.getDesiredReviewQuery();
@@ -1971,6 +2094,8 @@ export class ReviewController {
   }
 
   returnToLive(preservePosition = false) {
+    this.invalidateAutoSnapDecision();
+    this._autoSnapArmed = false;
     const previousPosition = this.reviewPosition;
     this._generation += 1;
     this._reviewRequestId += 1;
@@ -2041,6 +2166,7 @@ export class ReviewController {
     const selectedNames = this.canonicalCameraNames(this._selectedCameraNames);
     const target = this.getEventNavigationTargets()[direction];
     if (!Number.isFinite(target) || selectedNames.length === 0) return false;
+    this.invalidateAutoSnapDecision();
     this._playRequested = false;
     const generation = this._generation + 1;
     await this.playHistorical(target, {
@@ -2075,6 +2201,7 @@ export class ReviewController {
     const range = displayedQuery?.range;
     if (!Number.isFinite(targetEpoch) || !(range?.from < range?.to) ||
         targetEpoch < range.from || targetEpoch > range.to) return false;
+    this.invalidateAutoSnapDecision();
     if (autoplay === false) this._playRequested = false;
     const displayedNames = this.canonicalCameraNames(displayedQuery.cameraNames);
     const assignedNames = this.canonicalCameraNames(this._selectedCameraNames);
@@ -2159,6 +2286,7 @@ export class ReviewController {
       views: "mdi:view-dashboard-outline",
       when: "mdi:calendar-clock-outline",
       filters: "mdi:filter-outline",
+      options: "mdi:tune-variant",
       diagnostics: "mdi:stethoscope"
     }[name]);
     const label = this._document.createElement("span");
@@ -2264,6 +2392,17 @@ export class ReviewController {
       filterContent.appendChild(label);
     }
     controls.appendChild(this.createSection("filters", "Filters", filterContent));
+    const optionsContent = this._document.createElement("div");
+    optionsContent.className = "review-section-content review-options-controls";
+    const autoSnapLabel = this._document.createElement("label");
+    const autoSnapInput = this._document.createElement("input");
+    autoSnapInput.type = "checkbox";
+    autoSnapInput.className = "review-auto-snap-to";
+    autoSnapInput.checked = this._reviewOptions.autoSnapTo;
+    autoSnapInput.addEventListener("change", () => this.setAutoSnapTo(autoSnapInput.checked));
+    autoSnapLabel.append(autoSnapInput, "Auto Snap To");
+    optionsContent.appendChild(autoSnapLabel);
+    controls.appendChild(this.createSection("options", "Options", optionsContent));
     if (this._debugEnabled) {
       const diagnosticContent = this._document.createElement("div");
       diagnosticContent.className = "review-section-content review-diagnostics";
@@ -3199,6 +3338,8 @@ export class ReviewController {
   pausePlayback() {
     if (this._presentationMode !== "historical" || (!this.clock.running && !this._playRequested)) return false;
     this._playRequested = false;
+    this.invalidateAutoSnapDecision();
+    this._autoSnapArmed = false;
     const players = [...this._historicalPlayers.values()].filter(player =>
       (player.lifecycleState === "participating" || player.transition?.playPending) && player.video);
     this.clock.pause();
@@ -3215,6 +3356,8 @@ export class ReviewController {
   resumePlayback() {
     if (this._presentationMode !== "historical" || this.clock.running) return false;
     this._playRequested = true;
+    this.invalidateAutoSnapDecision();
+    this._autoSnapArmed = this._reviewOptions.autoSnapTo;
     if (this._historicalPreparing) {
       this.updateTransport();
       return true;
@@ -3237,28 +3380,77 @@ export class ReviewController {
   async seekHistoricalRelative(deltaSeconds) {
     if (this._presentationMode !== "historical" ||
         !Number.isFinite(this.clock.absoluteTime)) return false;
-    let target = this.clock.absoluteTime + Number(deltaSeconds);
-    if (this._historicalPlaybackRange) {
-      const now = this._wallClock() / 1000;
-      const upper = Math.min(this._historicalPlaybackRange.to, now);
-      if (target >= upper && this._historicalPlaybackRange.to > now) {
-        this.returnToLive();
-        return true;
+    const diagnostic = {
+      id: ++this._navigationDiagnosticSequence,
+      atMs: this._now(),
+      type: "relative",
+      deltaSeconds: Number(deltaSeconds),
+      direction: Math.sign(Number(deltaSeconds)),
+      requestedEpoch: this.clock.absoluteTime + Number(deltaSeconds),
+      selectedEpoch: null,
+      coverageDecision: "literal",
+      coverageBypassedDuringPreparation: false,
+      decisionToken: null,
+      requestIdAtStart: this._reviewRequestId,
+      ownerRequestId: null,
+      initialClockRunning: this.clock.running,
+      initialPlayRequested: this._playRequested,
+      initialHistoricalPreparing: this._historicalPreparing
+    };
+    let completed = false;
+    try {
+      let target = diagnostic.requestedEpoch;
+      if (this._historicalPlaybackRange) {
+        const now = this._wallClock() / 1000;
+        const upper = Math.min(this._historicalPlaybackRange.to, now);
+        if (target >= upper && this._historicalPlaybackRange.to > now) {
+          diagnostic.coverageDecision = "live_now";
+          this.returnToLive();
+          completed = true;
+          return true;
+        }
+        target = Math.min(upper, Math.max(this._historicalPlaybackRange.from, target));
       }
-      target = Math.min(upper, Math.max(this._historicalPlaybackRange.from, target));
+      diagnostic.selectedEpoch = target;
+      if (Math.abs(Number(deltaSeconds)) === 10 && this._active && !this._suspended &&
+          this._reviewOptions.autoSnapTo && this._autoSnapArmed &&
+          (this.clock.running || this._playRequested) && this._historicalPlaybackRange &&
+          target < Math.min(this._historicalPlaybackRange.to, this._wallClock() / 1000)) {
+        diagnostic.coverageDecision = "searching";
+        completed = await this.seekHistoricalRelativeThroughCoverage(
+          target, Math.sign(Number(deltaSeconds)), diagnostic);
+        return completed;
+      }
+      diagnostic.coverageBypassedDuringPreparation = Math.abs(Number(deltaSeconds)) === 10 &&
+        this._active && !this._suspended && this._reviewOptions.autoSnapTo &&
+        this._autoSnapArmed && (this.clock.running || this._playRequested) &&
+        Boolean(this._historicalPlaybackRange) && this._historicalPreparing &&
+        target < Math.min(this._historicalPlaybackRange.to, this._wallClock() / 1000);
+      if (diagnostic.coverageBypassedDuringPreparation) {
+        diagnostic.coverageDecision = "bypassed_preparing";
+      }
+      const operation = this.seekHistoricalToEpoch(target, {
+        autoplay: this.clock.running || this._playRequested,
+        source: "VCR seek"
+      });
+      diagnostic.ownerRequestId = this._reviewRequestId;
+      completed = await operation;
+      return completed;
+    } finally {
+      this.recordReviewNavigation(diagnostic, completed);
     }
-    return this.seekHistoricalToEpoch(target, {
-      autoplay: this.clock.running,
-      source: "VCR seek"
-    });
   }
 
   async seekHistoricalToEpoch(targetEpoch, {
     autoplay = this.clock.running,
-    source = "explicit historical seek"
+    source = "explicit historical seek",
+    autoSnap = false,
+    decisionToken = null
   } = {}) {
     const target = Number(targetEpoch);
     if (this._presentationMode !== "historical" || !Number.isFinite(target)) return false;
+    if (decisionToken !== null && decisionToken !== this._autoSnapDecisionToken) return false;
+    if (!autoSnap && decisionToken === null) this.invalidateAutoSnapDecision();
     const generation = this._generation;
     // Explicit placement supersedes older work even when it reuses the source.
     const requestId = ++this._reviewRequestId;
@@ -3309,6 +3501,10 @@ export class ReviewController {
     const results = await this.evaluateHistoricalAvailability(target, {
       explicit: true, reason: source, autoplay: false
     });
+    if (decisionToken !== null && decisionToken !== this._autoSnapDecisionToken) {
+      this.retireSupersededHistoricalSeek(requestId, generation);
+      return false;
+    }
     if (generation !== this._generation || requestId !== this._reviewRequestId ||
         !this._active || this._suspended) return false;
     const playable = players.filter(player =>
@@ -3322,6 +3518,10 @@ export class ReviewController {
     if (this._playRequested && playable.length) {
       this.clock.start();
       await Promise.allSettled(playable.map(player => this.startOwnedPlayback(player)));
+    }
+    if (decisionToken !== null && decisionToken !== this._autoSnapDecisionToken) {
+      this.retireSupersededHistoricalSeek(requestId, generation);
+      return false;
     }
     if (requestId !== this._reviewRequestId || generation !== this._generation) return false;
     this._playRequested = false;
@@ -3348,6 +3548,18 @@ export class ReviewController {
     this.updateClockDisplay();
     this.updateDiagnostics();
     return true;
+  }
+
+  retireSupersededHistoricalSeek(requestId, generation) {
+    if (requestId !== this._reviewRequestId || generation !== this._generation) return;
+    this.clock.pause();
+    for (const player of this._historicalPlayers.values()) player.video?.pause();
+    this._historicalPreparing = false;
+    if (this._autoSnapDecisionPending !== this._autoSnapDecisionToken) {
+      this._playRequested = false;
+    }
+    this.updateTransport();
+    this.updateDiagnostics();
   }
   clearHistoricalBoundaryTimer() {
     if (this._historicalBoundaryTimer === null) return;
@@ -3595,6 +3807,253 @@ export class ReviewController {
       end: range.end
     });
     return normalizeRecordingAvailability(result, player.frigateCamera);
+  }
+
+  autoSnapDecisionCurrent(token, context) {
+    const range = this._historicalPlaybackRange;
+    return token === this._autoSnapDecisionToken && this._active && !this._suspended &&
+      this._presentationMode === "historical" && !this._historicalPreparing &&
+      this._reviewOptions.autoSnapTo === true && this._autoSnapArmed && this.clock.running &&
+      this._generation === context.generation &&
+      this._reviewRequestId === context.requestId &&
+      this._assignmentRevision === context.assignmentRevision &&
+      range?.from === context.from && range?.to === context.to &&
+      this._selectedCameraNames.join("\u0000") === context.cameraNames &&
+      ![...this._historicalPlayers.values()].some(player =>
+        player.lifecycleState === "participating" || player.lifecycleState === "preparing" ||
+        player.transition || player.endResolution);
+  }
+
+  relativeCoverageDecisionCurrent(token, context) {
+    const range = this._historicalPlaybackRange;
+    return token === this._autoSnapDecisionToken && this._active && !this._suspended &&
+      this._presentationMode === "historical" &&
+      this._reviewOptions.autoSnapTo === true && this._autoSnapArmed &&
+      this._generation === context.generation &&
+      this._reviewRequestId === context.requestId &&
+      this._assignmentRevision === context.assignmentRevision &&
+      range?.from === context.from && range?.to === context.to &&
+      this._selectedCameraNames.join("\u0000") === context.cameraNames;
+  }
+
+  async seekHistoricalRelativeThroughCoverage(literalTarget, direction, diagnostic = null) {
+    // A transport click owns its lookup immediately, including while an older
+    // automatic or manual availability request remains unresolved.
+    this.invalidateAutoSnapDecision();
+    const token = this._autoSnapDecisionToken;
+    if (diagnostic) diagnostic.decisionToken = token;
+    this._autoSnapDecisionPending = token;
+    const range = this._historicalPlaybackRange;
+    const upper = Math.min(range.to, this._wallClock() / 1000);
+    const players = [...this._historicalPlayers.values()];
+    const context = {
+      generation: this._generation, requestId: this._reviewRequestId,
+      assignmentRevision: this._assignmentRevision, from: range.from, to: range.to,
+      cameraNames: this._selectedCameraNames.join("\u0000")
+    };
+    let result = { status: "unknown" };
+    try {
+      if (players.length && players.length === this._selectedCameraNames.length &&
+          players.every(player => player.frigateCamera)) {
+        let end = direction < 0 ? Math.min(literalTarget + 1, upper) : null;
+        let start = direction > 0 ? literalTarget : Math.max(range.from,
+          end - REVIEW_AVAILABILITY_WINDOW_SECONDS);
+        while (direction > 0 ? start < upper : end > range.from) {
+          if (direction > 0) end = Math.min(start + REVIEW_AVAILABILITY_WINDOW_SECONDS, upper);
+          let windows;
+          try { windows = await this.autoSnapAvailabilityWindow(players, start, end, token); }
+          catch { windows = null; }
+          if (!this.relativeCoverageDecisionCurrent(token, context)) return false;
+          if (!windows) break;
+          if (direction > 0 ? start === literalTarget : end === Math.min(literalTarget + 1, upper)) {
+            if (windows.some(window =>
+              inspectRecordingAvailability(window, literalTarget).containing)) {
+              result = { status: "covered", target: literalTarget };
+              break;
+            }
+          }
+          const intervals = windows.flatMap(window => window.coverage);
+          if (direction > 0) {
+            const starts = intervals.map(interval => interval.start)
+              .filter(epoch => epoch > literalTarget && epoch < upper);
+            if (starts.length) {
+              result = { status: "found", target: Math.min(...starts) };
+              break;
+            }
+          } else {
+            const preceding = intervals.filter(interval => interval.end <= literalTarget);
+            if (preceding.length) {
+              const latest = preceding.reduce((left, right) =>
+                right.end > left.end ? right : left);
+              result = { status: "found", target: Math.max(latest.start, latest.end - 0.05) };
+              break;
+            }
+          }
+          if (direction > 0 ? end === upper : start === range.from) {
+            result = { status: "none" };
+            break;
+          }
+          if (direction > 0) start = end;
+          else {
+            end = start;
+            start = Math.max(range.from, end - REVIEW_AVAILABILITY_WINDOW_SECONDS);
+          }
+        }
+      }
+      if (!this.relativeCoverageDecisionCurrent(token, context)) return false;
+      if (diagnostic) diagnostic.coverageDecision = result.status;
+      if (result.status === "found" &&
+          !(direction > 0 ? result.target > this.clock.absoluteTime
+            : result.target < this.clock.absoluteTime)) return false;
+      const target = result.status === "found" ? result.target
+        : result.status === "none" ? direction > 0 ? upper : range.from : literalTarget;
+      if (diagnostic) diagnostic.selectedEpoch = target;
+      if (result.status === "none" && direction > 0) {
+        if (range.to > upper) this.returnToLive();
+        else {
+          this.clock.setAbsolute(range.to);
+          this.clock.start();
+          this.enforceHistoricalPlaybackBoundary();
+        }
+        return true;
+      }
+      const operation = this.seekHistoricalToEpoch(target, {
+        autoplay: true, source: direction > 0 ? "VCR +10 coverage" : "VCR -10 coverage",
+        decisionToken: token
+      });
+      if (diagnostic) diagnostic.ownerRequestId = this._reviewRequestId;
+      return operation;
+    } finally {
+      if (this._autoSnapDecisionPending === token) this._autoSnapDecisionPending = 0;
+    }
+  }
+
+  async autoSnapAvailabilityWindow(players, start, end, token) {
+    const results = [];
+    for (let index = 0; index < players.length; index += REVIEW_AUTO_SNAP_CAMERA_CONCURRENCY) {
+      const group = players.slice(index, index + REVIEW_AUTO_SNAP_CAMERA_CONCURRENCY);
+      const work = Promise.allSettled(group.map(player => {
+        const cached = player.availability;
+        return cached && cached.requested_start <= start && cached.requested_end >= end
+          ? Promise.resolve(cached)
+          : this.requestRecordingAvailability(player, { start, end });
+      }));
+      let timer;
+      const deadline = new Promise(resolve => {
+        timer = setTimeout(() => resolve(null), this._mediaReadyTimeoutMs);
+      });
+      const settled = await Promise.race([work, deadline]);
+      clearTimeout(timer);
+      if (token !== this._autoSnapDecisionToken) return null;
+      if (!settled || settled.some(result => result.status !== "fulfilled" ||
+          result.value.requested_start > start || result.value.requested_end < end)) return null;
+      results.push(...settled.map(result => result.value));
+    }
+    return results;
+  }
+
+  async maybeAutoSnapTo() {
+    if (!this._autoSnapArmed || !this._reviewOptions.autoSnapTo ||
+        !this.clock.running ||
+        (this._autoSnapDecisionPending !== 0 &&
+         this._autoSnapDecisionPending === this._autoSnapDecisionToken) ||
+        (this._autoSnapAttempted && !(Number.isFinite(this._autoSnapRetryAfterEpoch) &&
+          this.clock.absoluteTime >= this._autoSnapRetryAfterEpoch)) ||
+        this._historicalPreparing || this._presentationMode !== "historical" ||
+        !this._active || this._suspended) return false;
+    const players = [...this._historicalPlayers.values()];
+    if (!players.length || players.length !== this._selectedCameraNames.length ||
+        players.some(player => !player.frigateCamera || player.lifecycleState === "preparing" ||
+          player.transition || player.endResolution || player.availabilityPromise)) return false;
+    if (players.some(player => player.lifecycleState === "participating")) {
+      this._autoSnapAttempted = false;
+      this._autoSnapRetryAfterEpoch = null;
+      return false;
+    }
+    const sourceEpoch = this.clock.absoluteTime;
+    const range = this._historicalPlaybackRange;
+    const upper = Math.min(range?.to ?? NaN, this._wallClock() / 1000);
+    if (!Number.isFinite(sourceEpoch) || !Number.isFinite(upper) ||
+        !(range.from <= sourceEpoch && sourceEpoch < upper)) return false;
+    const context = {
+      generation: this._generation, requestId: this._reviewRequestId,
+      assignmentRevision: this._assignmentRevision, from: range.from, to: range.to,
+      cameraNames: this._selectedCameraNames.join("\u0000")
+    };
+    const token = ++this._autoSnapDecisionToken;
+    this._autoSnapAttempted = true;
+    this._autoSnapRetryAfterEpoch = null;
+    this._autoSnapDecisionPending = token;
+    let searchedEnd = sourceEpoch;
+    let outcome = "blocked_unknown";
+    let target = null;
+    const knownWindows = [];
+    try {
+      for (let start = sourceEpoch; start < upper; start = searchedEnd) {
+        const end = Math.min(start + REVIEW_AVAILABILITY_WINDOW_SECONDS, upper);
+        const results = await this.autoSnapAvailabilityWindow(players, start, end, token);
+        if (!this.autoSnapDecisionCurrent(token, context)) {
+          outcome = "superseded";
+          break;
+        }
+        if (!results) break;
+        searchedEnd = end;
+        knownWindows.push({ start, end, results });
+        const currentCoverage = start === sourceEpoch
+          ? results.map(result => inspectRecordingAvailability(result, sourceEpoch).containing)
+            .filter(Boolean) : [];
+        if (currentCoverage.length) {
+          this._autoSnapRetryAfterEpoch = Math.max(...currentCoverage.map(interval => interval.end));
+          outcome = "current_coverage";
+          break;
+        }
+        const starts = results.flatMap(result => result.coverage
+          .map(interval => interval.start)
+          .filter(epoch => epoch > sourceEpoch && epoch < upper));
+        if (starts.length) {
+          target = Math.min(...starts);
+          break;
+        }
+      }
+      if (target === null && outcome === "blocked_unknown" && searchedEnd === upper) {
+        outcome = "no_later_coverage";
+      }
+      if ((target !== null || outcome === "no_later_coverage") &&
+          !this.autoSnapDecisionCurrent(token, context)) outcome = "superseded";
+      const current = this.clock.absoluteTime;
+      const currentWindow = knownWindows.find(window =>
+        window.start <= current && current < window.end);
+      if ((target !== null || outcome === "no_later_coverage") &&
+          (!currentWindow || currentWindow.results.some(result =>
+            inspectRecordingAvailability(result, current).containing))) outcome = "superseded";
+      if (target !== null && outcome !== "superseded") {
+        if (!(current < target)) outcome = "superseded";
+        else {
+          const moved = await this.seekHistoricalToEpoch(target, {
+            autoplay: true, source: "auto snap", autoSnap: true,
+            decisionToken: token
+          });
+          if (token !== this._autoSnapDecisionToken) outcome = "superseded";
+          else outcome = moved && [...this._historicalPlayers.values()].some(player =>
+            player.lifecycleState === "participating") ? "advanced" : "target_failed";
+          if (outcome === "advanced") this._autoSnapAttempted = false;
+        }
+      } else if (outcome === "no_later_coverage") {
+        if (range.to > this._wallClock() / 1000) this.returnToLive();
+        else {
+          this.clock.setAbsolute(range.to);
+          this.clock.start();
+          this.enforceHistoricalPlaybackBoundary();
+        }
+      }
+    } catch {
+      outcome = token === this._autoSnapDecisionToken ? "blocked_unknown" : "superseded";
+    } finally {
+      if (this._autoSnapDecisionPending === token) this._autoSnapDecisionPending = 0;
+      this.recordAutoSnapDecision(token, sourceEpoch, sourceEpoch, searchedEnd,
+        players.length, outcome, target);
+    }
+    return outcome === "advanced";
   }
 
   availabilityWindowForTarget(targetEpoch) {
@@ -5227,6 +5686,7 @@ export class ReviewController {
     }));
     this.updateHistoricalAvailabilityStatus();
     this.updateTransport();
+    if (!explicit) void this.maybeAutoSnapTo();
     return results;
   }
 
@@ -5258,6 +5718,8 @@ export class ReviewController {
     cameraNames = null,
     source = "other historical path"
   } = {}) {
+    this.invalidateAutoSnapDecision();
+    this._autoSnapArmed = false;
     const generation = ++this._generation;
     const requestId = ++this._reviewRequestId;
     this._playRequested = false;
@@ -5573,6 +6035,7 @@ export class ReviewController {
   }
 
   cleanupHistorical() {
+    this.invalidateAutoSnapDecision();
     this._initialDeadlineCancel?.();
     this._initialDeadlineCancel = null;
     this.endSyncReport("historical_cleanup_or_generation_change");
