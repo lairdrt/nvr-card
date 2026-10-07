@@ -3,10 +3,10 @@ import {
   formatInvestigationLocalCivil,
   loadInvestigationHls,
   parseInvestigationEpoch
-} from "./src/investigation-lab/single-camera-engine.js?v=__LAB_BUILD__";
+} from "./single-camera-engine.js?v=__LAB_BUILD__";
 import {
   LongVodTwoPeerExperiment
-} from "./src/investigation-lab/long-vod-two-peer-experiment.js?v=__LAB_BUILD__";
+} from "./long-vod-two-peer-experiment.js?v=__LAB_BUILD__";
 
 const LAB_BUILD = "__LAB_BUILD__";
 const SAFE_CAMERA_ID = /^[A-Za-z0-9_-]+$/;

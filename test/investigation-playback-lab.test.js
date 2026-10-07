@@ -1597,7 +1597,7 @@ test("diagnostics are bounded, lifecycle-accounted, and exclude signed URLs", as
 });
 
 test("two-peer Lab is isolated from production controllers and renders equal peer cells", async () => {
-  const source = await readFile(new URL("../investigation-playback-lab.js", import.meta.url), "utf8");
+  const source = await readFile(new URL("../src/investigation-lab/investigation-playback-lab.js", import.meta.url), "utf8");
   assert.match(source, /customElements\.define\("investigation-playback-lab"/);
   for (const label of ["Place", "Play 1x", "Pause", "Resume 1x", "Reset"]) {
     assert.ok(source.includes(label), `missing ${label}`);
@@ -1615,12 +1615,12 @@ test("two-peer Lab is isolated from production controllers and renders equal pee
 
 test("Lab loader and build substitution version the complete Lab module graph", async () => {
   const [loader, entry, engine, longVod] = await Promise.all([
-    readFile(new URL("../investigation-playback-lab-loader.js", import.meta.url), "utf8"),
-    readFile(new URL("../investigation-playback-lab.js", import.meta.url), "utf8"),
+    readFile(new URL("../src/investigation-lab/investigation-playback-lab-loader.js", import.meta.url), "utf8"),
+    readFile(new URL("../src/investigation-lab/investigation-playback-lab.js", import.meta.url), "utf8"),
     readFile(new URL("../src/investigation-lab/single-camera-engine.js", import.meta.url), "utf8"),
     readFile(new URL("../src/investigation-lab/long-vod-two-peer-experiment.js", import.meta.url), "utf8")
   ]);
-  assert.match(loader, /import\(`\/local\/nvr-card\/investigation-playback-lab\.js\?ts=\$\{investigationLabLoadTimestamp\}`\)/);
+  assert.match(loader, /import\(`\/local\/nvr-card\/src\/investigation-lab\/investigation-playback-lab\.js\?ts=\$\{investigationLabLoadTimestamp\}`\)/);
   const build = "LAB test-build";
   const generatedEntry = entry.replaceAll("__LAB_BUILD__", build);
   const generatedEngine = engine.replaceAll("__LAB_BUILD__", build);
@@ -1676,7 +1676,7 @@ test("lab card copies the complete displayed sanitized diagnostics and reports c
   let card;
   try {
     const { InvestigationPlaybackLab } = await import(
-      `../investigation-playback-lab.js?copy-test=${Date.now()}`
+      `../src/investigation-lab/investigation-playback-lab.js?copy-test=${Date.now()}`
     );
     card = new InvestigationPlaybackLab();
     assert.throws(() => card.setConfig({ cameras: [] }), /one or two/);

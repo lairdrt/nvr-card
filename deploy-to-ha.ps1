@@ -4,9 +4,9 @@ $HaConfigShare = "Z:"
 
 $SourceFile = Join-Path $PSScriptRoot "nvr-card.js"
 $LoaderSourceFile = Join-Path $PSScriptRoot "loader.js"
-$InvestigationLabSourceFile = Join-Path $PSScriptRoot "investigation-playback-lab.js"
-$InvestigationLabLoaderSourceFile = Join-Path $PSScriptRoot "investigation-playback-lab-loader.js"
 $InvestigationLabSourceDirectory = Join-Path $PSScriptRoot "src\investigation-lab"
+$InvestigationLabSourceFile = Join-Path $InvestigationLabSourceDirectory "investigation-playback-lab.js"
+$InvestigationLabLoaderSourceFile = Join-Path $InvestigationLabSourceDirectory "investigation-playback-lab-loader.js"
 $LiveSourceDirectory = Join-Path $PSScriptRoot "src\live"
 $ProviderSourceDirectory = Join-Path $PSScriptRoot "src\providers"
 $ReviewSourceDirectory = Join-Path $PSScriptRoot "src\review"
@@ -17,9 +17,9 @@ $HlsLicenseSourceFile = Join-Path $PSScriptRoot "src\vendor\hls.js.LICENSE"
 $HaWwwDirectory = Join-Path $HaConfigShare "www\nvr-card"
 $DestinationFile = Join-Path $HaWwwDirectory "nvr-card.js"
 $LoaderDestinationFile = Join-Path $HaWwwDirectory "loader.js"
-$InvestigationLabDestinationFile = Join-Path $HaWwwDirectory "investigation-playback-lab.js"
-$InvestigationLabLoaderDestinationFile = Join-Path $HaWwwDirectory "investigation-playback-lab-loader.js"
 $InvestigationLabDestinationDirectory = Join-Path $HaWwwDirectory "src\investigation-lab"
+$InvestigationLabDestinationFile = Join-Path $InvestigationLabDestinationDirectory "investigation-playback-lab.js"
+$InvestigationLabLoaderDestinationFile = Join-Path $HaWwwDirectory "investigation-playback-lab-loader.js"
 $LiveDestinationDirectory = Join-Path $HaWwwDirectory "src\live"
 $ProviderDestinationDirectory = Join-Path $HaWwwDirectory "src\providers"
 $ReviewDestinationDirectory = Join-Path $HaWwwDirectory "src\review"
@@ -117,7 +117,6 @@ try {
     $DeployedSourceFiles = @(
         Get-Item -LiteralPath $SourceFile -ErrorAction Stop
         Get-Item -LiteralPath $LoaderSourceFile -ErrorAction Stop
-        Get-Item -LiteralPath $InvestigationLabSourceFile -ErrorAction Stop
         Get-ChildItem -LiteralPath $InvestigationLabSourceDirectory -File -Filter "*.js" -ErrorAction Stop
         Get-ChildItem -LiteralPath $LiveSourceDirectory -File -Filter "*.js" -ErrorAction Stop
         Get-ChildItem -LiteralPath $ProviderSourceDirectory -File -Filter "*.js" -ErrorAction Stop
@@ -176,9 +175,9 @@ try {
     [System.IO.File]::WriteAllBytes($DestinationFile, $DeployedBytes)
     Copy-Item -LiteralPath $LoaderSourceFile -Destination $LoaderDestinationFile -Force -ErrorAction Stop
     Copy-Item -LiteralPath $InvestigationLabLoaderSourceFile -Destination $InvestigationLabLoaderDestinationFile -Force -ErrorAction Stop
-    [System.IO.File]::WriteAllBytes($InvestigationLabDestinationFile, $DeployedInvestigationLabBytes)
     New-Item -ItemType Directory -Path $InvestigationLabDestinationDirectory -Force -ErrorAction Stop | Out-Null
     Copy-Item -Path (Join-Path $InvestigationLabSourceDirectory "*.js") -Destination $InvestigationLabDestinationDirectory -Force -ErrorAction Stop
+    [System.IO.File]::WriteAllBytes($InvestigationLabDestinationFile, $DeployedInvestigationLabBytes)
     [System.IO.File]::WriteAllBytes(
         (Join-Path $InvestigationLabDestinationDirectory "single-camera-engine.js"),
         $DeployedInvestigationLabEngineBytes
