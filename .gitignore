@@ -26,3 +26,7 @@ coverage/
 Thumbs.db
 .vscode/
 .idea/
+
+# Local network fault-injection helpers
+/up.ps1
+/dn.ps1

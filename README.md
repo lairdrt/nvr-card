@@ -486,10 +486,6 @@ and Git must be available in `PATH`. Run the helper from the repository with:
 .\deploy-to-ha.ps1
 ```
 
-`dn.ps1` and `up.ps1` disable and re-enable the Windows network adapter named
-`Ethernet`. They are fault-injection helpers used for reconnect testing, not
-normal installation or deployment requirements.
-
 ### Build identifier
 
 The card displays a deployment identifier in the form:
