@@ -5,7 +5,8 @@ import {
   parseInvestigationEpoch
 } from "./single-camera-engine.js?v=__LAB_BUILD__";
 import {
-  LongVodTwoPeerExperiment
+  LongVodTwoPeerExperiment,
+  LONG_VOD_PLAYBACK_RATES
 } from "./long-vod-two-peer-experiment.js?v=__LAB_BUILD__";
 
 const LAB_BUILD = "__LAB_BUILD__";
@@ -100,7 +101,7 @@ class InvestigationPlaybackLab extends HTMLElement {
         <div class="entry"><label>Local investigation time <input class="ti" type="datetime-local" step="1" aria-label="Local investigation time"></label><button class="place">Place</button></div>
         <div class="entry range-entry" hidden><label>Lab range start <input class="range-start" type="datetime-local" step="1"></label><label>Lab range end <input class="range-end" type="datetime-local" step="1"></label><button class="count-range">Count range</button><button class="place-range">Prepare/place range</button><button class="probe-manifest">Probe manifest</button></div>
         <div class="entry"><label>Absolute seek time <input class="seek-time" type="datetime-local" step="1"></label><button class="seek">Seek within presentation</button></div>
-        <div class="transport"><button class="reset">Reset</button><button class="play">Play 1x</button><button class="pause">Pause</button><button class="resume">Resume 1x</button></div>
+        <div class="transport"><button class="reset">Reset</button><label>Requested rate <select class="rate-select" aria-label="Requested playback rate">${LONG_VOD_PLAYBACK_RATES.map(rate => `<option value="${rate}">${rate}x</option>`).join("")}</select></label><button class="play">Play</button><button class="pause">Pause</button><button class="resume">Resume</button></div>
         <div class="scene-state">Playback epoch: -- | follower error: --</div>
         <div class="status" role="status">Configure one or two test cameras</div>
         <details><summary>Sanitized diagnostics</summary><div class="diagnostics-toolbar"><button class="copy-diagnostics" type="button">Copy diagnostics</button></div><textarea class="diagnostics" readonly aria-label="Sanitized diagnostics">Full diagnostics are generated only when Copy diagnostics is pressed.</textarea></details>
@@ -115,6 +116,8 @@ class InvestigationPlaybackLab extends HTMLElement {
     this._bind(".resume", () => this._run(() => this._coordinator?.resume()));
     this._bind(".reset", () => this._run(() => this._coordinator?.reset()));
     this._bind(".copy-diagnostics", () => this._copyDiagnostics());
+    this.shadowRoot.querySelector(".rate-select").addEventListener("change", event =>
+      this._run(() => this._coordinator?.setPlaybackRate(Number(event.target.value))));
   }
 
   _bind(selector, listener) { this.shadowRoot.querySelector(selector).addEventListener("click", listener); }
@@ -130,7 +133,7 @@ class InvestigationPlaybackLab extends HTMLElement {
         <div class="peer-header"><span class="peer-camera"></span><span class="peer-role">${index === 0 ? "Observation reference" : "Follower observation"}</span></div>
         <div class="viewport" aria-label="${camera} historical media"></div>
         <div class="peer-times"><div class="time"><b>Requested</b><output class="requested">--</output></div><div class="time"><b>Resolved</b><output class="resolved">--</output></div><div class="time"><b>Represented</b><output class="represented">--</output></div></div>
-        <div class="peer-sync">nominal 1x | actual -- | error -- | long VOD --</div>`;
+        <div class="peer-sync">requested 1x | browser rate -- | error -- | long VOD --</div>`;
       peer.querySelector(".peer-camera").textContent = camera;
       return peer;
     }));
@@ -208,6 +211,7 @@ class InvestigationPlaybackLab extends HTMLElement {
         if (generation === this._selectionGeneration) this._update(state);
       }
     });
+    this._coordinator.setPlaybackRate(Number(this.shadowRoot.querySelector(".rate-select").value));
     this._update(this._coordinator.state);
   }
 
@@ -219,6 +223,9 @@ class InvestigationPlaybackLab extends HTMLElement {
 
   _update(state) {
     if (!this.shadowRoot) return;
+    const rateSelect = this.shadowRoot.querySelector(".rate-select");
+    if (state) rateSelect.value = String(state.nominalPlaybackRate);
+    rateSelect.disabled = Boolean(state?.playing || state?.peers?.some(peer => peer.playing));
     for (const peer of state?.peers ?? []) {
       const cell = this._cell(peer.camera);
       if (!cell) continue;
@@ -226,7 +233,7 @@ class InvestigationPlaybackLab extends HTMLElement {
       cell.querySelector(".resolved").textContent = formatEpoch(peer.resolvedEpoch);
       cell.querySelector(".represented").textContent = formatEpoch(peer.representedEpoch);
       cell.querySelector(".peer-sync").textContent =
-        `nominal 1x | actual ${formatNumber(peer.actualPlaybackRate, 2)}x | error ${peer.errorSeconds === null ? "n/a" : `${peer.errorSeconds >= 0 ? "+" : ""}${formatNumber(peer.errorSeconds)}s`} | ${peer.lifecycle}`;
+        `requested ${peer.nominalPlaybackRate}x | browser rate ${formatNumber(peer.actualPlaybackRate, 2)}x | error ${peer.errorSeconds === null ? "n/a" : `${peer.errorSeconds >= 0 ? "+" : ""}${formatNumber(peer.errorSeconds)}s`} | ${peer.lifecycle}`;
     }
     this.shadowRoot.querySelector(".scene-state").textContent = state
       ? `Playback epoch: ${formatNumber(state.playbackEpoch)} | follower error: ${state.followerErrorSeconds === null ? "--" : `${state.followerErrorSeconds >= 0 ? "+" : ""}${formatNumber(state.followerErrorSeconds)}s`} | authority: ${state.authorityStatus}`

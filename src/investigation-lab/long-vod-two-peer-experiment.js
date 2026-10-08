@@ -11,11 +11,13 @@ import {
 const SAFE_CAMERA_ID = /^[A-Za-z0-9_-]+$/;
 const PRESENTATION_BOUNDS_SECONDS = 2 * 60 * 60;
 const READINESS_TIMEOUT_MS = 15000;
-const SEEK_TOLERANCE_SECONDS = 0.05;
+// Only checks whether the seek operation settled; never authorizes a video frame.
+const SEEK_SETTLE_TOLERANCE_SECONDS = 0.05;
 const HLS_ERROR_LIMIT = 16;
 const SEEK_PROBE_LIMIT = 16;
 const VERIFIED_HLS_VERSION = "1.7.2";
 const PLAYLIST_TYPES = new Set(["manifest", "level", "audioTrack", "subtitleTrack"]);
+export const LONG_VOD_PLAYBACK_RATES = Object.freeze([1, 2, 4, 8, 16]);
 
 export const LONG_VOD_OBSERVATION_POLICY = Object.freeze({
   playbackRate: 1,
@@ -45,6 +47,17 @@ const safeResponseExcerpt = value => {
     ? "[redacted]" : excerpt;
 };
 const diagnosticNumber = value => Number.isFinite(Number(value)) ? Number(value) : null;
+const observedNumber = value => typeof value === "number" && Number.isFinite(value) ? value : null;
+const failureText = value => typeof value !== "string" ? null :
+  /[\\/]|bearer|authsig|token|password|credential|signature|secret/i.test(value)
+    ? "[redacted]" : value.slice(0, 240);
+const failureValue = value => {
+  if (typeof value === "string") return failureText(value);
+  if (Array.isArray(value)) return value.map(failureValue);
+  if (value && typeof value === "object") return Object.fromEntries(
+    Object.entries(value).map(([key, entry]) => [key, failureValue(entry)]));
+  return value;
+};
 const diagnosticFragment = value => value && typeof value === "object" ? {
   type: diagnosticText(value.type),
   sn: diagnosticNumber(value.sn),
@@ -161,6 +174,7 @@ export class LongVodTwoPeerExperiment {
     this._setTimer = setTimer;
     this._clearTimer = clearTimer;
     this._policy = Object.freeze({ ...LONG_VOD_OBSERVATION_POLICY, ...policy, playbackRate: 1 });
+    this._playbackRate = 1;
     this._generation = 0;
     this._nextSessionId = 0;
     this._nextPresentationId = 0;
@@ -170,6 +184,7 @@ export class LongVodTwoPeerExperiment {
     this._initialEpoch = null;
     this._initialRange = null;
     this._labProbe = null;
+    this._failedPlacement = null;
     this._seekSerial = 0;
     this._manifestProbeSerial = 0;
     this._manifestProbeXhr = null;
@@ -212,7 +227,7 @@ export class LongVodTwoPeerExperiment {
       requestedEpoch: this._requestedEpoch,
       playbackEpoch: referenceEpoch,
       playing: this._playing,
-      nominalPlaybackRate: 1,
+      nominalPlaybackRate: this._playbackRate,
       referenceCamera: this._cameras[0],
       followerCamera: this._cameras[1],
       followerErrorSeconds: error,
@@ -224,10 +239,10 @@ export class LongVodTwoPeerExperiment {
           camera,
           role: index === 0 ? "observation-reference" : "follower-observation",
           requestedEpoch: this._requestedEpoch,
-          resolvedEpoch: finite(session?.presentation?.resolved_selected_epoch),
+          resolvedEpoch: finite(session?.placement?.resolvedEpoch ?? session?.presentation?.resolved_selected_epoch),
           representedEpoch: finite(session?.representedEpoch),
           actualPlaybackRate: finite(session?.video?.playbackRate),
-          nominalPlaybackRate: 1,
+          nominalPlaybackRate: this._playbackRate,
           errorSeconds: peerError,
           lifecycle: session?.lifecycle ?? "empty",
           playing: Boolean(session && !session.video.paused),
@@ -331,6 +346,7 @@ export class LongVodTwoPeerExperiment {
     const target = finite(epoch);
     if (target === null) throw new Error("Investigation epoch must be finite.");
     const generation = ++this._generation;
+    this._failedPlacement = null;
     const operation = this._operation = {
       id: generation, intent: "place", disposition: "preparing", requestedEpoch: target,
       startedAtMs: this._now(), completedAtMs: null, error: null
@@ -382,6 +398,7 @@ export class LongVodTwoPeerExperiment {
       this._emit();
       return true;
     } catch (error) {
+      this._retainFailedPlacement(generation, error);
       for (const session of prepared) this._destroySession(session);
       if (generation === this._generation && !this._destroyed) {
         if (this._labProbe) this._labProbe.preparationError = safeError(error);
@@ -397,6 +414,19 @@ export class LongVodTwoPeerExperiment {
     }
   }
 
+  setPlaybackRate(rate) {
+    if (!LONG_VOD_PLAYBACK_RATES.includes(rate)) {
+      throw new Error("Long-VOD playback rate must be 1, 2, 4, 8, or 16.");
+    }
+    if (this._playing || [...this._sessions.values()].some(session => !session.video.paused)) {
+      throw new Error("Pause both peers before changing the experiment rate.");
+    }
+    this._playbackRate = rate;
+    for (const session of this._sessions.values()) session.video.playbackRate = rate;
+    this._emit();
+    return true;
+  }
+
   async play() {
     if (this._sessions.size !== this._cameras.length) return false;
     this._cancelPendingSeek();
@@ -408,7 +438,7 @@ export class LongVodTwoPeerExperiment {
       await Promise.all(this._cameras.map(camera => {
         const session = this._sessions.get(camera);
         const video = session.video;
-        video.playbackRate = 1;
+        video.playbackRate = this._playbackRate;
         session.lifecycle = "playing";
         return video.play();
       }));
@@ -416,7 +446,7 @@ export class LongVodTwoPeerExperiment {
       this._playing = true;
       this._playStartedAtMs = this._playStartedAtMs ?? this._now();
       operation.disposition = "playing";
-      this._status = "Playing two independent long VOD presentations at 1x";
+      this._status = `Playing two independent long VOD presentations at requested ${this._playbackRate}x`;
       this._emit();
       return true;
     } catch (error) {
@@ -459,6 +489,7 @@ export class LongVodTwoPeerExperiment {
     const serial = ++this._seekSerial;
     const startedAtMs = this._now();
     this._playing = false;
+    this._failedPlacement = null;
     for (const session of this._sessions.values()) session.video.pause?.();
     const operation = this._operation = {
       id: generation, intent: "seek", disposition: "seeking", requestedEpoch,
@@ -468,7 +499,7 @@ export class LongVodTwoPeerExperiment {
       await Promise.all(this._cameras.map(async camera => {
         const session = this._sessions.get(camera);
         const mapped = epochToMedia(session.presentation, requestedEpoch);
-        if (mapped.isBoundary || Math.abs(mapped.resolvedEpoch - requestedEpoch) > SEEK_TOLERANCE_SECONDS) {
+        if (mapped.isBoundary) {
           throw new Error("Seek target is outside truthful logical coverage.");
         }
         if (session.frameCallbackId !== null) {
@@ -478,9 +509,9 @@ export class LongVodTwoPeerExperiment {
         const owned = () => generation === this._generation && serial === this._seekSerial &&
           !session.destroyed && this._sessions.get(camera) === session;
         const seeked = this._waitForMedia(session.video, "seeked", () =>
-          !session.video.seeking && Math.abs(Number(session.video.currentTime) - mapped.mediaTime) <= SEEK_TOLERANCE_SECONDS,
+          !session.video.seeking && Math.abs(Number(session.video.currentTime) - mapped.mediaTime) <= SEEK_SETTLE_TOLERANCE_SECONDS,
         generation, "Long-VOD probe seek did not settle.");
-        const frame = this._waitForTargetFrame(session, mapped, generation, owned);
+        const frame = this._waitForTargetFrame(session, mapped, generation, owned, requestedEpoch);
         session.video.currentTime = mapped.mediaTime;
         await Promise.all([seeked, frame]);
         if (!owned()) throw new Error("Stale long-VOD seek.");
@@ -499,6 +530,7 @@ export class LongVodTwoPeerExperiment {
       }));
       this._assertCurrent(generation);
       if (serial !== this._seekSerial) return false;
+      this._requestedEpoch = requestedEpoch;
       operation.disposition = "placed-paused";
       operation.completedAtMs = this._now();
       this._status = "Absolute seek placed on truthful frames";
@@ -506,6 +538,9 @@ export class LongVodTwoPeerExperiment {
       return true;
     } catch (error) {
       if (generation === this._generation && serial === this._seekSerial) {
+        this._retainFailedPlacement(generation, error);
+        this._cancelPendingSeek();
+        for (const session of this._sessions.values()) session.video.pause?.();
         operation.disposition = "failed";
         operation.completedAtMs = this._now();
         operation.error = safeError(error);
@@ -605,7 +640,7 @@ export class LongVodTwoPeerExperiment {
       schema: 1,
       mode: "two-peer-long-vod-observation-only",
       state: current,
-      policy: this._policy,
+      policy: { ...this._policy, playbackRate: this._playbackRate },
       architecture: {
         observationReferenceIsNotProductPrimary: true,
         correction: "none",
@@ -620,6 +655,7 @@ export class LongVodTwoPeerExperiment {
         requestCategoryCounts: { ...this._authentication.requestCategoryCounts }
       },
       labProbe: this._labProbe ? structuredClone(this._labProbe) : null,
+      failedPlacement: this._failedPlacement ? structuredClone(this._failedPlacement) : null,
       resources: {
         ...this._resources,
         currentVideoElements: this._resources.videoElementsCreated - this._resources.videoElementsDestroyed,
@@ -684,8 +720,8 @@ export class LongVodTwoPeerExperiment {
     video.muted = true;
     video.playsInline = true;
     video.preload = "auto";
-    video.defaultPlaybackRate = 1;
-    video.playbackRate = 1;
+    video.defaultPlaybackRate = this._playbackRate;
+    video.playbackRate = this._playbackRate;
     const hls = new Hls({
       enableWorker: true, maxBufferLength: 20,
       xhrSetup: (xhr, url, context) => this._authenticateHlsRequest(xhr, url, context)
@@ -742,6 +778,7 @@ export class LongVodTwoPeerExperiment {
       session.lifecycle = "ready-paused";
       return session;
     } catch (error) {
+      this._retainFailedPlacement(generation, error, session);
       this._destroySession(session);
       throw error;
     }
@@ -816,15 +853,35 @@ export class LongVodTwoPeerExperiment {
     await this._waitForMedia(session.video, "progress", () => Number(session.video.seekable?.length) > 0,
       generation, "Long-VOD media did not become seekable.");
     const seeked = this._waitForMedia(session.video, "seeked", () =>
-      !session.video.seeking && Math.abs(Number(session.video.currentTime) - mapped.mediaTime) <= SEEK_TOLERANCE_SECONDS,
+      !session.video.seeking && Math.abs(Number(session.video.currentTime) - mapped.mediaTime) <= SEEK_SETTLE_TOLERANCE_SECONDS,
     generation, "Long-VOD seek did not settle.");
-    const frame = this._waitForTargetFrame(session, mapped, generation);
+    const frame = this._waitForTargetFrame(session, mapped, generation, undefined, session.presentation.selected_epoch);
     session.video.currentTime = mapped.mediaTime;
     await Promise.all([seeked, frame]);
     session.video.pause?.();
   }
 
-  _waitForTargetFrame(session, mapped, generation, owned = () => !session.destroyed) {
+  _waitForTargetFrame(session, mapped, generation, owned = () => !session.destroyed,
+    requestedEpoch = mapped.resolvedEpoch) {
+    const video = session.video;
+    const presentation = session.presentation;
+    const spans = presentation.time_map.spans;
+    const targetUs = Math.round(mapped.mediaTime * 1_000_000);
+    const targetSpan = spans.findIndex(span => targetUs >= span[2] && targetUs < span[3]);
+    if (targetSpan < 0) return Promise.reject(new Error("Seek target has no playable mapping span."));
+    // A discrete landing may straddle a recording boundary. Use the target's
+    // mapped span and its neighbors as a broad association check, not frame precision.
+    const seekMediaRange = [spans[Math.max(0, targetSpan - 1)][2] / 1_000_000,
+      spans[Math.min(spans.length - 1, targetSpan + 1)][3] / 1_000_000];
+    const previousPresentedFrames = session.latestPresentedFrames;
+    const placement = session.placement = {
+      requestedEpoch, resolvedEpoch: mapped.resolvedEpoch, mappedTargetMediaTime: mapped.mediaTime,
+      sessionId: session.id, presentationId: session.presentationId,
+      startedAtMs: this._now(), durationMs: null, disposition: "observing", failureReason: null,
+      initialRvfcMediaTime: null, initialRepresentedEpoch: null,
+      rvfcObservationCount: 0, ignoredStaleFrameCount: 0, seekMediaRange,
+      acceptedRvfcMediaTime: null, acceptedRepresentedEpoch: null, acceptedOffsetSeconds: null
+    };
     return new Promise((resolve, reject) => {
       let callbackId = null;
       let settled = false;
@@ -834,32 +891,66 @@ export class LongVodTwoPeerExperiment {
         settled = true;
         session.pendingFrameWaitCancel = null;
         this._clearTimer(timer);
-        if (callbackId !== null) session.video.cancelVideoFrameCallback?.(callbackId);
+        if (callbackId !== null) video.cancelVideoFrameCallback?.(callbackId);
+        video.removeEventListener?.("error", onMediaError);
+        video.removeEventListener?.("ended", onEnded);
+        placement.durationMs = this._now() - placement.startedAtMs;
+        placement.disposition = error ? "failed" : "accepted";
+        placement.failureReason = error ? failureText(error.message) : null;
         error ? reject(error) : resolve();
       };
-      session.pendingFrameWaitCancel = () => finish(new Error("Stale long-VOD seek."));
+      const onMediaError = () => finish(new Error("Media error during target-frame placement."));
+      const onEnded = () => finish(new Error("Presentation ended before target-frame placement."));
+      session.pendingFrameWaitCancel = error => finish(error ?? new Error("Stale long-VOD seek."));
+      video.addEventListener?.("error", onMediaError);
+      video.addEventListener?.("ended", onEnded);
       const observe = (wallMs, metadata = {}) => {
+        if (settled) return;
         callbackId = null;
         try {
           this._assertCurrent(generation);
-          if (!owned()) throw new Error("Stale long-VOD seek.");
-          const mappedFrame = mediaToEpoch(session.presentation, Number(metadata.mediaTime));
-          this._acceptFrame(session, wallMs, metadata, mappedFrame.epoch);
-          if (Math.abs(mappedFrame.epoch - mapped.resolvedEpoch) <= SEEK_TOLERANCE_SECONDS) {
-            session.mediaReadiness.firstTruthfulRvfcLatencyMs ??= this._now() - session.operationStartedAtMs;
-            finish();
+          if (!owned() || session.video !== video || session.presentation !== presentation ||
+              session.placement !== placement) throw new Error("Stale long-VOD seek.");
+          placement.rvfcObservationCount += 1;
+          const presentedAt = observedNumber(metadata.presentationTime);
+          const presentedFrames = observedNumber(metadata.presentedFrames);
+          if ((presentedAt !== null && presentedAt < placement.startedAtMs) ||
+              (previousPresentedFrames !== null && presentedFrames !== null && presentedFrames <= previousPresentedFrames)) {
+            placement.ignoredStaleFrameCount += 1;
+            callbackId = video.requestVideoFrameCallback(observe);
+            return;
           }
-          else callbackId = session.video.requestVideoFrameCallback(observe);
+          const mediaTime = observedNumber(metadata.mediaTime);
+          if (mediaTime === null) throw new Error("Presented frame has no valid media time.");
+          const mappedFrame = mediaToEpoch(presentation, mediaTime);
+          if (mappedFrame.isBoundary || mediaTime < seekMediaRange[0] || mediaTime >= seekMediaRange[1]) {
+            throw new Error("Presented frame is outside the requested seek's mapped context.");
+          }
+          if (Number(video.readyState) < 2) throw new Error("Presented seek frame is not ready.");
+          this._acceptFrame(session, wallMs, metadata, mappedFrame.epoch);
+          placement.initialRvfcMediaTime = placement.acceptedRvfcMediaTime = mediaTime;
+          placement.initialRepresentedEpoch = placement.acceptedRepresentedEpoch = mappedFrame.epoch;
+          placement.acceptedOffsetSeconds = mappedFrame.epoch - requestedEpoch;
+          session.mediaReadiness.firstTruthfulRvfcLatencyMs ??= this._now() - session.operationStartedAtMs;
+          // RVFC can precede seeked. Keep this frame; the caller also waits for
+          // the seek to settle before committing a paused Place.
+          finish();
         } catch (error) { finish(error); }
       };
-      callbackId = session.video.requestVideoFrameCallback(observe);
+      if (video.error) onMediaError();
+      else if (video.ended) onEnded();
+      else if (session.hlsErrors.some(error => error.fatal)) {
+        finish(new Error("Fatal HLS error during target-frame placement."));
+      } else callbackId = video.requestVideoFrameCallback(observe);
     });
   }
 
   _startFrameObservation(session, generation) {
+    const placement = session.placement;
     const observe = (wallMs, metadata = {}) => {
+      if (session.destroyed || generation !== this._generation || this._destroyed ||
+          session.placement !== placement) return;
       session.frameCallbackId = null;
-      if (session.destroyed || generation !== this._generation || this._destroyed) return;
       try {
         const mapped = mediaToEpoch(session.presentation, Number(metadata.mediaTime));
         this._acceptFrame(session, wallMs, metadata, mapped.epoch);
@@ -902,6 +993,7 @@ export class LongVodTwoPeerExperiment {
     const error = follower.representedEpoch - reference.representedEpoch;
     const sample = {
       observedAtMs,
+      requestedPlaybackRate: this._playbackRate,
       elapsedWallTimeMs: this._playStartedAtMs === null ? 0 : Math.max(0, observedAtMs - this._playStartedAtMs),
       referenceRepresentedEpoch: reference.representedEpoch,
       followerRepresentedEpoch: follower.representedEpoch,
@@ -988,6 +1080,7 @@ export class LongVodTwoPeerExperiment {
         session.lifecycle = "fatal-hls-error";
         this._playing = false;
         this._status = `${session.camera} reported a fatal HLS error`;
+        session.pendingFrameWaitCancel?.(new Error("Fatal HLS error during target-frame placement."));
         this._emit();
       }
     };
@@ -1047,8 +1140,9 @@ export class LongVodTwoPeerExperiment {
       preparationLatencyMs: session.preparationLatencyMs,
       manifest: { ...session.manifest }, mediaReadiness: { ...session.mediaReadiness },
       seekProbes: session.seekProbes.map(probe => ({ ...probe })),
-      requestedEpoch: this._requestedEpoch,
-      resolvedEpoch: session.presentation.resolved_selected_epoch,
+      placement: session.placement ? { ...session.placement } : null,
+      requestedEpoch: session.placement?.requestedEpoch ?? this._requestedEpoch,
+      resolvedEpoch: session.placement?.resolvedEpoch ?? session.presentation.resolved_selected_epoch,
       latestRvfcMediaTime: session.latestRvfcMediaTime,
       latestRepresentedEpoch: session.representedEpoch,
       latestPresentedFrames: session.latestPresentedFrames,
@@ -1063,12 +1157,67 @@ export class LongVodTwoPeerExperiment {
       playingCount: session.playingCount, pauseCount: session.pauseCount,
       hlsErrorCount: session.hlsErrorCount,
       hlsErrors: session.hlsErrors.map(error => ({ ...error })),
-      requestedPlaybackRate: 1, actualPlaybackRate: finite(session.video.playbackRate),
+      requestedPlaybackRate: this._playbackRate, actualPlaybackRate: finite(session.video.playbackRate),
       droppedVideoFrames: finite(quality?.droppedVideoFrames),
       totalVideoFrames: finite(quality?.totalVideoFrames),
       stoppedAdvancing: this._playing && session.latestRvfcAtMs !== null &&
         now - session.latestRvfcAtMs >= this._policy.stoppedAdvancingAfterMs
     };
+  }
+
+  _retainFailedPlacement(generation, error, failedSession = null) {
+    if (generation !== this._generation || this._destroyed || failedSession?.destroyed) return;
+    const reason = failureText(error?.message);
+    if (!this._failedPlacement) {
+      const now = this._now();
+      const target = this._operation?.requestedEpoch ?? null;
+      const sessions = [...this._pendingSessions, ...this._sessions.values()];
+      this._failedPlacement = {
+        operationId: generation, requestedEpoch: target, capturedAtMs: now,
+        reason, capturePhase: "before-first-placement-teardown",
+        documentVisibility: globalThis.document?.visibilityState ?? null,
+        resources: {
+          currentVideoElements: this._resources.videoElementsCreated - this._resources.videoElementsDestroyed,
+          currentHlsInstances: this._resources.hlsInstancesCreated - this._resources.hlsInstancesDestroyed
+        },
+        authenticationScope: "experiment-cumulative",
+        authentication: structuredClone(this._authentication),
+        peers: this._cameras.map((camera, index) => {
+          const session = sessions.find(peer => peer.camera === camera && !peer.destroyed);
+          if (!session) return { camera, sessionId: null, presentationId: null,
+            snapshotAvailable: false, peerRejectionReason: null };
+          const video = session.video;
+          let quality = null;
+          try { quality = video.getVideoPlaybackQuality?.() ?? null; } catch {}
+          return {
+            ...this._sessionDiagnostic(camera, session,
+              index === 0 ? "observation-reference" : "follower-observation", now),
+            snapshotAvailable: true, peerRejectionReason: null,
+            requestedEpoch: target,
+            mappedTargetMediaPosition: session.presentation.selected_media_position,
+            paused: typeof video.paused === "boolean" ? video.paused : null,
+            ended: typeof video.ended === "boolean" ? video.ended : null,
+            latestRvfcAtMs: session.latestRvfcAtMs,
+            targetErrorSeconds: session.representedEpoch === null || target === null
+              ? null : session.representedEpoch - target,
+            videoWidth: observedNumber(video.videoWidth), videoHeight: observedNumber(video.videoHeight),
+            mediaCurrentTime: observedNumber(video.currentTime),
+            mediaCurrentTimeIsFrameTruth: false,
+            readyState: observedNumber(video.readyState), networkState: observedNumber(video.networkState),
+            mediaErrorCode: observedNumber(video.error?.code),
+            mediaErrorEventCount: null,
+            droppedVideoFrames: observedNumber(quality?.droppedVideoFrames),
+            totalVideoFrames: observedNumber(quality?.totalVideoFrames),
+            corruptedVideoFrames: observedNumber(quality?.corruptedVideoFrames),
+            hlsErrors: failureValue(session.hlsErrors)
+          };
+        })
+      };
+    }
+    if (failedSession) {
+      const peer = this._failedPlacement.peers.find(peer => peer.sessionId === failedSession.id);
+      if (peer) peer.peerRejectionReason = reason;
+    }
   }
 
   _destroySessions() {

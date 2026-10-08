@@ -35,9 +35,10 @@ class FakeVideo extends EventTarget {
     this._currentTime = Number(value);
     this.seeking = true;
     queueMicrotask(() => {
+      if (this.frameBeforeSeeked && this.autoFrame !== false) this.emitFrame(this._currentTime + (this.frameOffset ?? 0));
       this.seeking = false;
       this.dispatchEvent(new Event("seeked"));
-      if (this.autoFrame !== false) queueMicrotask(() => this.emitFrame(this._currentTime));
+      if (this.autoFrame !== false && !this.frameBeforeSeeked) queueMicrotask(() => this.emitFrame(this._currentTime));
     });
   }
   makeReady() {
@@ -56,7 +57,7 @@ class FakeVideo extends EventTarget {
     if (!entry) return false;
     const [id, callback] = entry;
     this._callbacks.delete(id);
-    this._currentTime = Number(mediaTime);
+    if (!this.seeking) this._currentTime = Number(mediaTime);
     this._presentedFrames += 1;
     callback(wallMs, { mediaTime: Number(mediaTime), presentedFrames: this._presentedFrames });
     return true;
@@ -154,7 +155,8 @@ function deferred() {
   return { promise, resolve };
 }
 
-function harness({ prepare, now, policy, auth, cameras = CAMERAS, preflight, createXhr } = {}) {
+function harness({ prepare, now, policy, auth, cameras = CAMERAS, preflight, createXhr,
+  autoFrame = true, setTimer, clearTimer, onDestroyed } = {}) {
   MockHls.instances = [];
   const videos = [];
   const sessions = [];
@@ -202,13 +204,13 @@ function harness({ prepare, now, policy, auth, cameras = CAMERAS, preflight, cre
     callWS,
     getAuth: () => currentAuth,
     expectedOrigin: "https://ha.example.test",
-    createVideo: () => { const video = new FakeVideo(); videos.push(video); return video; },
+    createVideo: () => { const video = new FakeVideo(); video.autoFrame = autoFrame; videos.push(video); return video; },
     createXhr,
     loadHls: async () => MockHls,
     onVideoCreated: session => sessions.push(session),
-    onVideoDestroyed: session => destroyed.push(session),
+    onVideoDestroyed: session => { destroyed.push(session); onDestroyed?.(session, experiment); },
     now: now ?? (() => ++clock),
-    policy
+    policy, setTimer, clearTimer
   });
   return { experiment, videos, sessions, destroyed, requests };
 }
@@ -234,6 +236,7 @@ test("places two long V2 presentations with exactly one media pipeline per camer
   assert.equal(value.experiment.state.peers[0].representedEpoch, 10000);
   assert.equal(value.experiment.state.peers[1].representedEpoch, 10000);
   const report = value.experiment.getDiagnosticReport();
+  assert.equal(report.failedPlacement, null);
   assert.deepEqual(report.resources, {
     videoElementsCreated: 2, videoElementsDestroyed: 0,
     hlsInstancesCreated: 2, hlsInstancesDestroyed: 0,
@@ -244,6 +247,247 @@ test("places two long V2 presentations with exactly one media pipeline per camer
   assert.equal(report.architecture.signedPathUsed, false);
   assert.equal(report.authentication.mode, "ha-bearer-per-request");
   assert.equal(report.peers[0].presentation.logicalWallEnd - report.peers[0].presentation.logicalWallStart, 3600);
+});
+
+test("explicit rates persist through placement, play, pause, seek, and resume without replacement", async () => {
+  const value = harness();
+  value.experiment.setPlaybackRate(2);
+  assert.equal(await value.experiment.place(10000), true);
+  const sessions = [...value.sessions];
+  const pipelines = [...MockHls.instances];
+  const resources = value.experiment.getDiagnosticReport().resources;
+  for (const rate of [1, 2, 4, 8, 16, 1]) {
+    value.experiment.setPlaybackRate(rate);
+    assert.equal(await value.experiment.seekAbsolute(10010), true);
+    assert.equal(await value.experiment.play(), true);
+    assert.ok(value.videos.every(video => video.playbackRate === rate && !video.paused));
+    const report = value.experiment.getDiagnosticReport();
+    assert.equal(report.state.nominalPlaybackRate, rate);
+    assert.equal(report.policy.playbackRate, rate);
+    assert.ok(report.peers.every(peer => peer.requestedPlaybackRate === rate && peer.actualPlaybackRate === rate));
+    assert.ok(report.state.peers.every(peer => peer.nominalPlaybackRate === rate));
+    assert.deepEqual(report.resources, resources);
+    value.experiment.pause();
+    assert.equal(await value.experiment.resume(), true);
+    assert.ok(value.videos.every(video => video.playbackRate === rate));
+    value.experiment.pause();
+  }
+  assert.deepEqual(value.sessions, sessions);
+  assert.deepEqual(MockHls.instances, pipelines);
+  assert.equal(value.requests.length, 2);
+  assert.equal(value.destroyed.length, 0);
+  value.experiment.destroy();
+});
+
+for (const [label, offset] of [
+  ["exact target", 0], ["before target", -0.060056], ["after target", 0.015],
+  ["offset beyond the former precision gate", 0.3]
+]) test(`paused placement retains the actual current-operation frame: ${label}`, async () => {
+  const value = harness({ cameras: [CAMERAS[0]], autoFrame: false });
+  value.experiment.setPlaybackRate(16);
+  const pending = value.experiment.place(10000);
+  await new Promise(resolve => setImmediate(resolve));
+  const video = value.videos[0];
+  const lastCallback = video._callbacks.values().next().value;
+  assert.equal(video.emitFrame(36 + offset), true);
+  assert.equal(await pending, true);
+  const placed = value.experiment.getDiagnosticReport().peers[0].placement;
+  assert.equal(placed.rvfcObservationCount, 1);
+  assert.ok(Math.abs(placed.acceptedRepresentedEpoch - (10000 + offset)) < 0.000001);
+  assert.ok(Math.abs(placed.acceptedOffsetSeconds - offset) < 0.000001);
+  assert.equal(placed.acceptedRvfcMediaTime, 36 + offset);
+  assert.equal(video.playbackRate, 16);
+  assert.equal(video.paused, true);
+  assert.equal(value.sessions[0].playingCount, 0);
+  lastCallback(2000, {mediaTime:36.039,presentedFrames:2});
+  assert.deepEqual(value.experiment.getDiagnosticReport().peers[0].placement, placed);
+  assert.equal(value.sessions[0].representedEpoch, placed.acceptedRepresentedEpoch);
+  assert.equal(value.requests.length, 1);
+  assert.equal(MockHls.instances.length, 1);
+  value.experiment.destroy();
+});
+
+test("peers retain different pre-target frames paused without any correction or chasing", async () => {
+  const value = harness({ autoFrame: false });
+  const pending = value.experiment.place(10000);
+  await new Promise(resolve => setImmediate(resolve));
+  value.videos[0].emitFrame(36 - 0.009956);
+  value.videos[1].emitFrame(37 - 0.060056);
+  assert.equal(await pending, true);
+  const report = value.experiment.getDiagnosticReport();
+  assert.ok(Math.abs(report.state.followerErrorSeconds + 0.0501) < 0.000001);
+  assert.deepEqual(report.peers.map(peer => peer.totalRvfcObservations), [1, 1]);
+  assert.ok(report.peers.every(peer => peer.placement.acceptedRepresentedEpoch < 10000));
+  assert.ok(value.videos.every(video => video.paused));
+  assert.deepEqual(report.peers.map(peer => peer.playingCount), [0, 0]);
+  assert.equal(report.resources.currentVideoElements, 2);
+  assert.equal(report.resources.currentHlsInstances, 2);
+  assert.equal(report.architecture.correction, "none");
+  assert.equal(value.requests.length, 2);
+  value.experiment.destroy();
+});
+
+test("a truthful RVFC delivered while seeking is retained until seeked without waiting for another frame", async () => {
+  const value = harness();
+  const create = value.experiment._createVideo;
+  value.experiment._createVideo = () => {
+    const video = create(); video.frameBeforeSeeked = true; video.frameOffset = -0.060056; return video;
+  };
+  assert.equal(await value.experiment.place(10000), true);
+  const report = value.experiment.getDiagnosticReport();
+  assert.ok(report.peers.every(peer => peer.totalRvfcObservations === 1 && peer.seekedCount === 1));
+  assert.ok(report.peers.every(peer => Math.abs(peer.placement.acceptedOffsetSeconds + 0.060056) < 0.000001));
+  assert.ok(value.videos.every(video => video.paused));
+  value.experiment.destroy();
+});
+
+test("frames presented before the seek began cannot authorize the current placement", async () => {
+  const value = harness({cameras:[CAMERAS[0]],autoFrame:false});
+  const pending = value.experiment.place(10000);
+  await new Promise(resolve => setImmediate(resolve));
+  const session = value.sessions[0];
+  const callback = value.videos[0]._callbacks.values().next().value;
+  callback(2000, {mediaTime:36,presentedFrames:1,presentationTime:session.placement.startedAtMs-1});
+  assert.equal(session.placement.acceptedRepresentedEpoch, null);
+  assert.equal(session.representedEpoch, null);
+  assert.equal(session.placement.ignoredStaleFrameCount, 1);
+  // The directly invoked stale callback is no longer pending in a real browser.
+  value.videos[0]._callbacks.delete(value.videos[0]._callbacks.keys().next().value);
+  value.videos[0].emitFrame(35.94);
+  assert.equal(await pending, true);
+  assert.equal(session.placement.rvfcObservationCount, 2);
+  assert.equal(session.playingCount, 0);
+  value.experiment.destroy();
+});
+
+test("a callback from a superseded placement cannot authorize or mutate its replacement", async () => {
+  const value = harness({autoFrame:false});
+  const oldPlace = value.experiment.place(10000);
+  await new Promise(resolve => setImmediate(resolve));
+  const oldCallbacks = value.videos.map(video => video._callbacks.values().next().value);
+  const newPlace = value.experiment.place(10020);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(await oldPlace, false);
+  oldCallbacks.forEach(callback => callback(2000, {mediaTime:36,presentedFrames:1}));
+  assert.ok(value.sessions.slice(2).every(session => session.representedEpoch === null));
+  value.videos[2].emitFrame(35.94);
+  value.videos[3].emitFrame(37.015);
+  assert.equal(await newPlace, true);
+  assert.equal(value.experiment.state.requestedEpoch, 10020);
+  const report = value.experiment.getDiagnosticReport();
+  assert.ok(report.peers.every(peer => peer.placement.rvfcObservationCount === 1));
+  assert.equal(report.resources.currentVideoElements, 2);
+  assert.equal(report.resources.currentHlsInstances, 2);
+  value.experiment.destroy();
+});
+
+test("prior seek and observation callbacks on the same video cannot mutate a newer seek", async () => {
+  const value = harness({cameras:[CAMERAS[0]]});
+  assert.equal(await value.experiment.place(10000),true);
+  const video=value.videos[0];
+  const oldObservation=video._callbacks.values().next().value;
+  video.autoFrame=false;
+  const oldSeek=value.experiment.seekAbsolute(10010);
+  await new Promise(resolve=>setImmediate(resolve));
+  const oldSeekCallback=video._callbacks.values().next().value;
+  const currentSeek=value.experiment.seekAbsolute(10020);
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(await oldSeek,false);
+  const before=value.experiment.getDiagnosticReport().peers[0];
+  oldSeekCallback(2000,{mediaTime:46,presentedFrames:2});
+  oldObservation(2000,{mediaTime:36,presentedFrames:1});
+  const after=value.experiment.getDiagnosticReport().peers[0];
+  assert.deepEqual(after.placement,before.placement);
+  assert.equal(after.latestRepresentedEpoch,before.latestRepresentedEpoch);
+  assert.equal(after.totalRvfcObservations,before.totalRvfcObservations);
+  video.emitFrame(55.94);
+  assert.equal(await currentSeek,true);
+  assert.ok(Math.abs(value.experiment.state.peers[0].representedEpoch-10019.94)<0.000001);
+  assert.equal(value.experiment.getDiagnosticReport().resources.currentVideoElements,1);
+  value.experiment.destroy();
+});
+
+for (const failure of ["media", "hls", "ended", "logical-end", "outside-presentation", "unrelated-span"]) {
+  test(`paused placement fails truthfully on ${failure} and balances teardown`, async () => {
+    const value = harness({ autoFrame:false, prepare: message => {
+      const p = presentation(message.camera,message.target,21);
+      p.time_map.spans = [
+        [0,10e6,21e6,31e6], [10e6,20e6,31e6,41e6],
+        [20e6,30e6,41e6,51e6], [30e6,3600e6,51e6,3621e6]
+      ];
+      return p;
+    }});
+    const pending = value.experiment.place(10000);
+    await new Promise(resolve=>setImmediate(resolve));
+    const video = value.videos[0];
+    if (failure === "media") { video.error = {code:3}; video.dispatchEvent(new Event("error")); }
+    if (failure === "hls") MockHls.instances[0].emit(MockHls.Events.ERROR, {
+      type:"mediaError",details:"bufferAppendError",fatal:true
+    });
+    if (failure === "ended") { video.ended = true; video.dispatchEvent(new Event("ended")); }
+    if (failure === "logical-end") video.emitFrame(3621);
+    if (failure === "outside-presentation") video.emitFrame(20);
+    if (failure === "unrelated-span") video.emitFrame(80);
+    assert.equal(await pending, false);
+    const report = value.experiment.getDiagnosticReport();
+    assert.equal(report.resources.currentVideoElements, 0);
+    assert.equal(report.resources.currentHlsInstances, 0);
+    assert.ok(MockHls.instances.every(hls => hls.destroyed));
+    const placed = report.failedPlacement.peers[0].placement;
+    assert.equal(placed.disposition, "failed");
+    assert.equal(placed.acceptedRepresentedEpoch, null);
+    assert.ok(placed.failureReason);
+    value.experiment.destroy();
+  });
+}
+
+test("a discrete frame may land across a mapping boundary without an exact-frame gate", async () => {
+  const value = harness({autoFrame:false,cameras:[CAMERAS[0]],prepare:message=>{
+    const p=presentation(message.camera,message.target,21);
+    p.time_map.spans=[[0,15e6,21e6,36e6],[15e6,3600e6,36e6,3621e6]];
+    return p;
+  }});
+  const pending=value.experiment.place(10000);
+  await new Promise(resolve=>setImmediate(resolve));
+  value.videos[0].emitFrame(35.94);
+  assert.equal(await pending,true);
+  assert.ok(Math.abs(value.experiment.state.peers[0].representedEpoch-9999.94)<0.000001);
+  value.experiment.destroy();
+});
+
+test("rejects unsupported or active-run rate commands without changing either peer", async () => {
+  const value = harness();
+  await value.experiment.place(10000);
+  for (const rate of [0, 0.5, 3, 32, NaN, Infinity, "2", null]) {
+    assert.throws(() => value.experiment.setPlaybackRate(rate), /must be 1, 2, 4, 8, or 16/);
+  }
+  value.experiment.setPlaybackRate(4);
+  await value.experiment.play();
+  assert.throws(() => value.experiment.setPlaybackRate(8), /Pause both peers/);
+  assert.ok(value.videos.every(video => video.playbackRate === 4 && !video.paused));
+  assert.equal(value.experiment.state.nominalPlaybackRate, 4);
+  value.experiment.destroy();
+});
+
+test("rate diagnostics distinguish the explicit request from browser settings and represented progress", async () => {
+  const value = harness({ policy: { sampleIntervalMs: 0 } });
+  await value.experiment.place(10000);
+  value.experiment.setPlaybackRate(16);
+  await value.experiment.play();
+  value.videos[1].playbackRate = 13;
+  value.videos[0].emitFrame(52, 2000);
+  value.videos[1].emitFrame(50, 2000);
+  const report = value.experiment.getDiagnosticReport();
+  assert.equal(report.state.nominalPlaybackRate, 16);
+  assert.deepEqual(report.peers.map(peer => peer.requestedPlaybackRate), [16, 16]);
+  assert.deepEqual(report.peers.map(peer => peer.actualPlaybackRate), [16, 13]);
+  assert.deepEqual(report.peers.map(peer => peer.representedAdvancementSeconds), [16, 13]);
+  assert.equal(report.samples.at(-1).requestedPlaybackRate, 16);
+  assert.equal(report.samples.at(-1).pairErrorSeconds, -3);
+  assert.equal(report.architecture.correction, "none");
+  assert.ok(value.videos.every(video => !video.paused));
+  assert.equal(value.videos[1].playbackRate, 13);
+  value.experiment.destroy();
 });
 
 test("XHR setup authenticates expected manifests, media, init fragments, and keys at request time", async () => {
@@ -490,6 +734,100 @@ test("malformed V2 map data fails closed and destroys partial resources", async 
   assert.equal(report.resources.currentVideoElements, 0);
   assert.equal(report.resources.currentHlsInstances, 0);
   assert.equal(value.experiment.state.operationDisposition, "failed");
+});
+
+test("failed placement retains both peers before teardown with truthful nulls and sanitized facts", async () => {
+  const timers = new Map();
+  let timerId = 0;
+  const atDestruction = [];
+  const value = harness({
+    autoFrame: false,
+    setTimer: callback => { const id = ++timerId; timers.set(id, callback); return id; },
+    clearTimer: id => timers.delete(id),
+    onDestroyed: (_session, experiment) => atDestruction.push(experiment.getDiagnosticReport().failedPlacement)
+  });
+  const placement = value.experiment.place(10000);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(timers.size, 2);
+  value.videos[0].videoWidth = 1920;
+  value.videos[0].videoHeight = 1080;
+  value.videos[0].ended = false;
+  value.videos[1].getVideoPlaybackQuality = undefined;
+  value.videos[0].emitFrame(35.9, 1234);
+  value.videos[0].dispatchEvent(new Event("waiting"));
+  value.videos[1].dispatchEvent(new Event("stalled"));
+  for (let index = 0; index < 20; index += 1) MockHls.instances[0].emit(MockHls.Events.ERROR, {
+    type: "networkError", details: "fragLoadError", fatal: false,
+    url: "https://host/recordings/private?authSig=credential-fixture",
+    response: { code: 403, text: "Bearer credential-fixture" },
+    error: { message: "/recordings/private/file.mp4", name: "NetworkError" },
+    headers: { Authorization: "Bearer credential-fixture" },
+    context: { token: "credential-fixture", password: "credential-fixture" }
+  });
+  timers.values().next().value();
+  assert.equal(await placement, false);
+  const report = value.experiment.getDiagnosticReport();
+  const failure = report.failedPlacement;
+  assert.equal(failure.reason, "No consistent long-VOD frame was presented.");
+  assert.deepEqual(failure.resources, { currentVideoElements: 2, currentHlsInstances: 2 });
+  assert.equal(failure.peers.length, 2);
+  assert.deepEqual(failure.peers.map(peer => peer.camera), CAMERAS);
+  assert.ok(failure.peers.every(peer => peer.snapshotAvailable && peer.requestedEpoch === 10000));
+  assert.deepEqual(failure.peers.map(peer => peer.mappedTargetMediaPosition), [36, 37]);
+  assert.equal(failure.peers[0].latestRvfcMediaTime, 35.9);
+  assert.equal(failure.peers[0].latestRepresentedEpoch, 9999.9);
+  assert.ok(Math.abs(failure.peers[0].targetErrorSeconds + 0.1) < 0.000001);
+  assert.equal(failure.peers[0].latestRvfcAtMs, 1234);
+  assert.equal(failure.peers[0].totalRvfcObservations, 1);
+  assert.equal(failure.peers[1].totalRvfcObservations, 0);
+  assert.equal(failure.peers[1].latestRvfcMediaTime, null);
+  assert.equal(failure.peers[1].latestRepresentedEpoch, null);
+  assert.equal(failure.peers[1].targetErrorSeconds, null);
+  assert.equal(failure.peers[1].videoWidth, null);
+  assert.equal(failure.peers[1].totalVideoFrames, null);
+  assert.equal(failure.peers[1].ended, null);
+  assert.equal(failure.peers[0].waitingCount, 1);
+  assert.equal(failure.peers[1].stalledCount, 1);
+  assert.equal(failure.peers[0].hlsErrorCount, 20);
+  assert.equal(failure.peers[0].hlsErrors.length, 16);
+  assert.equal(failure.peers[0].peerRejectionReason, null);
+  assert.equal(failure.peers[0].lifecycle, "ready-paused");
+  assert.equal(failure.peers[1].peerRejectionReason, failure.reason);
+  assert.ok(atDestruction.every(snapshot => snapshot.peers.length === 2 && snapshot.resources.currentVideoElements === 2));
+  assert.equal(value.destroyed.length, 2);
+  assert.ok(MockHls.instances.every(hls => hls.destroyed));
+  assert.equal(report.resources.currentVideoElements, 0);
+  assert.equal(report.resources.currentHlsInstances, 0);
+  assert.doesNotMatch(JSON.stringify(failure), /credential-fixture|authSig|Authorization|\/recordings\/|https?:\/\//i);
+  failure.peers[0].hlsErrors[0].response.statusCode = 999;
+  assert.equal(value.experiment.getDiagnosticReport().failedPlacement.peers[0].hlsErrors[0].response.statusCode, 403);
+  const createVideo = value.experiment._createVideo;
+  value.experiment._createVideo = () => { const video = createVideo(); video.autoFrame = true; return video; };
+  assert.equal(await value.experiment.place(10000), true);
+  assert.equal(value.experiment.getDiagnosticReport().failedPlacement, null);
+  value.experiment.destroy();
+});
+
+test("placement failure distinguishes a ready peer from the peer whose frame wait failed", async () => {
+  const timers = new Map();
+  let timerId = 0;
+  const value = harness({ autoFrame: false,
+    setTimer: callback => { const id = ++timerId; timers.set(id, callback); return id; },
+    clearTimer: id => timers.delete(id) });
+  const placement = value.experiment.place(10000);
+  await new Promise(resolve => setImmediate(resolve));
+  value.videos[0].emitFrame(36, 1200);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(timers.size, 1);
+  timers.values().next().value();
+  assert.equal(await placement, false);
+  const peers = value.experiment.getDiagnosticReport().failedPlacement.peers;
+  assert.equal(peers[0].lifecycle, "ready-paused");
+  assert.equal(peers[0].targetErrorSeconds, 0);
+  assert.equal(peers[0].peerRejectionReason, null);
+  assert.equal(peers[1].peerRejectionReason, "No consistent long-VOD frame was presented.");
+  assert.equal(value.destroyed.length, 2);
+  value.experiment.destroy();
 });
 
 test("a newer Place supersedes stale preparation without letting it mutate current state", async () => {

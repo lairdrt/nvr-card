@@ -1599,7 +1599,7 @@ test("diagnostics are bounded, lifecycle-accounted, and exclude signed URLs", as
 test("two-peer Lab is isolated from production controllers and renders equal peer cells", async () => {
   const source = await readFile(new URL("../src/investigation-lab/investigation-playback-lab.js", import.meta.url), "utf8");
   assert.match(source, /customElements\.define\("investigation-playback-lab"/);
-  for (const label of ["Place", "Play 1x", "Pause", "Resume 1x", "Reset"]) {
+  for (const label of ["Place", "Play", "Pause", "Resume", "Reset", "Requested rate"]) {
     assert.ok(source.includes(label), `missing ${label}`);
   }
   assert.match(source, /Historical camera peers/);
@@ -1683,7 +1683,8 @@ test("lab card copies the complete displayed sanitized diagnostics and reports c
     card.setConfig({ cameras: ["driveway", "side_yard"] });
     assert.deepEqual([...card.shadowRoot.querySelectorAll(".peer")].map(peer => peer.dataset.camera),
       ["driveway", "side_yard"]);
-    assert.equal(card.shadowRoot.querySelector(".rate-select"), null);
+    const rateSelect = card.shadowRoot.querySelector(".rate-select");
+    assert.deepEqual([...rateSelect.options].map(option => option.value), ["1", "2", "4", "8", "16"]);
     const report = {
       mode: "two-peer-rvfc-clock-holder-observation",
       observations: [{ errorSeconds: -0.05 }]
@@ -1691,9 +1692,12 @@ test("lab card copies the complete displayed sanitized diagnostics and reports c
     let destroyed = 0;
     let reportCalls = 0;
     let placedEpoch = null;
+    let requestedRate = null;
     card._coordinator = {
       getDiagnosticReport: () => { reportCalls += 1; return structuredClone(report); },
       place: epoch => { placedEpoch = epoch; return true; },
+      setPlaybackRate: rate => { requestedRate = rate; state.nominalPlaybackRate = rate; return true; },
+      get state() { return state; },
       destroy: () => { destroyed += 1; }
     };
     card.shadowRoot.querySelector(".ti").value = "2026-09-23T08:23:40";
@@ -1723,6 +1727,17 @@ test("lab card copies the complete displayed sanitized diagnostics and reports c
     card._update(state);
     card._update({ ...state, playbackEpoch: 100.05 });
     card._update({ ...state, playbackEpoch: 100.1 });
+    rateSelect.value = "16";
+    rateSelect.dispatchEvent(new browser.Event("change"));
+    await Promise.resolve();
+    assert.equal(requestedRate, 16);
+    card._update({ ...state, playing: true, peers: state.peers.map(peer => ({
+      ...peer, nominalPlaybackRate: 16, actualPlaybackRate: 13
+    })) });
+    assert.equal(rateSelect.disabled, true);
+    assert.match(card.shadowRoot.querySelector(".peer-sync").textContent, /requested 16x \| browser rate 13.00x/);
+    card._update(state);
+    assert.equal(rateSelect.disabled, false);
 
     const diagnostics = card.shadowRoot.querySelector(".diagnostics");
     const button = card.shadowRoot.querySelector(".copy-diagnostics");

@@ -33,12 +33,12 @@ function mapper(presentation) {
 
 export class NativeVodSyncExperiment {
   constructor({ start, end, preparations, Hls, createVideo, getAuth, expectedOrigin,
-    now = () => performance.now() }) {
+    now = () => performance.now(), cameras = CAMERAS }) {
     if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) throw new Error("Invalid native VOD interval.");
     this.start = start; this.end = end; this.Hls = Hls;
     this.createVideo = createVideo; this.getAuth = getAuth;
     this.origin = new URL(expectedOrigin).origin; this.now = now;
-    this.peers = CAMERAS.map((camera, index) => {
+    this.peers = cameras.map((camera, index) => {
       const prepared = preparations.find(value => value.camera === camera);
       if (prepared?.requestedStart !== start || prepared?.requestedEnd !== end) throw new Error("Native VOD bounds differ.");
       const presentation = validateHistoricalPresentation(prepared.observationPresentation, camera);
@@ -107,6 +107,13 @@ export class NativeVodSyncExperiment {
         if (data?.fatal) peer.fatal = true;
       });
       const observe = (wallMs, metadata) => {
+        // Opt-in raw capture replaces the legacy observer, including its UI hook.
+        // Recorder ownership classification retains rejected/stale evidence.
+        if (peer.rawRecorder) {
+          peer.rawRecorder.capture(wallMs, metadata, video);
+          if (!this.destroyed) peer.callback = video.requestVideoFrameCallback(observe);
+          return;
+        }
         if (this.destroyed) return;
         if (!this.acceptObservation(peer, metadata)) {
           peer.callback = video.requestVideoFrameCallback(observe);
@@ -135,6 +142,23 @@ export class NativeVodSyncExperiment {
   onVideoCreated() {}
   acceptObservation() { return true; }
   onObservation() {}
+
+  // Install after landing, before the bounded Play capture. No media mutation.
+  // The caller supplies immutable ownership, Play/window and landed anchor.
+  setRawRecorder(camera, recorder) {
+    const peer = this.peers.find(value => value.camera === camera);
+    if (!peer || !peer.video || this.destroyed || peer.rawRecorder || recorder?.identity?.camera !== camera ||
+        recorder.identity.sessionId !== peer.id || recorder.identity.presentationId !== peer.id ||
+        typeof recorder.capture !== "function" || ("initial" in peer && (!peer.initial ||
+          recorder.anchor.mediaTime !== peer.initial.mediaTime ||
+          recorder.anchor.absoluteTime !== peer.initial.representedEpoch))) {
+      throw new Error("Invalid raw recorder ownership or landing.");
+    }
+    const currentOwnership = recorder.currentOwnership, video = peer.video;
+    recorder.currentOwnership = () => this.destroyed || peer.rawRecorder !== recorder || peer.video !== video ||
+      peer.id !== recorder.identity.sessionId || peer.id !== recorder.identity.presentationId ? null : currentOwnership();
+    peer.rawRecorder = recorder;
+  }
 
   playPeers() {
     // No readiness barrier, position assignment, or launch-skew compensation.
@@ -175,12 +199,14 @@ export class NativeVodSyncExperiment {
       slope = variance ? xs.reduce((sum,x,i)=>sum+(x-mx)*(signed[i]-my),0)/variance : null;
     }
     return { build: NATIVE_VOD_BUILD, requestedStart: this.start, requestedEnd: this.end, hlsVersion: this.Hls.version,
+      measurementKind: "legacy-callback-time-diagnostics", synchronizationEvidence: false,
       startedAt: this.startedAt, finishedAt: this.finishedAt, elapsedWallSeconds: (at-this.startedAt)/1000,
       architecture: { place: false, currentTimeWrites: 0, playbackRateWrites: 0, correction: false, sourceReplacement: false },
       resources: { ...this.resources, activeVideos: this.resources.videosCreated-this.resources.videosDestroyed,
         activeHls: this.resources.hlsCreated-this.resources.hlsDestroyed }, authentication: { ...this.auth },
-      playInvocationSkewMs: this.peers[1].times.playInvoked-this.peers[0].times.playInvoked,
-      pair: { sign: "drive_down minus drive_up", sampleCount: signed.length,
+      playInvocationSkewMs: this.peers.length === 2 ? this.peers[1].times.playInvoked-this.peers[0].times.playInvoked : null,
+      pair: { name: "legacy-callback-time-diagnostic", synchronizationEvidence: false,
+        sign: "drive_down minus drive_up", sampleCount: signed.length,
         firstSignedSeconds: first?.signedErrorSeconds ?? null, firstAbsoluteSeconds: first ? Math.abs(first.signedErrorSeconds) : null,
         medianAbsoluteSeconds: percentile(absolute,0.5), p95AbsoluteSeconds: percentile(absolute,0.95),
         maxAbsoluteSeconds: absolute.at(-1) ?? null, minSignedSeconds: signed.length ? Math.min(...signed) : null,
