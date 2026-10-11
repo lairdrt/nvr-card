@@ -339,11 +339,11 @@ class FrigateMaxProbeTests(unittest.TestCase):
         run = {"known_start": 1000.0, "known_end": 10000.0}
         window = probe.build_presentation_window(2000, run, 1000, 12000)
         self.assertEqual(window["logical_start"], 1985)
-        self.assertEqual(window["logical_end"], 9185)
-        self.assertEqual(window["logical_end"] - window["logical_start"], 7200)
+        self.assertEqual(window["logical_end"], 5585)
+        self.assertEqual(window["logical_end"] - window["logical_start"], 3600)
         near_end = probe.build_presentation_window(9990, run, 1000, 12000)
         self.assertEqual(near_end["logical_end"], 10000)
-        self.assertEqual(near_end["logical_start"], 2800)
+        self.assertEqual(near_end["logical_start"], 6400)
 
     def test_presentation_window_accepts_short_run_but_never_crosses_gap(self) -> None:
         short = probe.build_presentation_window(
@@ -356,16 +356,16 @@ class FrigateMaxProbeTests(unittest.TestCase):
                 1020, {"known_start": 1000, "known_end": 1010}, 900, 1100
             )
 
-    def test_two_hour_window_stays_inside_short_coverage_and_a_real_gap(self) -> None:
+    def test_hour_window_stays_inside_short_coverage_and_a_real_gap(self) -> None:
         rows = [
-            {"start_time": 1000, "end_time": 5000},
-            {"start_time": 5010, "end_time": 12000},
+            {"start_time": 1000, "end_time": 3000},
+            {"start_time": 3010, "end_time": 12000},
         ]
         run = probe.find_coverage_run(rows, 1015, 1000, 12000)
-        self.assertEqual(run["known_end"], 5000)
+        self.assertEqual(run["known_end"], 3000)
         window = probe.build_presentation_window(1015, run, 1000, 12000)
-        self.assertEqual((window["logical_start"], window["logical_end"]), (1000, 5000))
-        self.assertEqual(window["logical_end"] - window["logical_start"], 4000)
+        self.assertEqual((window["logical_start"], window["logical_end"]), (1000, 3000))
+        self.assertEqual(window["logical_end"] - window["logical_start"], 2000)
 
     def test_piecewise_map_associates_keyframe_origin_and_clips_lookahead(self) -> None:
         result = probe.build_piecewise_time_map(
@@ -638,7 +638,7 @@ class FrigateMaxProbeTests(unittest.TestCase):
         normal = probe.build_presentation_window(
             target, probe.find_coverage_run(rows, target, start, end), start, end
         )
-        self.assertEqual(normal["logical_end"] - normal["logical_start"], 7200)
+        self.assertEqual(normal["logical_end"] - normal["logical_start"], 3600)
 
     def test_lab_range_rejects_gap_and_unsafe_or_unbounded_requests(self) -> None:
         for args in (

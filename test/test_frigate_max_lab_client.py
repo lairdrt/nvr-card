@@ -55,7 +55,7 @@ class FixtureClient(client_module.FrigateProbeClient):
 
 
 class FrigateMaxLabClientTests(unittest.IsolatedAsyncioTestCase):
-    async def test_lab_preflight_and_prepare_cross_1080_while_normal_v2_stays_two_hour_bounded(self) -> None:
+    async def test_lab_preflight_and_prepare_cross_1080_while_normal_v2_stays_hour_bounded(self) -> None:
         start = 1000.0
         rows = [
             {"id": f"row-{index}", "private_path": f"/private/row-{index}.mp4",
@@ -78,14 +78,14 @@ class FrigateMaxLabClientTests(unittest.IsolatedAsyncioTestCase):
 
         normal = await client.prepare_presentation("garage", start + 15, start, end)
         self.assertEqual(normal["logical_wall_start"], start)
-        self.assertEqual(normal["logical_wall_end"], start + 7200)
-        self.assertEqual(normal["requested_wall_end"] - normal["requested_wall_start"], 7200)
-        self.assertEqual(len(normal["time_map"]["spans"]), 720)
+        self.assertEqual(normal["logical_wall_end"], start + 3600)
+        self.assertEqual(normal["requested_wall_end"] - normal["requested_wall_start"], 3600)
+        self.assertEqual(len(normal["time_map"]["spans"]), 360)
         self.assertNotIn("candidate_recording_row_count", normal)
         self.assertNotIn("mapping_clip_count", normal)
         self.assertNotIn("/private/", repr(probe.normalize_presentation_result(normal, "garage")))
 
-    async def test_normal_v2_centered_target_allows_four_hour_coverage_query(self) -> None:
+    async def test_normal_v2_centered_target_allows_two_hour_coverage_query(self) -> None:
         start = 1000.0
         rows = [
             {"id": f"row-{index}", "start_time": start + index * 10,
@@ -96,27 +96,27 @@ class FrigateMaxLabClientTests(unittest.IsolatedAsyncioTestCase):
         target = start + 7200
         normal = await client.prepare_presentation("garage", target, start, start + 14400)
         self.assertEqual(normal["logical_wall_start"], target - 15)
-        self.assertEqual(normal["logical_wall_end"], target - 15 + 7200)
-        self.assertEqual(len(normal["time_map"]["spans"]), 721)
+        self.assertEqual(normal["logical_wall_end"], target - 15 + 3600)
+        self.assertEqual(len(normal["time_map"]["spans"]), 361)
 
     async def test_normal_v2_short_coverage_stops_before_a_real_gap(self) -> None:
         start = 1000.0
         rows = [
             {"id": f"first-{index}", "start_time": start + index * 10,
              "end_time": start + (index + 1) * 10}
-            for index in range(400)
+            for index in range(200)
         ]
         rows.extend(
-            {"id": f"later-{index}", "start_time": start + 4010 + index * 10,
-             "end_time": start + 4020 + index * 10}
+            {"id": f"later-{index}", "start_time": start + 2010 + index * 10,
+             "end_time": start + 2020 + index * 10}
             for index in range(400)
         )
         client = FixtureClient(rows)
         normal = await client.prepare_presentation("garage", start + 15, start, start + 9000)
         self.assertEqual(normal["logical_wall_start"], start)
-        self.assertEqual(normal["logical_wall_end"], start + 4000)
-        self.assertEqual(len(normal["time_map"]["spans"]), 400)
-        self.assertEqual(normal["logical_media_end_position"], 4000)
+        self.assertEqual(normal["logical_wall_end"], start + 2000)
+        self.assertEqual(len(normal["time_map"]["spans"]), 200)
+        self.assertEqual(normal["logical_media_end_position"], 2000)
 
 
 if __name__ == "__main__":

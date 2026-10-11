@@ -14,9 +14,9 @@ MAX_RANGE_SECONDS = 300.0
 MAX_REVIEW_RANGE_SECONDS = 7 * 24 * 60 * 60.0
 MAX_AVAILABILITY_RANGE_SECONDS = 2 * 60 * 60.0
 MAX_PRESENTATION_BOUNDS_SECONDS = MAX_REVIEW_RANGE_SECONDS
+MAX_PRESENTATION_QUERY_SECONDS = MAX_AVAILABILITY_RANGE_SECONDS + 60.0
 RECORDING_MERGE_TOLERANCE_SECONDS = 1.5
-PRESENTATION_MAX_SECONDS = 2 * 60 * 60.0
-MAX_PRESENTATION_QUERY_SECONDS = 2 * PRESENTATION_MAX_SECONDS + 60.0
+PRESENTATION_MAX_SECONDS = 60 * 60.0
 PRESENTATION_PREROLL_SECONDS = 15.0
 MAPPING_LOOKAROUND_SECONDS = 30.0
 LAB_MAX_PROBE_SECONDS = 5 * 60 * 60.0  # Temporary provider-limit experiment only.
@@ -405,7 +405,7 @@ def build_presentation_window(
     review_end: float,
     confirmed_end: float | None = None,
 ) -> dict[str, float]:
-    """Select a forward-biased, at-most-two-hour logical presentation window."""
+    """Select a forward-biased, at-most-hour logical presentation window."""
     target_epoch = _finite_number(target, "target")
     bounds_start = _finite_number(review_start, "review_start")
     bounds_end = _finite_number(review_end, "review_end")

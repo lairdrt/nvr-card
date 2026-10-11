@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import time
+from collections.abc import Mapping
 from typing import Any
 from urllib.parse import quote
 
@@ -13,7 +15,6 @@ from .probe import (
     ProbeDataError,
     MAPPING_LOOKAROUND_SECONDS,
     MAX_PRESENTATION_QUERY_SECONDS,
-    PRESENTATION_MAX_SECONDS,
     candidate_probe_windows,
     build_piecewise_time_map,
     build_presentation_window,
@@ -175,19 +176,74 @@ class FrigateProbeClient:
     async def get_review_events(
         self, cameras: list[str], from_epoch: float, to_epoch: float
     ) -> list[dict[str, Any]]:
-        """Return normalized Frigate events for the requested Review window."""
+        """Return every start-in-range event or fail when a cursor is ambiguous."""
+        page_size = 1000
         events: list[dict[str, Any]] = []
         for camera in cameras:
-            result = await self._get_json(
-                "/api/events",
-                params={
-                    "camera": camera,
-                    "after": str(from_epoch),
-                    "before": str(to_epoch),
-                    "limit": "1000",
-                },
-            )
-            events.extend(normalize_review_events(result, camera))
+            # Frigate uses strict start-time predicates. Expand only the two
+            # outer endpoints so records starting exactly at When.from/to are
+            # included in a response that claims complete coverage.
+            lower = math.nextafter(from_epoch, -math.inf)
+            cursor = math.nextafter(to_epoch, math.inf)
+            seen: set[str] = set()
+            camera_events: list[dict[str, Any]] = []
+
+            async def fetch(after: float, before: float) -> list[dict[str, Any]]:
+                result = await self._get_json(
+                    "/api/events",
+                    params={
+                        "camera": camera,
+                        "after": str(after),
+                        "before": str(before),
+                        "limit": str(page_size),
+                        "include_thumbnails": "0",
+                    },
+                )
+                if not isinstance(result, list) or len(result) > page_size:
+                    raise FrigateProbeError("Frigate event retrieval was incomplete.")
+                previous = math.inf
+                for row in result:
+                    if not isinstance(row, Mapping) or not isinstance(row.get("id"), str) or not row["id"]:
+                        raise FrigateProbeError("Frigate event retrieval was incomplete.")
+                    start = row.get("start_time")
+                    if (isinstance(start, bool) or not isinstance(start, (int, float)) or
+                            not math.isfinite(start) or not after < start < before or
+                            start > previous):
+                        raise FrigateProbeError("Frigate event retrieval was incomplete.")
+                    previous = start
+                return result
+
+            def add(rows: list[dict[str, Any]]) -> None:
+                for row in rows:
+                    if row["id"] not in seen:
+                        seen.add(row["id"])
+                        camera_events.append(row)
+
+            while True:
+                page = await fetch(lower, cursor)
+                add(page)
+                if len(page) < page_size:
+                    break
+
+                boundary = page[-1]["start_time"]
+                if not lower < boundary < cursor:
+                    raise FrigateProbeError("Frigate event retrieval did not advance.")
+                # Both Frigate time predicates are strict. Adjacent floats select
+                # exactly the boundary timestamp, including records beyond the
+                # first page. A full bucket cannot be proven complete.
+                bucket = await fetch(
+                    math.nextafter(boundary, -math.inf),
+                    math.nextafter(boundary, math.inf),
+                )
+                if (len(bucket) == page_size or
+                        any(row["start_time"] != boundary for row in bucket) or
+                        not {row["id"] for row in page if row["start_time"] == boundary}
+                        .issubset({row["id"] for row in bucket})):
+                    raise FrigateProbeError("Frigate event retrieval was incomplete.")
+                add(bucket)
+                cursor = boundary
+
+            events.extend(normalize_review_events(camera_events, camera))
         return events
 
     async def get_recording_availability(
@@ -216,8 +272,8 @@ class FrigateProbeClient:
         lab_exact_range: bool = False,
     ) -> dict[str, Any]:
         """Prepare one bounded, absolute-time presentation without exposing Frigate data."""
-        query_start = bounds_start if lab_exact_range else max(bounds_start, target - PRESENTATION_MAX_SECONDS)
-        query_end = bounds_end if lab_exact_range else min(bounds_end, target + PRESENTATION_MAX_SECONDS)
+        query_start = bounds_start if lab_exact_range else max(bounds_start, target - 60 * 60.0)
+        query_end = bounds_end if lab_exact_range else min(bounds_end, target + 60 * 60.0)
         if not lab_exact_range and query_end - query_start > MAX_PRESENTATION_QUERY_SECONDS:
             raise FrigateProbeError("Presentation query envelope is too large.")
         row_start = max(0.0, query_start - MAPPING_LOOKAROUND_SECONDS)

@@ -76,8 +76,8 @@ task; do not reconstruct the whole repository or conversation history.
 ## 4. Runtime-proven experimental evidence
 
 These observations came from the deployed development environment. They do
-not establish production Review acceptance of the current 7,200-second V2
-policy.
+not by themselves establish production Review acceptance; see section 5 for
+the deployed 3,600-second V2 policy.
 
 ### One mapped seek, then hands off (2026-09-26)
 
@@ -175,26 +175,29 @@ exact interval, 2026-09-25 12:00:05-14:00:05 UTC,
 [1790337605, 1790344805). Nine cameras had 721 mapping clips; patio and
 side_gate had 720. Mean was 720.82; worst-case headroom below the measured
 1,080 ceiling was 359 clips (66.76% utilization). Every camera was below
-900 clips. This supports a fixed two-hour policy for the measured workload;
-it does not validate production playback of that policy.
+900 clips. This showed clip-count headroom for a two-hour policy on the
+measured workload; it did not validate production playback of that policy,
+and production now uses one hour (section 5).
 
 ## 5. Source and automated-test evidence only
 
-- Normal FrigateMax V2 now caps a presentation at 7,200 seconds. The recording
-  query envelope expanded to plus/minus 7,200 seconds, with a 14,460-second
-  maximum query guard. The checkpoint validation was backend 39/39, focused
-  historical/playback/Lab JavaScript 407/407, full JavaScript 542/542, syntax
-  checks passed, and git diff --check passed.
+- Normal FrigateMax V2 caps a presentation at 3,600 seconds. The recording
+  query envelope is plus/minus 3,600 seconds, with a 7,260-second maximum
+  query guard (the separate two-hour availability limit plus 60 seconds).
+  This is the deployed Home Assistant policy and has passed real-world
+  Review playback acceptance. A 7,200-second policy was briefly committed in
+  d1c194a but was never runtime-accepted; the repository was reconciled to
+  the deployed one-hour backend on 2026-10-11.
+- The two-hour recording availability limit (MAX_AVAILABILITY_RANGE_SECONDS)
+  is unrelated to the presentation maximum and remains two hours.
 - The change preserves the forward-biased window, 15-second preroll, end
   backfill, Review bounds, continuous-run constraint, genuine gaps, half-open
   logical end, physical/keyframe lookahead, microsecond mapping, safe camera
   IDs, sanitized response, and authentication behavior.
-- Normal V2 does not expose the Lab's experimental clip counts. The normal
-  7,200-second V2 policy is committed and test validated but has NOT received
-  production runtime acceptance.
-- Review's "When" selection default remains 3,600 seconds. That UI range
-  default is separate from the V2 media-presentation maximum; do not change
-  it merely because V2 supports two hours.
+- Normal V2 does not expose the Lab's experimental clip counts.
+- Review's "When" selection default is also 3,600 seconds. That UI range
+  default is separate from the V2 media-presentation maximum; do not couple
+  them.
 - Older Lab single-camera/high-rate and coordinator results belong to earlier
   architectures. They do not accept higher rates on the simplified long-VOD
   architecture. Source/tests are never a substitute for browser/HA runtime
@@ -245,14 +248,14 @@ it does not validate production playback of that policy.
    then nine or eleven if warranted. Measure natural synchronization at
    higher rates and camera counts before considering correction.
 3. Define and runtime-accept the simplest robust continuation at a real
-   presentation boundary. With two-hour presentations, a boundary arrives
-   about every two hours at 1x, one hour at 2x, 30 minutes at 4x, 15 minutes
-   at 8x, and 7.5 minutes at 16x. Do not automatically revive permanent
+   presentation boundary. With one-hour presentations, a boundary arrives
+   about every hour at 1x, 30 minutes at 2x, 15 minutes at 4x, 7.5 minutes
+   at 8x, and 3.75 minutes at 16x. Do not automatically revive permanent
    active/staging architecture.
 4. Runtime-accept final production behavior at genuine recording gaps,
    including truthful held frames while other cameras continue.
-5. Runtime-accept normal production Review using the new 7,200-second V2
-   policy. The complete production Review playback engine is not proven.
+5. Any future increase of the 3,600-second V2 presentation maximum requires
+   its own runtime acceptance before it replaces the deployed policy.
 
 ## 8. Recommended next technical experiment
 
