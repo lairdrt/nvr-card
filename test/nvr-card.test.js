@@ -4489,6 +4489,216 @@ test("narrow navigation focus trap is removed on mode switch and disconnect", t 
   assert.equal(card._mobileNavigationFocusHandler, null);
 });
 
+function setupNarrowReview(harness) {
+  const card = harness.createCard({ shellWidth: 600 });
+  card.setApplicationMode("review");
+  const controller = card._reviewController;
+  controller.setSectionExpanded("cameras", true);
+  controller.setSectionExpanded("layouts", true);
+  return { card, controller, panel: card.querySelector(".review-control-rail"),
+    toggle: card.querySelector(".mobile-navigation-toggle") };
+}
+
+test("narrow Review navigation toggles and dismisses without transport, membership or DOM side effects", t => {
+  const harness = setup(t);
+      const { card, controller, panel, toggle } = setupNarrowReview(harness);
+  const cells = [...card.querySelectorAll(".review-layout-cell")];
+  const media = [...card.querySelectorAll("video, .review-camera-panel")];
+  const assignments = [...controller._reviewAssignments];
+  const epoch = controller.clock.absoluteTime;
+  const running = controller.clock.running;
+  const writes = harness.userStateCalls.length;
+  card.render = () => assert.fail("navigation must not render card");
+  for (const method of ["pausePlayback", "resumePlayback", "playHistorical", "seekHistoricalRelative"]) {
+    controller[method] = () => assert.fail(`navigation must not call ${method}`);
+  }
+  assert.equal(panel.hidden, true);
+  assert.equal(toggle.hidden, false);
+  assert.equal(toggle.getAttribute("aria-controls"), panel.id);
+  toggle.click();
+  assert.equal(panel.hidden, false);
+  assert.equal(panel.getAttribute("aria-hidden"), "false");
+  assert.equal(toggle.getAttribute("aria-expanded"), "true");
+  const tab = new harness.window.KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true });
+  toggle.dispatchEvent(tab);
+  assert.ok(panel.contains(harness.window.document.activeElement));
+  toggle.dispatchEvent(new harness.window.KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+  assert.equal(panel.hidden, true);
+  assert.strictEqual(harness.window.document.activeElement, toggle);
+  toggle.click();
+  const backdrop = card.querySelector(".mobile-navigation-backdrop");
+  const click = new harness.window.MouseEvent("click", { bubbles: true, cancelable: true });
+  backdrop.dispatchEvent(click);
+  assert.equal(click.defaultPrevented, true);
+  assert.equal(card._mobileNavigationOpen, false);
+  assert.deepEqual([...controller._reviewAssignments], assignments);
+  assert.equal(controller.clock.absoluteTime, epoch);
+  assert.equal(controller.clock.running, running);
+  assert.equal(harness.userStateCalls.length, writes);
+  assert.deepEqual([...card.querySelectorAll(".review-layout-cell")], cells);
+  assert.deepEqual([...card.querySelectorAll("video, .review-camera-panel")], media);
+});
+
+for (const kind of ["camera", "layout"]) {
+  test(`narrow Review ${kind} select retracts and the first target click assigns once`, t => {
+    const harness = setup(t);
+    const { card, controller, toggle } = setupNarrowReview(harness);
+    const selector = kind === "camera" ? '.camera-item[data-camera="Patio"]' : '.sidebar-layout-item[data-layout="2x2"]';
+    const selectedKey = kind === "camera" ? "_selectedReviewCamera" : "_selectedReviewLayout";
+    const method = kind === "camera" ? "assignCameraToSlot" : "setReviewLayout";
+    const original = controller[method];
+    const calls = [];
+    controller[method] = function (...args) { calls.push(args); return original.apply(this, args); };
+    toggle.click();
+    card.querySelector(`.review-control-rail ${selector}`).click();
+    assert.equal(card._mobileNavigationOpen, false);
+    assert.equal(controller[selectedKey], kind === "camera" ? "Patio" : "2x2");
+    assert.deepEqual(calls, []);
+    const cell = card.querySelector('.review-layout-cell[data-review-slot="1"]');
+    cell.click();
+    assert.deepEqual(calls, kind === "camera" ? [["Patio", 1]] : [["2x2"]]);
+    assert.equal(controller[selectedKey], null);
+    cell.click();
+    assert.equal(calls.length, 1);
+    toggle.click();
+    card.querySelector(`.review-control-rail ${selector}`).click();
+    toggle.click();
+    card.querySelector(`.review-control-rail ${selector}`).click();
+    assert.equal(controller[selectedKey], null);
+    assert.equal(card._mobileNavigationOpen, true);
+    harness.setShellWidth(card, 601);
+    assert.equal(card._mobileNavigationOpen, false);
+    assert.equal(card.querySelector(".review-control-rail").hidden, false);
+    assert.equal(toggle.hidden, true);
+    card.querySelector(`.review-control-rail ${selector}`).click();
+    assert.equal(card._mobileNavigationOpen, false);
+    assert.equal(card.querySelector(".review-control-rail").hidden, false);
+  });
+
+  for (const ending of ["drop", "invalid", "cancel", "escape", "resize", "mode", "disconnect"]) {
+    test(`narrow Review ${kind} pointer drag: ${ending}`, t => {
+      const harness = setup(t);
+      const { card, controller, panel, toggle } = setupNarrowReview(harness);
+      panel.getBoundingClientRect = () => ({ left: 0, top: 88, right: 240, bottom: 550 });
+      const source = panel.querySelector(kind === "camera" ? '.camera-item[data-camera="Patio"]' : '.sidebar-layout-item[data-layout="2x2"]');
+      const cell = card.querySelector('.review-layout-cell[data-review-slot="1"]');
+      card.getRootNode = () => ({ elementFromPoint: x => x >= 240 && x < 600 ? cell : harness.window.document.body });
+      const method = kind === "camera" ? "assignCameraToSlot" : "setReviewLayout";
+      const original = controller[method];
+      const calls = [];
+      controller[method] = function (...args) { calls.push(args); return original.apply(this, args); };
+      const cells = [...card.querySelectorAll(".review-layout-cell")];
+      const pointer = (type, x, target = harness.window.document) => {
+        const event = new harness.window.Event(type, { bubbles: true, cancelable: true });
+        for (const [key, value] of Object.entries({ clientX: x, clientY: 150, pointerId: 7, button: 0, isPrimary: true })) {
+          Object.defineProperty(event, key, { value });
+        }
+        target.dispatchEvent(event);
+      };
+      toggle.click();
+      pointer("pointerdown", 80, source);
+      pointer("pointermove", 100);
+      assert.ok(card.querySelector(".mobile-navigation-drag-ghost"));
+      assert.equal(source.isConnected, true);
+      pointer("pointermove", 300);
+      assert.equal(panel.hidden, true);
+      assert.equal(source.isConnected, true);
+      assert.deepEqual(calls, []);
+      assert.equal(card._mobileNavigationPointerDrag.target, kind === "camera" ? cell : card.querySelector(".review-camera-wall"));
+      if (ending === "drop") pointer("pointerup", 300);
+      else if (ending === "invalid") pointer("pointerup", 650);
+      else if (ending === "cancel") pointer("pointercancel", 300);
+      else if (ending === "escape") harness.window.document.dispatchEvent(new harness.window.KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+      else if (ending === "resize") harness.setShellWidth(card, 601);
+      else if (ending === "mode") card.setApplicationMode("live");
+      else card.remove();
+      assert.deepEqual(calls, ending === "drop" ? (kind === "camera" ? [["Patio", 1]] : [["2x2"]]) : []);
+      assert.equal(card._mobileNavigationPointerDrag, null);
+      assert.equal(card.querySelector(".mobile-navigation-drag-ghost"), null);
+      assert.equal(card.querySelector(".mobile-navigation-drop-target"), null);
+      if (ending === "mode" || ending === "disconnect") {
+        // Existing Review deactivation/suspension intentionally removes its UI.
+        assert.equal(card.querySelectorAll(".review-layout-cell").length, 0);
+      } else assert.deepEqual([...card.querySelectorAll(".review-layout-cell")], cells);
+    });
+  }
+}
+
+test("compact Review transport preserves command nodes, handlers and desktop ordering", t => {
+  const harness = setup(t);
+  const { card, controller } = setupNarrowReview(harness);
+  const controls = card.querySelector(".review-transport-controls");
+  const details = controls.querySelector(".review-transport-more");
+  const summary = details.querySelector("summary");
+  const commands = [...details.querySelectorAll("button")];
+  assert.equal(details.open, false);
+  assert.equal(summary.getAttribute("aria-label"), "More playback controls");
+  assert.equal(summary.title, "More playback controls");
+  assert.equal(summary.getAttribute("aria-expanded"), "false");
+  assert.equal(summary.textContent.trim(), "");
+  const ellipsis = summary.querySelector("svg");
+  assert.equal(ellipsis.getAttribute("viewBox"), "0 0 24 24");
+  assert.equal(ellipsis.getAttribute("aria-hidden"), "true");
+  assert.equal(ellipsis.getAttribute("focusable"), "false");
+  assert.deepEqual([...ellipsis.querySelectorAll("circle")].map(circle =>
+    [circle.getAttribute("cx"), circle.getAttribute("cy"), circle.getAttribute("r")]),
+    [["5", "12", "2"], ["12", "12", "2"], ["19", "12", "2"]]);
+  assert.equal(harness.window.getComputedStyle(ellipsis).pointerEvents, "none");
+  const summaryStyle = harness.window.getComputedStyle(summary);
+  assert.equal(summaryStyle.width, "40px");
+  assert.equal(summaryStyle.height, "40px");
+  assert.equal(summaryStyle.borderRadius, "8px");
+  assert.equal(controls.querySelector(".review-vcr-group").children.length, 2);
+  assert.equal(controls.querySelector(".review-speed-select").disabled, false);
+  const calls = [];
+  controller.snapToPreviousEvent = () => calls.push("previous");
+  controller.snapToNextEvent = () => calls.push("next");
+  controller.seekHistoricalRelative = seconds => calls.push(seconds);
+  const media = [...card.querySelectorAll("video, .review-layout-cell")];
+  const epoch = controller.clock.absoluteTime;
+  for (const command of commands) {
+    details.open = true;
+    command.disabled = false;
+    command.click();
+    assert.equal(details.open, false);
+    assert.equal(summary.getAttribute("aria-expanded"), "false");
+    assert.strictEqual(harness.window.document.activeElement, summary);
+  }
+  assert.deepEqual(calls, ["previous", -10, 10, "next"]);
+  details.open = true;
+  summary.dispatchEvent(new harness.window.KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+  assert.equal(details.open, false);
+  assert.equal(summary.getAttribute("aria-expanded"), "false");
+  const speed = controls.querySelector(".review-speed-select");
+  harness.setShellWidth(card, 601);
+  assert.equal(controls.querySelector("details"), null);
+  assert.equal(controls.querySelector(".review-vcr-group").children.length, 6);
+  assert.deepEqual([...controls.querySelector(".review-vcr-group").children].map(node => node.className),
+    ["review-previous-event", "review-back-ten", "review-pause", "review-play", "review-forward-ten", "review-next-event"]);
+  harness.setShellWidth(card, 600);
+  assert.deepEqual([...controls.querySelector("details").querySelectorAll("button")], commands);
+  assert.strictEqual(controls.querySelector(".review-speed-select"), speed);
+  assert.equal(controller.clock.absoluteTime, epoch);
+  assert.deepEqual([...card.querySelectorAll("video, .review-layout-cell")], media);
+});
+
+test("responsive Review presentation reapplies after controller root replacement and reconnect", async t => {
+  const harness = setup(t);
+  const { card, controller, toggle } = setupNarrowReview(harness);
+  controller.render();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(card.querySelector(".review-control-rail").hidden, true);
+  assert.ok(card.querySelector(".review-transport-more"));
+  toggle.click();
+  card.remove();
+  harness.window.document.body.appendChild(card);
+  controller.render();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(card.querySelector(".review-control-rail").hidden, true);
+  assert.equal(toggle.hidden, false);
+  assert.ok(card.querySelector(".review-transport-more"));
+});
+
 test("3x3 diagnostic mode keeps exactly logical slots 0 through 3 live", t => {
   const harness = setup(t, {
     useHaHuiImageExperiment: false

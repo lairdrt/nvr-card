@@ -2370,6 +2370,7 @@ class NVRCard extends HTMLElement {
 
   connectedCallback() {
     this._reviewController.resume();
+    if (this.querySelector(".review-surface")) this.observeReviewNavigation();
     NVR_HISTORICAL_SYNC_CARDS.add(this);
     this.querySelectorAll("hui-image.nvr-live-camera").forEach(image => {
       if (!this._reconnectPresentationSources.has(image)) return;
@@ -2399,6 +2400,7 @@ class NVRCard extends HTMLElement {
 
   disconnectedCallback() {
     this.closeMobileNavigation({ returnFocus: false });
+    this._reviewNavigationObserver?.disconnect();
     NVR_HISTORICAL_SYNC_CARDS.delete(this);
     this._reviewController.setHistoricalSyncDiagnostics(false);
     this._reviewController.suspend();
@@ -4302,6 +4304,124 @@ class NVRCard extends HTMLElement {
         touch-action: none;
       }
 
+      .nvr-shell.phone-layout.review-active {
+        grid-template-rows: 88px minmax(0, 1fr);
+      }
+
+      .nvr-shell.phone-layout.review-active .application-mode-control {
+        align-self: flex-start;
+        height: 44px;
+      }
+
+      .nvr-shell.phone-layout.review-active .review-header-transport {
+        top: 44px;
+        right: 0;
+        bottom: auto;
+        left: 0;
+        height: 44px;
+        z-index: 2;
+      }
+
+      .nvr-shell.phone-layout .review-product {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr);
+        grid-template-rows: minmax(180px, 0.8fr) minmax(250px, 1fr);
+        height: 100%;
+        min-height: 480px;
+        overflow: visible;
+        transition: none;
+      }
+
+      .nvr-shell.phone-layout .review-surface { overflow: auto; }
+      .nvr-shell.phone-layout .review-media-workspace {
+        grid-column: 1;
+        grid-row: 1;
+        min-height: 0;
+        min-width: 0;
+        overflow: hidden;
+      }
+      .nvr-shell.phone-layout .review-rhs {
+        grid-column: 1;
+        grid-row: 2;
+        min-height: 0;
+        border-left: 0;
+        border-top: 1px solid #26313b;
+      }
+      .nvr-shell.phone-layout .review-control-rail {
+        position: absolute;
+        top: 88px;
+        left: 0;
+        z-index: 100;
+        width: min(var(--nvr-sidebar-width), 100%);
+        height: calc(100% - 88px);
+        padding: 0 14px;
+        background: rgba(17, 22, 28, 0.85);
+        box-shadow: 4px 0 18px rgba(0, 0, 0, 0.45);
+      }
+      .nvr-shell.phone-layout:not(.mobile-navigation-open) .review-control-rail {
+        display: none !important;
+      }
+      .nvr-shell.phone-layout.review-active.mobile-navigation-open > .sidebar-rail-footer {
+        display: none;
+      }
+      .nvr-shell.phone-layout .review-control-rail .camera-item,
+      .nvr-shell.phone-layout .review-control-rail .sidebar-layout-item {
+        cursor: grab;
+        touch-action: none;
+      }
+      .mobile-navigation-drop-target {
+        outline: 2px solid #6faed9;
+        outline-offset: -2px;
+      }
+      .nvr-shell.phone-layout .review-transport button,
+      .nvr-shell.phone-layout .review-speed-select {
+        height: 44px;
+        min-height: 44px;
+      }
+      .nvr-shell.phone-layout .review-transport button { width: 44px; }
+      .review-transport-more { position: relative; }
+      .review-transport-more summary {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 40px;
+        height: 40px;
+        padding: 0;
+        border: 0;
+        border-radius: 8px;
+        background: transparent;
+        color: #dce6ec;
+        cursor: pointer;
+        box-sizing: border-box;
+        list-style: none;
+      }
+      .review-transport-more summary::-webkit-details-marker { display: none; }
+      .review-transport-more summary:hover {
+        background: #4a4a4a;
+      }
+      .review-transport-more summary svg {
+        width: 24px;
+        height: 24px;
+        fill: currentColor;
+        pointer-events: none;
+      }
+      .review-transport-more summary:focus-visible {
+        outline: 2px solid #6faed9;
+        outline-offset: 2px;
+      }
+      .review-transport-more[open] .review-secondary-transport {
+        position: absolute;
+        top: 100%;
+        right: 0;
+        z-index: 10;
+        display: flex;
+        gap: 4px;
+        padding: 8px;
+        background: #11161c;
+        border: 1px solid #3b5263;
+        border-radius: 4px;
+      }
+
       .mobile-navigation-pointer-dragging,
       .mobile-navigation-pointer-dragging * {
         cursor: grabbing !important;
@@ -5127,6 +5247,7 @@ class NVRCard extends HTMLElement {
       this.querySelector(".review-header-transport")
     );
     this.setApplicationMode(this._applicationMode, true);
+    this.observeReviewNavigation();
 
     this.installResizeObserver();
     this.logCardLifecycle("render-complete", {
@@ -7949,8 +8070,21 @@ class NVRCard extends HTMLElement {
       this.scheduleCameraFit();
     });
 
-    this.querySelector(".nvr-shell > .camera-list")?.addEventListener("pointerdown",
+    this.querySelector(".nvr-shell")?.addEventListener("pointerdown",
       event => this.startMobileNavigationPointerDrag(event));
+    this.querySelector(".review-surface")?.addEventListener("click", event => {
+      const source = event.composedPath().find(node =>
+        node?.matches?.(".camera-item, .sidebar-layout-item"));
+      const controller = this._reviewController;
+      if (this._phoneLayout && this._applicationMode === "review" && source &&
+          (controller._selectedReviewCamera === source.dataset.camera ||
+           controller._selectedReviewLayout === source.dataset.layout)) {
+        this.closeMobileNavigation({ returnFocus: true });
+      }
+    });
+    this.querySelector(".review-surface")?.addEventListener("dragstart", event => {
+      if (this._phoneLayout && event.target.closest(".review-control-rail")) event.preventDefault();
+    }, true);
     const mobileToggle = this.querySelector(".mobile-navigation-toggle");
     const backdrop = this.querySelector(".mobile-navigation-backdrop");
     mobileToggle?.addEventListener("click", () => {
@@ -7974,8 +8108,7 @@ class NVRCard extends HTMLElement {
 
   openMobileNavigation() {
     const shell = this.querySelector(".nvr-shell");
-    if (!shell?.classList.contains("phone-layout") ||
-        this._applicationMode === "review") return false;
+    if (!shell?.classList.contains("phone-layout")) return false;
     this._mobileNavigationOpen = true;
     this.updateResponsiveShell();
     this.querySelector(".mobile-navigation-toggle")?.focus();
@@ -8011,18 +8144,22 @@ class NVRCard extends HTMLElement {
 
 
   startMobileNavigationPointerDrag(event) {
-    if (!this._phoneLayout || this._applicationMode !== "live" ||
+    if (!this._phoneLayout ||
         !this._mobileNavigationOpen || event.button !== 0 || event.isPrimary === false ||
         this._mobileNavigationPointerDrag || event.defaultPrevented) return;
-    const panel = this.querySelector(".nvr-shell > .camera-list");
+    const panel = this.mobileNavigationPanel();
     const source = event.target.closest(".camera-item, .sidebar-layout-item");
     if (!source || !panel?.contains(source)) return;
     const kind = source.classList.contains("camera-item") ? "camera" : "layout";
     const value = source.dataset[kind === "camera" ? "camera" : "layout"];
-    if (kind === "camera" ? this.getCameraByName(value)?.active !== true : !this.layouts[value]) return;
+    const review = this._applicationMode === "review";
+    if (kind === "camera" ? (review
+      ? !this._reviewController._cameras.some(camera => camera.name === value)
+      : this.getCameraByName(value)?.active !== true) : !this.layouts[value]) return;
+    if (review) source.draggable = false;
     this.clearMobileNavigationDragClick();
     const drag = {
-      pointerId: event.pointerId, kind, value, source,
+      pointerId: event.pointerId, kind, value, source, review,
       x: event.clientX, y: event.clientY, bounds: panel.getBoundingClientRect(),
       active: false, retracted: false, ghost: null, target: null
     };
@@ -8036,6 +8173,11 @@ class NVRCard extends HTMLElement {
       const target = drag.target;
       this.cancelMobileNavigationPointerDrag();
       if (!target) return;
+      if (review) {
+        if (kind === "camera") this._reviewController.assignCameraToSlot(value, Number(target.dataset.reviewSlot));
+        else this._reviewController.setReviewLayout(value);
+        return;
+      }
       if (kind === "camera") {
         if (this._maximizedSlot !== null) this.replaceMaximizedCamera(value);
         else this.assignCameraToSlot(value, Number(target.dataset.slot));
@@ -8093,20 +8235,24 @@ class NVRCard extends HTMLElement {
       drag.retracted = true;
       this.closeMobileNavigation({ preservePointerDrag: true });
     }
+    if (drag.review) drag.target?.classList.remove("mobile-navigation-drop-target");
     drag.target = null;
     if (drag.retracted) {
       // HA hosts cards inside shadow roots; document hit testing sees the outer host.
       const hit = this.getRootNode().elementFromPoint(event.clientX, event.clientY);
-      const grid = this.querySelector(".video-grid");
+      const grid = this.querySelector(drag.review ? ".review-camera-wall" : ".video-grid");
       if (hit && grid?.contains(hit)) {
-        const cell = hit.closest(".video-cell");
+        const cell = hit.closest(drag.review ? ".review-layout-cell" : ".video-cell");
         if (drag.kind === "layout") drag.target = grid;
-        else if (cell && !cell.classList.contains("hidden-slot") &&
+        else if (drag.review ? cell && !cell.hidden : cell && !cell.classList.contains("hidden-slot") &&
           (this._maximizedSlot === null || cell.classList.contains("maximized-camera"))) drag.target = cell;
       }
     }
-    this.setCameraDropTarget(drag.kind === "camera" ? drag.target : null);
-    this.setLayoutDropFeedback(drag.kind === "layout" && drag.target !== null);
+    if (drag.review) drag.target?.classList.add("mobile-navigation-drop-target");
+    else {
+      this.setCameraDropTarget(drag.kind === "camera" ? drag.target : null);
+      this.setLayoutDropFeedback(drag.kind === "layout" && drag.target !== null);
+    }
   }
 
 
@@ -8117,11 +8263,14 @@ class NVRCard extends HTMLElement {
     drag.dispose();
     drag.ghost?.remove();
     this.classList.remove("mobile-navigation-pointer-dragging");
-    this.setCameraDropTarget(null);
-    this.setLayoutDropFeedback(false);
+    if (drag.review) drag.target?.classList.remove("mobile-navigation-drop-target");
+    else {
+      this.setCameraDropTarget(null);
+      this.setLayoutDropFeedback(false);
+    }
     if (this.hasPointerCapture?.(drag.pointerId)) this.releasePointerCapture(drag.pointerId);
     if (drag.active && suppressClick) this.suppressMobileNavigationDragClick();
-    if (drag.retracted && this.isConnected && this._applicationMode === "live") {
+    if (drag.retracted && this.isConnected) {
       this.querySelector(".mobile-navigation-toggle")?.focus();
     }
   }
@@ -8143,7 +8292,7 @@ class NVRCard extends HTMLElement {
 
   installMobileNavigationFocusTrap() {
     this.removeMobileNavigationFocusTrap();
-    const focusables = () => [this.querySelector(".mobile-navigation-toggle"), ...(this.querySelector(".nvr-shell > .camera-list")
+    const focusables = () => [this.querySelector(".mobile-navigation-toggle"), ...(this.mobileNavigationPanel()
       ?.querySelectorAll("button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex='-1'])") ?? [])]
       .filter(element => element && !element.hidden && !element.closest("[hidden]"));
     this._mobileNavigationKeyHandler = event => {
@@ -8236,6 +8385,10 @@ class NVRCard extends HTMLElement {
         sidebar.hidden = this._applicationMode === "review" ||
           (phoneLayout && !this._mobileNavigationOpen);
       }
+      if (reviewSurface) {
+        sidebar.hidden = phoneLayout && !this._mobileNavigationOpen;
+        sidebar.id = `${this._mobileNavigationId}-review`;
+      }
       sidebar.setAttribute(
         "aria-hidden",
         String(sidebar.hidden || reviewSurface?.hidden === true)
@@ -8264,15 +8417,82 @@ class NVRCard extends HTMLElement {
     const mobileToggle = this.querySelector(".mobile-navigation-toggle");
     const backdrop = this.querySelector(".mobile-navigation-backdrop");
     if (mobileToggle) {
-      mobileToggle.hidden = !phoneLayout || this._applicationMode === "review";
+      mobileToggle.hidden = !phoneLayout;
+      mobileToggle.setAttribute("aria-controls", this._applicationMode === "review"
+        ? `${this._mobileNavigationId}-review` : this._mobileNavigationId);
       mobileToggle.setAttribute("aria-expanded", String(phoneLayout && this._mobileNavigationOpen));
       mobileToggle.setAttribute("aria-label", this._mobileNavigationOpen ? "Close navigation" : "Open navigation");
       mobileToggle.setAttribute("title", this._mobileNavigationOpen ? "Close navigation" : "Open navigation");
     }
     if (backdrop) backdrop.hidden = !phoneLayout || !this._mobileNavigationOpen;
     shell.classList.toggle("mobile-navigation-open", phoneLayout && this._mobileNavigationOpen);
+    shell.classList.toggle("review-active", this._applicationMode === "review");
+    this.updateReviewTransportPresentation(phoneLayout);
     this.querySelectorAll(".nvr-shell > .camera-list .camera-item, .nvr-shell > .camera-list .sidebar-layout-item")
       .forEach(source => source.setAttribute("draggable", String(!phoneLayout)));
+    this.querySelectorAll(".review-control-rail .camera-item, .review-control-rail .sidebar-layout-item")
+      .forEach(source => source.setAttribute("draggable", String(!phoneLayout)));
+  }
+
+
+  mobileNavigationPanel() {
+    return this.querySelector(this._applicationMode === "review"
+      ? ".review-control-rail" : ".nvr-shell > .camera-list");
+  }
+
+
+  observeReviewNavigation() {
+    this._reviewNavigationObserver?.disconnect();
+    // Observe only controller root replacements, not timeline/frame updates.
+    this._reviewNavigationObserver = new MutationObserver(() => this.updateResponsiveShell());
+    for (const root of this.querySelectorAll(".review-surface, .review-header-transport")) {
+      this._reviewNavigationObserver.observe(root, { childList: true });
+    }
+  }
+
+
+  updateReviewTransportPresentation(narrow) {
+    const controls = this.querySelector(".review-transport-controls");
+    const vcr = controls?.querySelector(".review-vcr-group");
+    if (!vcr) return;
+    const more = controls.querySelector(".review-transport-more");
+    if (narrow && !more) {
+      const details = this.ownerDocument.createElement("details");
+      details.className = "review-transport-more";
+      const summary = this.ownerDocument.createElement("summary");
+      summary.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="5" cy="12" r="2"></circle><circle cx="12" cy="12" r="2"></circle><circle cx="19" cy="12" r="2"></circle></svg>';
+      summary.title = "More playback controls";
+      summary.setAttribute("aria-label", "More playback controls");
+      const updateExpanded = () => summary.setAttribute("aria-expanded", String(details.open));
+      updateExpanded();
+      details.addEventListener("toggle", updateExpanded);
+      const commands = this.ownerDocument.createElement("div");
+      commands.className = "review-secondary-transport";
+      for (const selector of [".review-previous-event", ".review-back-ten", ".review-forward-ten", ".review-next-event"]) {
+        commands.appendChild(vcr.querySelector(selector));
+      }
+      details.append(summary, commands);
+      controls.appendChild(details);
+      details.addEventListener("keydown", event => {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          details.open = false;
+          updateExpanded();
+          summary.focus();
+        }
+      });
+      commands.addEventListener("click", event => {
+        if (event.target.closest("button")?.disabled === false) {
+          details.open = false;
+          updateExpanded();
+          summary.focus();
+        }
+      });
+    } else if (!narrow && more) {
+      vcr.prepend(more.querySelector(".review-previous-event"), more.querySelector(".review-back-ten"));
+      vcr.append(more.querySelector(".review-forward-ten"), more.querySelector(".review-next-event"));
+      more.remove();
+    }
   }
 
 
