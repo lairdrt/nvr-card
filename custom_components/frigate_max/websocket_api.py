@@ -115,7 +115,9 @@ async def websocket_review_events_v1(
     except (ProbeDataError, FrigateProbeError) as err:
         connection.send_error(msg["id"], "frigate_max_review_unavailable", str(err))
         return
-    connection.send_result(msg["id"], result)
+    # An older integration returned a bare list that could stop at 1,000 events.
+    # Only the exhaustive cursor path may assert this versioned completeness bit.
+    connection.send_result(msg["id"], {"schema": 2, "complete": True, "items": result})
 
 
 @websocket_api.websocket_command(
