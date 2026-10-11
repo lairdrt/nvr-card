@@ -39,6 +39,9 @@ Object.defineProperty(window, "nvrDiagnostics", {
     getRecentAutoSnapDecisions() {
       return soleHistoricalSyncController()?.getRecentAutoSnapDecisions() ?? [];
     },
+    getLastAutoSnapBoundaryCapture() {
+      return soleHistoricalSyncController()?.getLastAutoSnapBoundaryCapture() ?? null;
+    },
     getReviewNavigationDiagnostics() {
       return soleHistoricalSyncController()?.getReviewNavigationDiagnostics() ?? null;
     },
@@ -266,10 +269,13 @@ const AUTO_DIM_FADE_STEPS = 8;
 const AUTO_DIM_COMMAND_TIMEOUT = 15000;
 const AUTO_DIM_WAKE_CLICK_TIMEOUT = 500;
 const AUTO_DIM_WAKE_GESTURE_TIMEOUT = 10000;
+let nextNvrCardInstanceId = 1;
 
 class NVRCard extends HTMLElement {
   constructor() {
     super();
+
+    this._mobileNavigationId = `nvr-live-navigation-${nextNvrCardInstanceId++}`;
 
     this._layout = "2x2";
     this._hass = null;
@@ -311,6 +317,12 @@ class NVRCard extends HTMLElement {
     };
 
     this._sidebarCollapsed = null;
+    this._mobileNavigationOpen = false;
+    this._mobileNavigationPointerDrag = null;
+    this._mobileNavigationClickCleanup = null;
+    this._phoneLayout = null;
+    this._mobileNavigationKeyHandler = null;
+    this._mobileNavigationFocusHandler = null;
     this._viewportListenersInstalled = false;
     this._liveStatusPosition = "bottom-left";
     this._autoDimConfig = AUTO_DIM_DEFAULTS;
@@ -2386,6 +2398,7 @@ class NVRCard extends HTMLElement {
 
 
   disconnectedCallback() {
+    this.closeMobileNavigation({ returnFocus: false });
     NVR_HISTORICAL_SYNC_CARDS.delete(this);
     this._reviewController.setHistoricalSyncDiagnostics(false);
     this._reviewController.suspend();
@@ -2814,6 +2827,7 @@ class NVRCard extends HTMLElement {
     this._swipeClick = null;
     this._placementClickPending = false;
 
+    this.closeMobileNavigation({ returnFocus: false });
     this.innerHTML = `
       <ha-card>
         <div class="nvr-shell">
@@ -2834,6 +2848,19 @@ class NVRCard extends HTMLElement {
           </div>
 
           <header class="card-title-bar">
+            <button
+              type="button"
+              class="mobile-navigation-toggle"
+              aria-controls="${this._mobileNavigationId}"
+              aria-expanded="false"
+              aria-label="Open navigation"
+              title="Open navigation"
+              hidden
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M4 6h16M4 12h16M4 18h16"></path>
+              </svg>
+            </button>
             <div class="application-mode-control" role="group" aria-label="NVR mode">
               <button type="button" data-application-mode="live">
                 <span>LIVE</span>
@@ -2845,7 +2872,7 @@ class NVRCard extends HTMLElement {
             <div class="review-header-transport" hidden></div>
           </header>
 
-          <aside class="camera-list nvr-sidebar">
+          <aside id="${this._mobileNavigationId}" class="camera-list nvr-sidebar">
 
             <section
               class="sidebar-section camera-section ${this._sidebarSections.cameras ? "expanded" : ""}"
@@ -2969,6 +2996,7 @@ class NVRCard extends HTMLElement {
 
           </aside>
 
+          <div class="mobile-navigation-backdrop" aria-hidden="true" hidden></div>
 
           <main class="main-area">
 
@@ -3113,6 +3141,10 @@ class NVRCard extends HTMLElement {
 
         box-sizing: border-box;
         position: relative;
+      }
+
+      .mobile-navigation-toggle {
+        display: none;
       }
 
       .application-mode-control {
@@ -3770,7 +3802,7 @@ class NVRCard extends HTMLElement {
 
       .review-time-truth {
         display: flex;
-        flex: 0 0 66px;
+        flex: 0 0 34px;
         min-width: 0;
         padding: 5px 10px;
         align-items: center;
@@ -3788,24 +3820,6 @@ class NVRCard extends HTMLElement {
         min-width: 0;
         color: #e4ebef;
         font-weight: 600;
-      }
-
-      .review-timeline-zoom {
-        display: flex;
-        width: 100%;
-        min-width: 0;
-        align-items: center;
-        gap: 5px;
-        font-size: 11px;
-        white-space: nowrap;
-      }
-
-      .review-timeline-zoom-input {
-        flex: 1 1 auto;
-        min-width: 40px;
-        height: 16px;
-        margin: 0;
-        accent-color: #69a7d0;
       }
 
       .review-placeholder {
@@ -3905,7 +3919,24 @@ class NVRCard extends HTMLElement {
         flex: 1 1 auto;
         min-height: 0;
         cursor: pointer;
-        touch-action: manipulation;
+        touch-action: none;
+      }
+
+      .review-timeline-axis.review-timeline-panning { cursor: grabbing; }
+
+      .review-timeline-axis.review-timeline-snap-arrival {
+        animation: review-timeline-snap-arrival 180ms ease-out;
+      }
+
+      @keyframes review-timeline-snap-arrival {
+        from { opacity: 0.72; }
+        to { opacity: 1; }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .review-timeline-axis.review-timeline-snap-arrival {
+          animation: none;
+        }
       }
 
       .review-timeline-lanes {
@@ -4135,30 +4166,78 @@ class NVRCard extends HTMLElement {
 
       .nvr-shell.phone-layout
       > .sidebar-rail-top {
-        width: var(--nvr-sidebar-current-width);
-        height: 44px;
-        position: absolute;
-        top: 0;
-        left: 0;
-        z-index: 101;
+        display: none;
       }
 
 
       .nvr-shell.phone-layout
       > .sidebar-rail-footer {
-        width: var(--nvr-sidebar-current-width);
+        display: none;
       }
 
 
       .nvr-shell.phone-layout
       > .card-title-bar {
-        padding-left: calc(var(--nvr-sidebar-current-width) + 4px);
+        padding-left: 52px;
+      }
+
+      .nvr-shell.phone-layout .mobile-navigation-toggle {
+        position: absolute;
+        top: 0;
+        left: 4px;
+        z-index: 102;
+        display: grid;
+        width: 44px;
+        height: 44px;
+        padding: 0;
+        place-items: center;
+        border: 0;
+        border-radius: 4px;
+        background: transparent;
+        color: #6faed9;
+        cursor: pointer;
+      }
+
+      .nvr-shell.phone-layout .mobile-navigation-toggle[hidden] {
+        display: none !important;
+      }
+
+      .mobile-navigation-toggle:hover,
+      .mobile-navigation-toggle:focus-visible {
+        background: #202a33;
+        color: #e5f2fa;
+        outline: 2px solid #6faed9;
+        outline-offset: -2px;
+      }
+
+      .mobile-navigation-toggle svg {
+        width: 24px;
+        height: 24px;
+        fill: none;
+        stroke: currentColor;
+        stroke-width: 2;
+        stroke-linecap: round;
+        pointer-events: none;
+      }
+
+      .nvr-shell.phone-layout > .mobile-navigation-backdrop {
+        position: absolute;
+        top: 0;
+        right: 0;
+        bottom: 0;
+        left: 0;
+        z-index: 99;
+        background: transparent;
+      }
+
+      .nvr-shell.phone-layout > .mobile-navigation-backdrop[hidden] {
+        display: none !important;
       }
 
 
       .nvr-shell.phone-layout
       > .camera-list {
-        width: var(--nvr-sidebar-current-width);
+        width: min(var(--nvr-sidebar-width), 100%);
         height: calc(100% - 44px);
 
         position: absolute;
@@ -4167,6 +4246,27 @@ class NVRCard extends HTMLElement {
         z-index: 100;
 
         box-sizing: border-box;
+      }
+
+      .nvr-shell.phone-layout > .camera-list[hidden] {
+        display: none !important;
+      }
+
+      .nvr-shell.phone-layout.mobile-navigation-open > .camera-list {
+        z-index: 100;
+        padding: 0 14px 44px;
+        background: rgba(17, 22, 28, 0.85);
+        box-shadow: 4px 0 18px rgba(0, 0, 0, 0.45);
+      }
+
+      .nvr-shell.phone-layout.mobile-navigation-open > .sidebar-rail-footer {
+        position: absolute;
+        bottom: 0;
+        left: 0;
+        z-index: 101;
+        background: rgba(17, 22, 28, 0.85);
+        display: flex;
+        width: min(var(--nvr-sidebar-width), 100%);
       }
 
 
@@ -4193,6 +4293,33 @@ class NVRCard extends HTMLElement {
       .nvr-shell.phone-layout:not(.sidebar-collapsed)
       > .camera-list {
         pointer-events: auto;
+      }
+
+
+      .nvr-shell.phone-layout > .camera-list .camera-item,
+      .nvr-shell.phone-layout > .camera-list .sidebar-layout-item {
+        cursor: grab;
+        touch-action: none;
+      }
+
+      .mobile-navigation-pointer-dragging,
+      .mobile-navigation-pointer-dragging * {
+        cursor: grabbing !important;
+      }
+
+      .mobile-navigation-drag-ghost {
+        position: fixed;
+        top: 0;
+        left: 0;
+        z-index: 200;
+        pointer-events: none;
+        padding: 8px 12px;
+        border: 1px solid #6faed9;
+        border-radius: 4px;
+        background: rgba(17, 22, 28, 0.95);
+        color: #fff;
+        font-size: 14px;
+        box-shadow: 0 2px 10px rgba(0, 0, 0, 0.45);
       }
 
 
@@ -7385,6 +7512,10 @@ class NVRCard extends HTMLElement {
             this.toggleCameraTargetSelection(
               button.dataset.camera
             );
+            if (this._applicationMode === "live" && this._phoneLayout &&
+                this._selectedCamera === button.dataset.camera) {
+              this.closeMobileNavigation({ returnFocus: true });
+            }
           }
         );
       });
@@ -7456,6 +7587,10 @@ class NVRCard extends HTMLElement {
         item.addEventListener(
           "dragstart",
           event => {
+            if (this._phoneLayout && this._applicationMode === "live") {
+              event.preventDefault();
+              return;
+            }
             const cameraName =
               item.dataset.camera;
 
@@ -7813,6 +7948,246 @@ class NVRCard extends HTMLElement {
       this.updateResponsiveShell();
       this.scheduleCameraFit();
     });
+
+    this.querySelector(".nvr-shell > .camera-list")?.addEventListener("pointerdown",
+      event => this.startMobileNavigationPointerDrag(event));
+    const mobileToggle = this.querySelector(".mobile-navigation-toggle");
+    const backdrop = this.querySelector(".mobile-navigation-backdrop");
+    mobileToggle?.addEventListener("click", () => {
+      if (this._mobileNavigationOpen) {
+        this.closeMobileNavigation({ returnFocus: true });
+      } else {
+        this.openMobileNavigation();
+      }
+    });
+    backdrop?.addEventListener("pointerdown", event => {
+      event.preventDefault();
+      event.stopPropagation();
+    });
+    backdrop?.addEventListener("click", event => {
+      event.preventDefault();
+      event.stopPropagation();
+      this.closeMobileNavigation({ returnFocus: true });
+    });
+  }
+
+
+  openMobileNavigation() {
+    const shell = this.querySelector(".nvr-shell");
+    if (!shell?.classList.contains("phone-layout") ||
+        this._applicationMode === "review") return false;
+    this._mobileNavigationOpen = true;
+    this.updateResponsiveShell();
+    this.querySelector(".mobile-navigation-toggle")?.focus();
+    this.installMobileNavigationFocusTrap();
+    return true;
+  }
+
+
+  clearMobileNavigationDragClick() {
+    this._mobileNavigationClickCleanup?.();
+    this._mobileNavigationClickCleanup = null;
+  }
+
+
+  suppressMobileNavigationDragClick() {
+    this.clearMobileNavigationDragClick();
+    const clear = () => this.clearMobileNavigationDragClick();
+    const click = event => {
+      // Native keyboard activation has detail 0 and must remain available.
+      if (event.detail > 0) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+      }
+      clear();
+    };
+    this._mobileNavigationClickCleanup = () => {
+      this.ownerDocument.removeEventListener("click", click, true);
+      this.ownerDocument.removeEventListener("pointerdown", clear, true);
+    };
+    this.ownerDocument.addEventListener("click", click, true);
+    this.ownerDocument.addEventListener("pointerdown", clear, true);
+  }
+
+
+  startMobileNavigationPointerDrag(event) {
+    if (!this._phoneLayout || this._applicationMode !== "live" ||
+        !this._mobileNavigationOpen || event.button !== 0 || event.isPrimary === false ||
+        this._mobileNavigationPointerDrag || event.defaultPrevented) return;
+    const panel = this.querySelector(".nvr-shell > .camera-list");
+    const source = event.target.closest(".camera-item, .sidebar-layout-item");
+    if (!source || !panel?.contains(source)) return;
+    const kind = source.classList.contains("camera-item") ? "camera" : "layout";
+    const value = source.dataset[kind === "camera" ? "camera" : "layout"];
+    if (kind === "camera" ? this.getCameraByName(value)?.active !== true : !this.layouts[value]) return;
+    this.clearMobileNavigationDragClick();
+    const drag = {
+      pointerId: event.pointerId, kind, value, source,
+      x: event.clientX, y: event.clientY, bounds: panel.getBoundingClientRect(),
+      active: false, retracted: false, ghost: null, target: null
+    };
+    this._mobileNavigationPointerDrag = drag;
+    const move = e => this.moveMobileNavigationPointerDrag(e);
+    const up = e => {
+      if (e.pointerId !== drag.pointerId) return;
+      if (!drag.active) { this.cancelMobileNavigationPointerDrag(); return; }
+      e.preventDefault();
+      this.moveMobileNavigationPointerDrag(e);
+      const target = drag.target;
+      this.cancelMobileNavigationPointerDrag();
+      if (!target) return;
+      if (kind === "camera") {
+        if (this._maximizedSlot !== null) this.replaceMaximizedCamera(value);
+        else this.assignCameraToSlot(value, Number(target.dataset.slot));
+        this.clearCameraTargetSelection();
+        this.clearLayoutTargetSelection();
+      } else {
+        if (this._maximizedSlot !== null) this.restoreMaximizedCamera();
+        this.selectLayout(value);
+      }
+    };
+    const cancel = e => {
+      if (e.pointerId === drag.pointerId) this.cancelMobileNavigationPointerDrag();
+    };
+    const key = e => {
+      if (e.key !== "Escape") return;
+      e.preventDefault();
+      e.stopPropagation();
+      this.cancelMobileNavigationPointerDrag();
+    };
+    drag.dispose = () => {
+      this.ownerDocument.removeEventListener("pointermove", move, true);
+      this.ownerDocument.removeEventListener("pointerup", up, true);
+      this.ownerDocument.removeEventListener("pointercancel", cancel, true);
+      this.ownerDocument.removeEventListener("keydown", key, true);
+      this.removeEventListener("lostpointercapture", cancel);
+    };
+    this.ownerDocument.addEventListener("pointermove", move, true);
+    this.ownerDocument.addEventListener("pointerup", up, true);
+    this.ownerDocument.addEventListener("pointercancel", cancel, true);
+    this.ownerDocument.addEventListener("keydown", key, true);
+    this.addEventListener("lostpointercapture", cancel);
+  }
+
+
+  moveMobileNavigationPointerDrag(event) {
+    const drag = this._mobileNavigationPointerDrag;
+    if (!drag || event.pointerId !== drag.pointerId) return;
+    if (!drag.active) {
+      if ((event.clientX - drag.x) ** 2 + (event.clientY - drag.y) ** 2 < 36) return;
+      drag.active = true;
+      // Capture on the stable card, since the source menu will retract.
+      try { this.setPointerCapture?.(drag.pointerId); } catch { /* Document handlers still track the pointer. */ }
+      drag.ghost = this.ownerDocument.createElement("div");
+      drag.ghost.className = "mobile-navigation-drag-ghost";
+      drag.ghost.setAttribute("aria-hidden", "true");
+      drag.ghost.textContent = drag.kind === "camera" ? drag.value : this.layouts[drag.value].label;
+      this.appendChild(drag.ghost);
+      this.classList.add("mobile-navigation-pointer-dragging");
+    }
+    event.preventDefault();
+    drag.ghost.style.transform = `translate(${event.clientX + 12}px, ${event.clientY + 12}px)`;
+    const bounds = drag.bounds;
+    if (!drag.retracted && (event.clientX < bounds.left || event.clientX >= bounds.right ||
+        event.clientY < bounds.top || event.clientY >= bounds.bottom)) {
+      drag.retracted = true;
+      this.closeMobileNavigation({ preservePointerDrag: true });
+    }
+    drag.target = null;
+    if (drag.retracted) {
+      // HA hosts cards inside shadow roots; document hit testing sees the outer host.
+      const hit = this.getRootNode().elementFromPoint(event.clientX, event.clientY);
+      const grid = this.querySelector(".video-grid");
+      if (hit && grid?.contains(hit)) {
+        const cell = hit.closest(".video-cell");
+        if (drag.kind === "layout") drag.target = grid;
+        else if (cell && !cell.classList.contains("hidden-slot") &&
+          (this._maximizedSlot === null || cell.classList.contains("maximized-camera"))) drag.target = cell;
+      }
+    }
+    this.setCameraDropTarget(drag.kind === "camera" ? drag.target : null);
+    this.setLayoutDropFeedback(drag.kind === "layout" && drag.target !== null);
+  }
+
+
+  cancelMobileNavigationPointerDrag({ suppressClick = true } = {}) {
+    const drag = this._mobileNavigationPointerDrag;
+    if (!drag) return;
+    this._mobileNavigationPointerDrag = null;
+    drag.dispose();
+    drag.ghost?.remove();
+    this.classList.remove("mobile-navigation-pointer-dragging");
+    this.setCameraDropTarget(null);
+    this.setLayoutDropFeedback(false);
+    if (this.hasPointerCapture?.(drag.pointerId)) this.releasePointerCapture(drag.pointerId);
+    if (drag.active && suppressClick) this.suppressMobileNavigationDragClick();
+    if (drag.retracted && this.isConnected && this._applicationMode === "live") {
+      this.querySelector(".mobile-navigation-toggle")?.focus();
+    }
+  }
+
+
+  closeMobileNavigation({ returnFocus = false, preservePointerDrag = false } = {}) {
+    if (!preservePointerDrag) {
+      this.cancelMobileNavigationPointerDrag({ suppressClick: false });
+      this.clearMobileNavigationDragClick();
+    }
+    const wasOpen = this._mobileNavigationOpen;
+    this._mobileNavigationOpen = false;
+    this.removeMobileNavigationFocusTrap();
+    if (wasOpen) this.updateResponsiveShell();
+    if (wasOpen && returnFocus) this.querySelector(".mobile-navigation-toggle")?.focus();
+    return wasOpen;
+  }
+
+
+  installMobileNavigationFocusTrap() {
+    this.removeMobileNavigationFocusTrap();
+    const focusables = () => [this.querySelector(".mobile-navigation-toggle"), ...(this.querySelector(".nvr-shell > .camera-list")
+      ?.querySelectorAll("button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex='-1'])") ?? [])]
+      .filter(element => element && !element.hidden && !element.closest("[hidden]"));
+    this._mobileNavigationKeyHandler = event => {
+      if (!this._mobileNavigationOpen) return;
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        this.closeMobileNavigation({ returnFocus: true });
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const items = focusables();
+      if (items.length === 0) {
+        event.preventDefault();
+        return;
+      }
+      // Explicit cycling includes the header toggle without tabbing into video controls.
+      const activeIndex = items.indexOf(this.ownerDocument.activeElement);
+      const nextIndex = event.shiftKey
+        ? (activeIndex <= 0 ? items.length - 1 : activeIndex - 1)
+        : (activeIndex + 1) % items.length;
+      event.preventDefault();
+      items[nextIndex].focus();
+    };
+    this._mobileNavigationFocusHandler = event => {
+      const items = focusables();
+      if (this._mobileNavigationOpen && !items.includes(event.target)) {
+        items[0]?.focus();
+      }
+    };
+    this.ownerDocument.addEventListener("keydown", this._mobileNavigationKeyHandler, true);
+    this.ownerDocument.addEventListener("focusin", this._mobileNavigationFocusHandler, true);
+  }
+
+
+  removeMobileNavigationFocusTrap() {
+    if (this._mobileNavigationKeyHandler) {
+      this.ownerDocument.removeEventListener("keydown", this._mobileNavigationKeyHandler, true);
+      this._mobileNavigationKeyHandler = null;
+    }
+    if (this._mobileNavigationFocusHandler) {
+      this.ownerDocument.removeEventListener("focusin", this._mobileNavigationFocusHandler, true);
+      this._mobileNavigationFocusHandler = null;
+    }
   }
 
 
@@ -7833,7 +8208,17 @@ class NVRCard extends HTMLElement {
     const phoneLayout =
       shell.clientWidth <= 600;
 
-    const collapsed = this._sidebarCollapsed ?? true;
+    if (this._phoneLayout === null || this._phoneLayout !== phoneLayout) {
+      this.cancelMobileNavigationPointerDrag({ suppressClick: false });
+      this.clearMobileNavigationDragClick();
+      this._mobileNavigationOpen = false;
+      this.removeMobileNavigationFocusTrap();
+      this._phoneLayout = phoneLayout;
+    }
+
+    const collapsed = phoneLayout
+      ? !this._mobileNavigationOpen
+      : (this._sidebarCollapsed ?? true);
 
     shell.classList.toggle(
       "phone-layout",
@@ -7847,6 +8232,10 @@ class NVRCard extends HTMLElement {
 
     sidebars.forEach(sidebar => {
       const reviewSurface = sidebar.closest(".review-surface");
+      if (sidebar.parentElement === shell) {
+        sidebar.hidden = this._applicationMode === "review" ||
+          (phoneLayout && !this._mobileNavigationOpen);
+      }
       sidebar.setAttribute(
         "aria-hidden",
         String(sidebar.hidden || reviewSurface?.hidden === true)
@@ -7871,6 +8260,19 @@ class NVRCard extends HTMLElement {
         ? "Expand sidebar"
         : "Collapse sidebar"
     );
+
+    const mobileToggle = this.querySelector(".mobile-navigation-toggle");
+    const backdrop = this.querySelector(".mobile-navigation-backdrop");
+    if (mobileToggle) {
+      mobileToggle.hidden = !phoneLayout || this._applicationMode === "review";
+      mobileToggle.setAttribute("aria-expanded", String(phoneLayout && this._mobileNavigationOpen));
+      mobileToggle.setAttribute("aria-label", this._mobileNavigationOpen ? "Close navigation" : "Open navigation");
+      mobileToggle.setAttribute("title", this._mobileNavigationOpen ? "Close navigation" : "Open navigation");
+    }
+    if (backdrop) backdrop.hidden = !phoneLayout || !this._mobileNavigationOpen;
+    shell.classList.toggle("mobile-navigation-open", phoneLayout && this._mobileNavigationOpen);
+    this.querySelectorAll(".nvr-shell > .camera-list .camera-item, .nvr-shell > .camera-list .sidebar-layout-item")
+      .forEach(source => source.setAttribute("draggable", String(!phoneLayout)));
   }
 
 
@@ -7948,6 +8350,10 @@ class NVRCard extends HTMLElement {
             this.toggleLayoutTargetSelection(
               button.dataset.layout
             );
+            if (this._applicationMode === "live" && this._phoneLayout &&
+                this._selectedLayout === button.dataset.layout) {
+              this.closeMobileNavigation({ returnFocus: true });
+            }
           }
         );
       });
@@ -8088,6 +8494,10 @@ class NVRCard extends HTMLElement {
         item.addEventListener(
           "dragstart",
           event => {
+            if (this._phoneLayout && this._applicationMode === "live") {
+              event.preventDefault();
+              return;
+            }
             const layoutKey =
               item.dataset.layout;
 
@@ -8740,6 +9150,7 @@ class NVRCard extends HTMLElement {
     if (mode !== "live" && mode !== "review") return false;
     if (!force && mode === this._applicationMode) return true;
 
+    this.closeMobileNavigation({ returnFocus: false });
     this._applicationMode = mode;
     const reviewActive = mode === "review";
     const sidebar = this.querySelector(".nvr-sidebar");

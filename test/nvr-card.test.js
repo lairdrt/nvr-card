@@ -33,6 +33,7 @@ test("global historical sync diagnostics address only the sole connected card", 
   assert.equal(api.getHistoricalSyncReports().length, 0);
   assert.equal(api.getRecentReviewFailures().length, 0);
   assert.equal(api.getRecentAutoSnapDecisions().length, 0);
+  assert.equal(api.getLastAutoSnapBoundaryCapture(), null);
   assert.equal(api.getReviewNavigationDiagnostics(), null);
   assert.equal(api.disableHistoricalSync(), false);
   assert.equal(api.getContinuousHandoffPrototypeReport(), null);
@@ -56,6 +57,15 @@ test("global historical sync diagnostics address only the sole connected card", 
   const latest = api.getLatestHistoricalSyncReport();
   assert.equal(latest.selectedEpoch, 1800000000);
   assert.equal(api.getHistoricalSyncReports().length, 1);
+  assert.equal(api.getLastAutoSnapBoundaryCapture(), null);
+  controller._lastAutoSnapBoundaryCapture = {
+    capturedAt: "2026-10-10T12:00:00.000Z", event: { startEpoch: 1, endEpoch: 2 },
+    cameras: [], boundaryDecision: { outcome: "interval_end", targetEpoch: 2 },
+    nextDecision: { outcome: "finished", targetEpoch: null }
+  };
+  const boundaryCapture = api.getLastAutoSnapBoundaryCapture();
+  boundaryCapture.event.endEpoch = 999;
+  assert.equal(api.getLastAutoSnapBoundaryCapture().event.endEpoch, 2);
   controller.recordReviewFailure({
     camera: { name: "Front", entity: "camera.private", password: "fixture-only-password" },
     requestId: 1, lifecycleState: "preparing", lifecycleRevision: 0,
@@ -65,12 +75,11 @@ test("global historical sync diagnostics address only the sole connected card", 
   assert.equal(failures[0].camera, "Front");
   failures[0].camera = "mutated";
   assert.equal(api.getRecentReviewFailures()[0].camera, "Front");
-  controller.recordAutoSnapDecision(1, 1800000000, 1800000000, 1800007200,
-    2, "blocked_unknown");
+  controller.recordAutoSnapDecision("blocked_incomplete", 1800000000);
   const decisions = api.getRecentAutoSnapDecisions();
-  assert.equal(decisions[0].outcome, "blocked_unknown");
+  assert.equal(decisions[0].outcome, "blocked_incomplete");
   decisions[0].outcome = "mutated";
-  assert.equal(api.getRecentAutoSnapDecisions()[0].outcome, "blocked_unknown");
+  assert.equal(api.getRecentAutoSnapDecisions()[0].outcome, "blocked_incomplete");
   const navigation = api.getReviewNavigationDiagnostics();
   navigation.cursor.displayedFrom = "mutated";
   assert.notEqual(api.getReviewNavigationDiagnostics().cursor.displayedFrom, "mutated");
@@ -105,6 +114,7 @@ test("global historical sync diagnostics address only the sole connected card", 
   assert.throws(() => api.getLatestHistoricalSyncReport(), /exactly one connected/);
   assert.throws(() => api.getRecentReviewFailures(), /exactly one connected/);
   assert.throws(() => api.getRecentAutoSnapDecisions(), /exactly one connected/);
+  assert.throws(() => api.getLastAutoSnapBoundaryCapture(), /exactly one connected/);
   assert.throws(() => api.getReviewNavigationDiagnostics(), /exactly one connected/);
   assert.throws(() => api.getContinuousHandoffPrototypeReport(), /exactly one connected/);
   second.remove();
@@ -116,6 +126,7 @@ test("global historical sync diagnostics address only the sole connected card", 
   assert.equal(api.getHistoricalSyncReports().length, 0);
   assert.equal(api.getRecentReviewFailures().length, 0);
   assert.equal(api.getRecentAutoSnapDecisions().length, 0);
+  assert.equal(api.getLastAutoSnapBoundaryCapture(), null);
   assert.equal(api.getReviewNavigationDiagnostics(), null);
   assert.equal(api.getContinuousHandoffPrototypeReport(), null);
 });
@@ -2731,8 +2742,11 @@ test("Review Save Current View uses the Review capture contract and persists onc
   card.setApplicationMode("review");
   card._reviewController.setSelectedCameraNames(["Front", "Garage"]);
   card._reviewController._desiredReviewRange = { from: 100, to: 200 };
-  card._reviewController.setTimelineZoomSpanSeconds(7200);
-  const zoomedWhen = { ...card._reviewController.state.desiredReviewRange };
+  const savedWhen = { ...card._reviewController.state.desiredReviewRange };
+  const displayedWhen = card._reviewController.state.displayedReviewQuery.range;
+  card._reviewController.setTimelineViewport({
+    from: displayedWhen.to - 300, to: displayedWhen.to
+  });
   harness.window.prompt = () => "  Investigation  ";
   const beforeWrites = harness.userStateCalls.filter(call => call.type === "frontend/set_user_data").length;
   card.querySelector(".review-saved-views-body .saved-view-save-current").click();
@@ -2741,9 +2755,10 @@ test("Review Save Current View uses the Review capture contract and persists onc
   assert.equal(card._reviewSavedViews.length, 1);
   assert.equal(card._reviewSavedViews[0].name, "Investigation");
   assert.equal(JSON.stringify(card._reviewSavedViews[0].state.when), JSON.stringify({
-    version: 1, kind: "absolute-range", ...zoomedWhen
+    version: 1, kind: "absolute-range", ...savedWhen
   }));
-  assert.equal(zoomedWhen.to - zoomedWhen.from, 7200);
+  assert.deepEqual(savedWhen, { from: 100, to: 200 });
+  assert.equal(Object.hasOwn(card._reviewSavedViews[0].state, "timelineViewport"), false);
   assert.equal(Object.hasOwn(card._reviewSavedViews[0].state, "zoomSpanSeconds"), false);
   assert.equal(JSON.stringify(card._reviewSavedViews[0].state.options), '{"autoSnapTo":false}');
   assert.equal(JSON.stringify(storedWorkspace(harness, card).reviewSavedViews.views[0].state.options), '{"autoSnapTo":false}');
@@ -2789,7 +2804,7 @@ test("Review load uses transactional restore once and does not overwrite the sna
   const controller = card._reviewController;
   controller._desiredReviewRange = { from: 100, to: 200 };
   const saved = card.saveReviewViewAs("Saved Review", controller.captureReviewViewState());
-  controller.setTimelineZoomSpanSeconds(7200);
+  controller._desiredReviewRange = { from: 300, to: 400 };
   controller._reviewLayout = "2x2";
   controller._reviewAssignments = ["Garage", null, ...new Array(14).fill(null)];
   controller.syncSelectionFromAssignments();
@@ -3959,7 +3974,8 @@ test("sidebar and 600px responsive transitions preserve every player and cell", 
   assert.equal(shell.classList.contains("phone-layout"), true);
   assert.equal(shell.classList.contains("sidebar-collapsed"), true);
   assert.equal(toggle.getAttribute("aria-expanded"), "false");
-  assert.equal(sidebar.getAttribute("aria-hidden"), "false");
+  assert.equal(sidebar.hidden, true);
+  assert.equal(card.querySelector(".mobile-navigation-toggle").hidden, false);
   assertIdentitiesUnchanged(harness, card, cameraNames, before);
 
   harness.setShellWidth(card, 601);
@@ -3985,6 +4001,492 @@ test("sidebar and 600px responsive transitions preserve every player and cell", 
   assert.equal(toggle.getAttribute("aria-expanded"), "false");
   assert.equal(sidebar.getAttribute("aria-hidden"), "false");
   assertIdentitiesUnchanged(harness, card, cameraNames, before);
+});
+
+
+test("narrow Live navigation is hidden at 599 and 600px and desktop preference returns at 601px", t => {
+  const harness = setup(t);
+  const card = harness.createCard({ shellWidth: 601 });
+  const shell = card.querySelector(".nvr-shell");
+  const sidebar = card.querySelector(".nvr-shell > .camera-list");
+  const mobileToggle = card.querySelector(".mobile-navigation-toggle");
+  const desktopToggle = card.querySelector(".sidebar-toggle");
+
+  assert.equal(shell.classList.contains("sidebar-collapsed"), true);
+  for (const width of [599, 600]) {
+    harness.setShellWidth(card, width);
+    assert.equal(sidebar.hidden, true);
+    assert.equal(mobileToggle.hidden, false);
+    assert.equal(mobileToggle.getAttribute("aria-expanded"), "false");
+    assert.equal(sidebar.getAttribute("aria-hidden"), "true");
+  }
+  mobileToggle.click();
+  assert.equal(sidebar.hidden, false);
+  assert.equal(sidebar.classList.contains("expanded"), false);
+  harness.setShellWidth(card, 601);
+  assert.equal(sidebar.hidden, false);
+  assert.equal(mobileToggle.hidden, true);
+  assert.equal(shell.classList.contains("sidebar-collapsed"), true);
+
+  desktopToggle.click();
+  assert.equal(shell.classList.contains("sidebar-collapsed"), false);
+  harness.setShellWidth(card, 600);
+  assert.equal(sidebar.hidden, true);
+  harness.setShellWidth(card, 601);
+  assert.equal(sidebar.hidden, false);
+  assert.equal(shell.classList.contains("sidebar-collapsed"), false);
+});
+
+
+test("narrow navigation overlay preserves Live media identity and does not persist menu state", t => {
+  const harness = setup(t);
+  const card = harness.createCard({ shellWidth: 600 });
+  card.assignCamera("Front");
+  const identity = harness.capturePlayerIdentity(card, "Front");
+  const cells = [...card.querySelectorAll(".video-cell")];
+  const assignedCameras = [...card._assignedCameras];
+  const playerStartCount = identity.player.startCount;
+  const workspace = JSON.stringify(card.captureWorkspace());
+  const persistedCalls = harness.userStateCalls.length;
+  const toggle = card.querySelector(".mobile-navigation-toggle");
+  assert.equal(card.querySelector(".mobile-navigation-close"), null);
+  const sidebar = card.querySelector(".nvr-shell > .camera-list");
+  const backdrop = card.querySelector(".mobile-navigation-backdrop");
+
+  assert.equal(toggle.getAttribute("aria-controls"), sidebar.id);
+  assert.equal(toggle.localName, "button");
+  assert.equal(toggle.type, "button");
+  assert.equal(toggle.getAttribute("aria-label"), "Open navigation");
+  toggle.click();
+  assert.equal(toggle.getAttribute("aria-expanded"), "true");
+  assert.equal(toggle.getAttribute("aria-label"), "Close navigation");
+  assert.equal(sidebar.hidden, false);
+  assert.equal(backdrop.hidden, false);
+  assert.equal(toggle.hidden, false);
+  assert.strictEqual(harness.window.document.activeElement, toggle);
+  toggle.click();
+  assert.equal(sidebar.hidden, true);
+  assert.equal(backdrop.hidden, true);
+  assert.strictEqual(harness.window.document.activeElement, toggle);
+  toggle.click();
+  assert.equal(sidebar.hidden, false);
+  assert.strictEqual(harness.capturePlayerIdentity(card, "Front").player, identity.player);
+  assert.strictEqual(harness.capturePlayerIdentity(card, "Front").cell, identity.cell);
+  assert.deepEqual([...card.querySelectorAll(".video-cell")], cells);
+
+  toggle.focus();
+  const backwardsTab = new harness.window.KeyboardEvent("keydown", { key: "Tab", shiftKey: true, bubbles: true, cancelable: true });
+  toggle.dispatchEvent(backwardsTab);
+  assert.equal(backwardsTab.defaultPrevented, true);
+  const lastSection = [...sidebar.querySelectorAll(".sidebar-section-header")].at(-1);
+  assert.strictEqual(harness.window.document.activeElement, lastSection);
+  lastSection.focus();
+  const tab = new harness.window.KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true });
+  lastSection.dispatchEvent(tab);
+  assert.equal(tab.defaultPrevented, true);
+  assert.strictEqual(harness.window.document.activeElement, toggle);
+  card.querySelector('[data-application-mode="review"]').focus();
+  assert.strictEqual(harness.window.document.activeElement, toggle);
+  const escape = new harness.window.KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true });
+  toggle.dispatchEvent(escape);
+  assert.equal(escape.defaultPrevented, true);
+  assert.equal(sidebar.hidden, true);
+  assert.equal(backdrop.hidden, true);
+  assert.equal(toggle.getAttribute("aria-expanded"), "false");
+  assert.strictEqual(harness.window.document.activeElement, toggle);
+
+  toggle.dispatchEvent(new harness.window.KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  toggle.click();
+  assert.equal(sidebar.hidden, false);
+  let underlyingClicks = 0;
+  card.querySelector(".nvr-shell").addEventListener("click", () => underlyingClicks++);
+  const pointerDown = new harness.window.MouseEvent("pointerdown", { bubbles: true, cancelable: true });
+  let underlyingPointerDowns = 0;
+  card.querySelector(".nvr-shell").addEventListener("pointerdown", () => underlyingPointerDowns++);
+  backdrop.dispatchEvent(pointerDown);
+  assert.equal(pointerDown.defaultPrevented, true);
+  assert.equal(underlyingPointerDowns, 0);
+  const outside = new harness.window.MouseEvent("click", { bubbles: true, cancelable: true });
+  backdrop.dispatchEvent(outside);
+  assert.equal(outside.defaultPrevented, true);
+  assert.equal(underlyingClicks, 0);
+  assert.equal(sidebar.hidden, true);
+  assert.equal(JSON.stringify(card.captureWorkspace()), workspace);
+  assert.equal(harness.userStateCalls.length, persistedCalls);
+  assert.deepEqual(Array.from(card._assignedCameras), assignedCameras);
+  assert.equal(identity.player.startCount, playerStartCount);
+  assert.strictEqual(harness.capturePlayerIdentity(card, "Front").player, identity.player);
+  assert.strictEqual(harness.capturePlayerIdentity(card, "Front").cell, identity.cell);
+});
+
+
+test("Live overlay uses translucent backgrounds and keeps the toggle above outside-dismissal layer", t => {
+  const harness = setup(t);
+  const card = harness.createCard({ shellWidth: 600 });
+  const toggle = card.querySelector(".mobile-navigation-toggle");
+  toggle.click();
+  const style = element => harness.window.getComputedStyle(element);
+  const panelStyle = style(card.querySelector(".nvr-shell > .camera-list"));
+  const footerStyle = style(card.querySelector(".sidebar-rail-footer"));
+  const backdropStyle = style(card.querySelector(".mobile-navigation-backdrop"));
+  const toggleStyle = style(toggle);
+  assert.equal(panelStyle.backgroundColor, "rgba(17, 22, 28, 0.85)");
+  assert.equal(footerStyle.backgroundColor, "rgba(17, 22, 28, 0.85)");
+  assert.ok(!panelStyle.opacity || panelStyle.opacity === "1");
+  assert.ok(!toggleStyle.opacity || toggleStyle.opacity === "1");
+  assert.equal(backdropStyle.backgroundColor, "transparent");
+  assert.equal(backdropStyle.top, "0px");
+  assert.ok(Number(toggleStyle.zIndex) > Number(backdropStyle.zIndex));
+  assert.ok(Number(toggleStyle.zIndex) > Number(panelStyle.zIndex));
+  assert.equal(toggleStyle.width, "44px");
+  assert.equal(toggleStyle.height, "44px");
+});
+
+
+for (const kind of ["camera", "layout"]) {
+  test(`narrow Live ${kind} selection retracts without applying and first target click applies once`, t => {
+    const harness = setup(t);
+    const card = harness.createCard({ shellWidth: 600 });
+    card.assignCamera("Garage");
+    card.setSidebarSectionExpanded(kind === "camera" ? "cameras" : "layouts", true);
+    const identity = harness.capturePlayerIdentity(card, "Garage");
+    const media = [...identity.player.childNodes];
+    const cells = [...card.querySelectorAll(".video-cell")];
+    const workspace = JSON.stringify(card.captureWorkspace());
+    const writes = harness.userStateCalls.length;
+    const startCount = identity.player.startCount;
+    const toggle = card.querySelector(".mobile-navigation-toggle");
+    const source = card.querySelector(kind === "camera" ? '.nvr-shell > .camera-list .camera-item[data-camera="Front"]' : '.nvr-shell > .camera-list .sidebar-layout-item[data-layout="2x2"]');
+    const selectedKey = kind === "camera" ? "_selectedCamera" : "_selectedLayout";
+    const selectedValue = kind === "camera" ? "Front" : "2x2";
+    const method = kind === "camera" ? "assignCameraToSlot" : "selectLayout";
+    const calls = [];
+    const original = card[method];
+    card[method] = function (...args) { calls.push(args); return original.apply(this, args); };
+    card.render = () => assert.fail("selection and menu retraction must not render the card");
+    toggle.click();
+    source.focus();
+    source.click();
+    assert.equal(card[selectedKey], selectedValue);
+    assert.equal(card._mobileNavigationOpen, false);
+    assert.equal(card.querySelector(".nvr-shell > .camera-list").hidden, true);
+    assert.equal(card.querySelector(".mobile-navigation-backdrop").hidden, true);
+    assert.notEqual(harness.window.getComputedStyle(card.querySelector(".main-area")).pointerEvents, "none");
+    assert.equal(card._mobileNavigationKeyHandler, null);
+    assert.equal(card._mobileNavigationFocusHandler, null);
+    assert.strictEqual(harness.window.document.activeElement, toggle);
+    assert.deepEqual(calls, []);
+    assert.equal(JSON.stringify(card.captureWorkspace()), workspace);
+    assert.equal(harness.userStateCalls.length, writes);
+    assert.equal(identity.player.startCount, startCount);
+    assert.strictEqual(harness.capturePlayerIdentity(card, "Garage").player, identity.player);
+    assert.strictEqual(harness.capturePlayerIdentity(card, "Garage").cell, identity.cell);
+    assert.deepEqual([...identity.player.childNodes], media);
+    assert.deepEqual([...card.querySelectorAll(".video-cell")], cells);
+    const target = card.querySelector(kind === "camera" ? '.video-cell[data-slot="1"]' : ".video-grid");
+    target.click();
+    assert.deepEqual(calls, kind === "camera" ? [["Front", 1]] : [["2x2"]]);
+    assert.equal(card[selectedKey], null);
+    target.click();
+    assert.equal(calls.length, 1);
+  });
+
+  test(`Live ${kind} pending selection survives retraction, Escape, replacement and same-item cancellation`, t => {
+    const harness = setup(t);
+    const card = harness.createCard({ shellWidth: 600 });
+    const toggle = card.querySelector(".mobile-navigation-toggle");
+    const source = card.querySelector(kind === "camera" ? '.nvr-shell > .camera-list .camera-item[data-camera="Front"]' : '.nvr-shell > .camera-list .sidebar-layout-item[data-layout="2x2"]');
+    const replacement = card.querySelector(kind === "camera" ? '.nvr-shell > .camera-list .camera-item[data-camera="Patio"]' : '.nvr-shell > .camera-list .sidebar-layout-item[data-layout="3x3"]');
+    const other = card.querySelector(kind === "camera" ? '.nvr-shell > .camera-list .sidebar-layout-item[data-layout="2x2"]' : '.nvr-shell > .camera-list .camera-item[data-camera="Front"]');
+    const key = kind === "camera" ? "_selectedCamera" : "_selectedLayout";
+    const otherKey = kind === "camera" ? "_selectedLayout" : "_selectedCamera";
+    const value = kind === "camera" ? "Front" : "2x2";
+    const workspace = JSON.stringify(card.captureWorkspace());
+    const writes = harness.userStateCalls.length;
+    toggle.click();
+    source.click();
+    toggle.click();
+    toggle.dispatchEvent(new harness.window.KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+    assert.equal(card._mobileNavigationOpen, false);
+    assert.equal(card[key], value);
+    toggle.click();
+    source.click();
+    assert.equal(card[key], null);
+    assert.equal(card._mobileNavigationOpen, true);
+    source.click();
+    toggle.click();
+    replacement.click();
+    assert.equal(card[key], kind === "camera" ? "Patio" : "3x3");
+    assert.equal(card._mobileNavigationOpen, false);
+    toggle.click();
+    other.click();
+    assert.equal(card[key], null);
+    assert.notEqual(card[otherKey], null);
+    assert.equal(card._mobileNavigationOpen, false);
+    assert.equal(JSON.stringify(card.captureWorkspace()), workspace);
+    assert.equal(harness.userStateCalls.length, writes);
+  });
+
+  test(`desktop Live ${kind} select-and-target keeps the sidebar open`, t => {
+    const harness = setup(t);
+    const card = harness.createCard({ shellWidth: 601 });
+    card.querySelector(".sidebar-toggle").click();
+    const source = card.querySelector(kind === "camera" ? '.nvr-shell > .camera-list .camera-item[data-camera="Front"]' : '.nvr-shell > .camera-list .sidebar-layout-item[data-layout="2x2"]');
+    const selectedKey = kind === "camera" ? "_selectedCamera" : "_selectedLayout";
+    source.focus();
+    source.click();
+    assert.equal(card.querySelector(".nvr-shell").classList.contains("sidebar-collapsed"), false);
+    assert.equal(card.querySelector(".nvr-shell > .camera-list").hidden, false);
+    assert.strictEqual(harness.window.document.activeElement, source);
+    assert.notEqual(card[selectedKey], null);
+    card.querySelector(kind === "camera" ? '.video-cell[data-slot="0"]' : ".video-grid").click();
+    assert.equal(card[selectedKey], null);
+    if (kind === "camera") assert.equal(card._assignedCameras[0], "Front");
+    else assert.equal(card._layout, "2x2");
+  });
+}
+
+test("invalid Live source clicks leave the narrow menu and pending selection unchanged", t => {
+  const harness = setup(t);
+  const card = harness.createCard({ shellWidth: 600 });
+  const toggle = card.querySelector(".mobile-navigation-toggle");
+  card.toggleCameraTargetSelection("Front");
+  toggle.click();
+  for (const [selector, key] of [[".camera-item", "camera"], [".sidebar-layout-item", "layout"]]) {
+    const source = card.querySelector(`.nvr-shell > .camera-list ${selector}`);
+    source.dataset[key] = "invalid-source";
+    source.click();
+    assert.equal(card._mobileNavigationOpen, true);
+    assert.equal(card._selectedCamera, "Front");
+    assert.equal(card._selectedLayout, null);
+  }
+});
+
+
+function createLiveNavigationDrag(harness, source) {
+  const data = new Map();
+  const transfer = {
+    effectAllowed: "", dropEffect: "",
+    get types() { return [...data.keys()]; },
+    setData(type, value) { data.set(type, value); },
+    getData(type) { return data.get(type) ?? ""; }
+  };
+  const dispatch = (target, type, payload = transfer) => {
+    const event = new harness.window.Event(type, { bubbles: true, cancelable: true });
+    Object.defineProperty(event, "dataTransfer", { value: payload });
+    target.dispatchEvent(event);
+    return event;
+  };
+  return { source, transfer, dispatch };
+}
+
+function setupMobilePointerDrag(harness, kind = "camera") {
+  const card = harness.createCard({ shellWidth: 600 });
+  card.assignCamera("Garage");
+  card.setSidebarSectionExpanded(kind === "camera" ? "cameras" : "layouts", true);
+  const panel = card.querySelector(".nvr-shell > .camera-list");
+  panel.getBoundingClientRect = () => ({ left: 0, top: 44, right: 240, bottom: 500 });
+  const source = panel.querySelector(kind === "camera" ? '.camera-item[data-camera="Front"]' : '.sidebar-layout-item[data-layout="2x2"]');
+  const cell = card.querySelector('.video-cell[data-slot="1"]');
+  const grid = card.querySelector(".video-grid");
+  const hits = [];
+  // Model HA's shadow boundary: document hit testing cannot see the cell.
+  harness.window.document.elementFromPoint = () => harness.window.document.body;
+  card.getRootNode = () => ({ elementFromPoint(x, y) {
+    hits.push([x, y]);
+    return x >= 240 && x < 600 && y >= 44 && y < 500 ? cell : harness.window.document.body;
+  } });
+  let captured = false;
+  card.setPointerCapture = () => { captured = true; };
+  card.hasPointerCapture = () => captured;
+  card.releasePointerCapture = () => { captured = false; };
+  const pointer = (type, x, y, target = harness.window.document, id = 7) => {
+    const event = new harness.window.Event(type, { bubbles: true, cancelable: true });
+    for (const [key, value] of Object.entries({ clientX: x, clientY: y, pointerId: id, button: 0, isPrimary: true, pointerType: "mouse" })) {
+      Object.defineProperty(event, key, { value });
+    }
+    target.dispatchEvent(event);
+    return event;
+  };
+  card.querySelector(".mobile-navigation-toggle").click();
+  return { card, panel, source, cell, grid, hits, pointer, captured: () => captured };
+}
+
+for (const kind of ["camera", "layout"]) {
+  test(`mobile Live ${kind} pointer drag shows ghost, retracts at boundary and applies exactly once`, t => {
+    const harness = setup(t);
+    const { card, panel, source, cell, grid, hits, pointer, captured } = setupMobilePointerDrag(harness, kind);
+    const identity = harness.capturePlayerIdentity(card, "Garage");
+    const cells = [...card.querySelectorAll(".video-cell")];
+    const media = [...identity.player.childNodes];
+    const workspace = JSON.stringify(card.captureWorkspace());
+    const writes = harness.userStateCalls.length;
+    const method = kind === "camera" ? "assignCameraToSlot" : "selectLayout";
+    const original = card[method];
+    const calls = [];
+    card[method] = function (...args) { calls.push(args); return original.apply(this, args); };
+    card.render = () => assert.fail("pointer dragging must not render the card");
+    assert.equal(pointer("pointerdown", 80, 120, source).defaultPrevented, false);
+    pointer("pointermove", 83, 122);
+    assert.equal(card.querySelector(".mobile-navigation-drag-ghost"), null);
+    pointer("pointermove", 90, 130);
+    const ghost = card.querySelector(".mobile-navigation-drag-ghost");
+    assert.ok(ghost);
+    assert.equal(captured(), true);
+    assert.equal(ghost.textContent, kind === "camera" ? "Front" : card.layouts["2x2"].label);
+    assert.equal(ghost.style.transform, "translate(102px, 142px)");
+    assert.equal(harness.window.getComputedStyle(ghost).pointerEvents, "none");
+    assert.equal(card._mobileNavigationOpen, true);
+    pointer("pointermove", 300, 150);
+    assert.equal(ghost.style.transform, "translate(312px, 162px)");
+    assert.equal(card._mobileNavigationOpen, false);
+    assert.equal(panel.hidden, true);
+    assert.equal(source.isConnected, true);
+    assert.notEqual(harness.window.getComputedStyle(card.querySelector(".main-area")).pointerEvents, "none");
+    assert.equal((kind === "camera" ? cell : grid).classList.contains(kind === "camera" ? "camera-drop-target" : "layout-drop-target"), true);
+    assert.deepEqual(hits.at(-1), [300, 150]);
+    assert.deepEqual(calls, []);
+    assert.equal(JSON.stringify(card.captureWorkspace()), workspace);
+    assert.equal(harness.userStateCalls.length, writes);
+    assert.strictEqual(harness.capturePlayerIdentity(card, "Garage").player, identity.player);
+    assert.deepEqual([...identity.player.childNodes], media);
+    assert.deepEqual([...card.querySelectorAll(".video-cell")], cells);
+    pointer("pointerup", 310, 160);
+    assert.deepEqual(calls, kind === "camera" ? [["Front", 1]] : [["2x2"]]);
+    assert.deepEqual(hits.at(-1), [310, 160]);
+    assert.equal(card._mobileNavigationPointerDrag, null);
+    assert.equal(card.querySelector(".mobile-navigation-drag-ghost"), null);
+    assert.equal(captured(), false);
+    assert.equal(cell.classList.contains("camera-drop-target"), false);
+    assert.equal(grid.classList.contains("layout-drop-target"), false);
+    assert.strictEqual(harness.capturePlayerIdentity(card, "Garage").player, identity.player);
+    assert.deepEqual([...card.querySelectorAll(".video-cell")], cells);
+    const click = new harness.window.MouseEvent("click", { detail: 1, bubbles: true, cancelable: true });
+    source.dispatchEvent(click);
+    assert.equal(click.defaultPrevented, true);
+    assert.equal(card._selectedCamera, null);
+    assert.equal(card._selectedLayout, null);
+    assert.equal(card._mobileNavigationClickCleanup, null);
+    pointer("pointerup", 310, 160);
+    assert.equal(calls.length, 1);
+  });
+
+  test(`mobile Live ${kind} press without drag preserves click-select-target`, t => {
+    const harness = setup(t);
+    const { card, source, cell, grid, pointer } = setupMobilePointerDrag(harness, kind);
+    pointer("pointerdown", 80, 120, source);
+    pointer("pointermove", 82, 121);
+    pointer("pointerup", 82, 121, source);
+    assert.equal(card._mobileNavigationPointerDrag, null);
+    assert.equal(card._mobileNavigationClickCleanup, null);
+    source.click();
+    assert.equal(card._mobileNavigationOpen, false);
+    assert.equal(card[kind === "camera" ? "_selectedCamera" : "_selectedLayout"], kind === "camera" ? "Front" : "2x2");
+    (kind === "camera" ? cell : grid).click();
+    if (kind === "camera") assert.equal(card._assignedCameras[1], "Front");
+    else assert.equal(card._layout, "2x2");
+  });
+
+  test(`desktop Live ${kind} native dragging stays enabled; mobile native dragging is disabled`, t => {
+    const harness = setup(t);
+    const card = harness.createCard({ shellWidth: 601 });
+    const source = card.querySelector(kind === "camera" ? ".nvr-shell > .camera-list .camera-item" : ".nvr-shell > .camera-list .sidebar-layout-item");
+    const drag = createLiveNavigationDrag(harness, source);
+    assert.equal(source.getAttribute("draggable"), "true");
+    assert.equal(drag.dispatch(source, "dragstart").defaultPrevented, false);
+    assert.equal(drag.transfer.effectAllowed, kind === "camera" ? "move" : "copy");
+    assert.equal(drag.transfer.getData(`application/x-nvr-${kind}`), source.dataset[kind === "camera" ? "camera" : "layout"]);
+    const target = card.querySelector(kind === "camera" ? '.video-cell[data-slot="0"]' : ".video-grid");
+    assert.equal(drag.dispatch(target, "dragover").defaultPrevented, true);
+    assert.equal(drag.dispatch(target, "drop").defaultPrevented, true);
+    harness.setShellWidth(card, 600);
+    assert.equal(source.getAttribute("draggable"), "false");
+    assert.equal(drag.dispatch(source, "dragstart").defaultPrevented, true);
+    assert.equal(card._mobileNavigationPointerDrag, null);
+  });
+
+  for (const reason of ["invalid-drop", "pointercancel", "escape", "lost-capture", "resize", "mode", "disconnect"]) {
+    test(`mobile Live ${kind} pointer drag cancellation: ${reason}`, t => {
+      const harness = setup(t);
+      const { card, source, cell, grid, pointer, captured } = setupMobilePointerDrag(harness, kind);
+      const workspace = JSON.stringify(card.captureWorkspace());
+      const writes = harness.userStateCalls.length;
+      const assignments = [...card._assignedCameras];
+      pointer("pointerdown", 80, 120, source);
+      pointer("pointermove", 300, 150);
+      if (reason === "invalid-drop") pointer("pointerup", 800, 150);
+      if (reason === "pointercancel") pointer("pointercancel", 300, 150);
+      if (reason === "lost-capture") pointer("lostpointercapture", 300, 150, card);
+      if (reason === "escape") harness.window.document.dispatchEvent(new harness.window.KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+      if (reason === "resize") harness.setShellWidth(card, 601);
+      if (reason === "mode") card.setApplicationMode("review");
+      if (reason === "disconnect") card.remove();
+      assert.equal(card._mobileNavigationPointerDrag, null);
+      assert.equal(card.querySelector(".mobile-navigation-drag-ghost"), null);
+      assert.equal(card.classList.contains("mobile-navigation-pointer-dragging"), false);
+      assert.equal(cell.classList.contains("camera-drop-target"), false);
+      assert.equal(grid.classList.contains("layout-drop-target"), false);
+      assert.equal(captured(), false);
+      assert.deepEqual([...card._assignedCameras], assignments);
+      if (reason !== "mode") assert.equal(JSON.stringify(card.captureWorkspace()), workspace);
+      assert.equal(harness.userStateCalls.length, writes);
+      pointer("pointerup", 300, 150);
+      assert.deepEqual([...card._assignedCameras], assignments);
+    });
+  }
+}
+
+test("mobile pointer dragging ignores unrelated pointers and invalid sources", t => {
+  const harness = setup(t);
+  const { card, source, pointer } = setupMobilePointerDrag(harness);
+  pointer("pointerdown", 80, 120, source);
+  pointer("pointermove", 300, 150, harness.window.document, 8);
+  pointer("pointerup", 300, 150, harness.window.document, 8);
+  assert.equal(card._mobileNavigationPointerDrag.active, false);
+  pointer("pointercancel", 80, 120);
+  source.dataset.camera = "invalid-camera";
+  pointer("pointerdown", 80, 120, source);
+  assert.equal(card._mobileNavigationPointerDrag, null);
+});
+
+test("a new pointer gesture clears drag-click suppression and ordinary menu selection still works", t => {
+  const harness = setup(t);
+  const { card, source, pointer } = setupMobilePointerDrag(harness);
+  pointer("pointerdown", 80, 120, source);
+  pointer("pointermove", 300, 150);
+  pointer("pointerup", 800, 150);
+  assert.ok(card._mobileNavigationClickCleanup);
+  const toggle = card.querySelector(".mobile-navigation-toggle");
+  pointer("pointerdown", 10, 10, toggle);
+  assert.equal(card._mobileNavigationClickCleanup, null);
+  toggle.click();
+  source.click();
+  assert.equal(card._selectedCamera, "Front");
+  assert.equal(card._mobileNavigationOpen, false);
+});
+
+
+test("narrow navigation focus trap is removed on mode switch and disconnect", t => {
+  const harness = setup(t);
+  const card = harness.createCard({ shellWidth: 600 });
+  const toggle = card.querySelector(".mobile-navigation-toggle");
+  const sidebar = card.querySelector(".nvr-shell > .camera-list");
+  toggle.click();
+  assert.equal(card._mobileNavigationOpen, true);
+  assert.ok(card._mobileNavigationKeyHandler);
+
+  card.setApplicationMode("review");
+  assert.equal(card._mobileNavigationOpen, false);
+  assert.equal(card._mobileNavigationKeyHandler, null);
+  assert.equal(sidebar.hidden, true);
+  card.setApplicationMode("live");
+  assert.equal(sidebar.hidden, true);
+  toggle.click();
+  assert.equal(card._mobileNavigationOpen, true);
+  card.remove();
+  assert.equal(card._mobileNavigationOpen, false);
+  assert.equal(card._mobileNavigationKeyHandler, null);
+  assert.equal(card._mobileNavigationFocusHandler, null);
 });
 
 test("3x3 diagnostic mode keeps exactly logical slots 0 through 3 live", t => {

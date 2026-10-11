@@ -22,12 +22,14 @@ import {
   normalizeReviewTimelineItems,
   reviewEventNavigationTimestamps,
   reviewEventNavigationTargets,
+  buildReviewEventIntervals,
   planContinuousHandoffPrototype,
   reviewTimelineEpochFromCoordinate,
   reviewTimelineMarkerGeometry,
   reviewTimelineMarkerTop
 } from "../src/review/review-controller.js";
 import { createTestHarness } from "./helpers/nvr-card-harness.js";
+import { epochToMedia, mediaToEpoch } from "../src/review/historical-presentation.js";
 
 function cameras() {
   return [
@@ -110,7 +112,7 @@ test("deployed card cache-busts the Review controller with its build identifier"
   );
 });
 
-test("Live and Review consume centralized expanded and collapsed rail widths", () => {
+test("wide layouts share rail widths while narrow Live navigation overlays full-width video", () => {
   const source = readFileSync(new URL("../nvr-card.js", import.meta.url), "utf8");
   assert.match(source, /--nvr-sidebar-width:\s*240px/);
   assert.match(source, /--nvr-sidebar-collapsed-width:\s*calc\(/);
@@ -118,7 +120,11 @@ test("Live and Review consume centralized expanded and collapsed rail widths", (
   assert.match(source, /\.nvr-shell\.sidebar-collapsed\s*{[\s\S]*?--nvr-sidebar-current-width:\s*var\(--nvr-sidebar-collapsed-width\)/);
   assert.match(source, /grid-template-columns:\s*var\(--nvr-sidebar-current-width\)\s*minmax\(0, 1fr\)/);
   assert.match(source, /grid-template-columns:\s*var\(--nvr-sidebar-current-width\) minmax\(360px, 1fr\)/);
-  assert.match(source, /\.nvr-shell\.phone-layout[\s\S]*?width:\s*var\(--nvr-sidebar-current-width\)/);
+  assert.match(source, /\.nvr-shell\.phone-layout\s*> \.camera-list\s*{[\s\S]*?width:\s*min\(var\(--nvr-sidebar-width\), 100%\)/);
+  assert.match(source, /\.nvr-shell\.phone-layout\s*> \.sidebar-rail-top\s*{\s*display:\s*none/);
+  assert.match(source, /\.nvr-shell\.phone-layout \.mobile-navigation-toggle\[hidden\]\s*{\s*display:\s*none !important/);
+  assert.match(source, /\.nvr-shell\.phone-layout\s*> \.mobile-navigation-backdrop\s*{[\s\S]*?z-index:\s*99/);
+  assert.match(source, /\.nvr-shell\.phone-layout\.mobile-navigation-open\s*> \.camera-list\s*{[\s\S]*?z-index:\s*100/);
 });
 
 test("rail shell shares large icons, clean rows, footer, and collapsed treatment", () => {
@@ -490,7 +496,7 @@ function createHistoricalHarness({
       if (message.type === "frigate_max/v1/review/get") {
         if (reviewResponder) return reviewResponder(message);
         if (reviewError) return Promise.reject(new Error("synthetic timeline failure"));
-        return Promise.resolve(reviewEvents);
+        return Promise.resolve({ schema: 2, complete: true, items: reviewEvents });
       }
       if (message.type === "frigate_max/v1/recordings/availability") {
         if (availabilityResponder) return availabilityResponder(message);
@@ -571,45 +577,15 @@ function recordingCoverageResponder(intervalsByCamera, onRequest = null) {
   };
 }
 
-async function enterAutoSnapGap(harness, target, range) {
+async function enterEventAutoSnap(harness, target, when) {
   const controller = harness.controller;
-  await controller.playHistorical(target, { autoplay: false, playbackRange: range });
+  await controller.refreshReviewQuery();
+  await controller.playHistorical(target, {
+    autoplay: false, updateDisplayedRange: false, playbackRange: when
+  });
   controller.setAutoSnapTo(true);
-  assert.equal(controller.resumePlayback(), true,
-    JSON.stringify({ mode: controller.state.presentationMode, running: controller.clock.running,
-      players: [...controller._historicalPlayers.values()].map(player => player.lifecycleState) }));
-  await controller.queueHistoricalAvailabilityEvaluation("auto_snap_test_start");
-  controller.clock.setAbsolute(target + 10);
-  controller.clock.start();
-  for (const player of controller._historicalPlayers.values()) {
-    controller.leaveHistoricalCamera(player, "authoritative_recording_gap", target + 10);
-  }
-  assert.equal(controller.clock.running, true);
   return controller;
 }
-
-async function createRelativeCoverageHarness(t, {
-  range, startEpoch, coverage, cameraNames = ["Drive Up"],
-  enabled = true, playing = true, onRequest = null, reviewEvents = []
-}) {
-  const harness = createHistoricalHarness({
-    now: () => 1000, wallClockMs: (range.to + 1000) * 1000,
-    initialReviewRange: range, reviewEvents,
-    availabilityResponder: recordingCoverageResponder(coverage, onRequest)
-  });
-  t.after(() => harness.close());
-  const controller = harness.controller;
-  controller.setSelectedCameraNames(cameraNames);
-  await controller.playHistorical(startEpoch, { autoplay: false, playbackRange: range });
-  controller.setAutoSnapTo(enabled);
-  if (playing) {
-    assert.equal(controller.resumePlayback(), true);
-    await waitForCondition(() => [...controller._historicalPlayers.values()].some(player =>
-      player.lifecycleState === "participating"));
-  }
-  return harness;
-}
-
 function getWhenEditor(harness) {
   const content = harness.root.querySelector(".review-when-controls");
   const field = endpoint => harness.root.querySelector(`.review-${endpoint}-picker`)
@@ -1321,78 +1297,487 @@ test("Timeline coordinates map newest/top to oldest/bottom for any height", () =
   assert.equal(reviewTimelineEpochFromCoordinate(100, 100, 0, range), null);
 });
 
-test("timeline zoom commits 1h, 4h, and 24h When ranges around absolute TI", async t => {
+test("timeline viewport initializes from displayed When and clamps duration and position", t => {
   const wall = 1800000000;
-  const original = { from: wall - 24 * 3600, to: wall + 24 * 3600 };
-  const harness = createHistoricalHarness({ wallClockMs: wall * 1000, initialReviewRange: original });
-  t.after(() => harness.close());
-  const controller = harness.controller;
-  const ti = wall - 10000;
-  controller._reviewPosition = ti;
-  controller.updateClockDisplay();
-  const slider = harness.root.querySelector(".review-timeline-zoom-input");
-  assert.equal(slider.min, "1");
-  assert.equal(slider.max, "24");
-  assert.equal(harness.root.querySelector(".review-timeline-zoom-value"), null);
-  const cameras = controller.state.displayedReviewQuery.cameraNames;
-  const prepareCount = harness.calls.filter(call => call.type === "frigate_max/v1/vod/prepare").length;
-  for (const hours of [1, 4, 24]) {
-    slider.value = String(hours);
-    slider.dispatchEvent(new harness.window.Event("input", { bubbles: true }));
-    const to = Math.min(ti + hours * 1800, wall);
-    const expected = { from: to - hours * 3600, to };
-    assert.deepEqual(controller.state.desiredReviewRange, expected);
-    assert.deepEqual(controller.state.displayedReviewQuery.range, expected);
-    assert.deepEqual(controller.getWhenControlRange(), expected);
-    assert.equal(controller.reviewPosition, ti);
-    assert.deepEqual(controller.state.displayedReviewQuery.cameraNames, cameras);
-    const ticks = [...harness.root.querySelectorAll(".review-timeline-tick")];
-    assert.equal(ticks[0].textContent, formatNvrClockTime(expected.to, controller.timeZone));
-    assert.equal(ticks.at(-1).textContent, formatNvrClockTime(expected.from, controller.timeZone));
+  for (const span of [120, 900, 24 * 3600, 48 * 3600]) {
+    const when = { from: wall - span, to: wall };
+    const harness = createHistoricalHarness({ wallClockMs: wall * 1000, initialReviewRange: when });
+    t.after(() => harness.close());
+    const controller = harness.controller;
+    const expected = { from: wall - Math.min(span, 86400), to: wall };
+    assert.deepEqual(controller.state.timelineViewport, expected);
+    assert.equal(harness.root.querySelector(".review-timeline-zoom-input"), null);
+    assert.equal(controller.setTimelineViewport({ from: wall - 10, to: wall }),
+      span > 300);
+    assert.deepEqual(controller.state.timelineViewport,
+      span > 300 ? { from: wall - 300, to: wall } : expected);
+    assert.deepEqual(controller.state.displayedReviewQuery.range, when);
   }
-  await controller.flushScheduledReviewQuery();
-  assert.equal(harness.calls.filter(call => call.type === "frigate_max/v1/vod/prepare").length, prepareCount);
-  assert.deepEqual(controller.state.timeline.queryRange, controller.state.desiredReviewRange);
 });
 
-test("timeline zoom clamps at now without moving TI and leaves shorter manual When ranges valid", t => {
+test("wheel zoom anchors the pointer and changes only the visible timeline", t => {
   const wall = 1800000000;
-  const short = { from: wall - 900, to: wall };
-  const harness = createHistoricalHarness({ wallClockMs: wall * 1000, initialReviewRange: short });
+  const when = { from: wall - 48 * 3600, to: wall };
+  const harness = createHistoricalHarness({ wallClockMs: wall * 1000,
+    initialReviewRange: when });
   t.after(() => harness.close());
   const controller = harness.controller;
-  assert.deepEqual(controller.state.displayedReviewQuery.range, short);
-  assert.equal(harness.root.querySelector(".review-timeline-zoom-input").value, "1");
-  controller.setTimelineZoomSpanSeconds(3600);
-  assert.deepEqual(controller.state.desiredReviewRange, { from: wall - 3600, to: wall });
-  assert.equal(controller.reviewPosition, wall);
-  controller._reviewPosition = wall - 900;
-  controller.setTimelineZoomSpanSeconds(4 * 3600);
-  assert.deepEqual(controller.state.desiredReviewRange, { from: wall - 4 * 3600, to: wall });
-  assert.equal(controller.reviewPosition, wall - 900);
+  const initial = { from: wall - 7200, to: wall - 3600 };
+  controller.setTimelineViewport(initial);
+  const ti = controller.reviewPosition;
+  const queries = harness.calls.filter(call => call.type === "frigate_max/v1/review/get").length;
+  const axis = harness.root.querySelector(".review-timeline-axis");
+  axis.getBoundingClientRect = () => ({ top: 100, height: 400 });
+  const anchor = reviewTimelineEpochFromCoordinate(200, 100, 400, initial);
+  const wheel = new harness.window.WheelEvent("wheel", {
+    bubbles: true, cancelable: true, deltaY: -100, clientY: 200
+  });
+  Object.defineProperty(wheel, "clientY", { value: 200 });
+  assert.equal(axis.dispatchEvent(wheel), false);
+  const viewport = controller.state.timelineViewport;
+  assert.ok(viewport.to - viewport.from < 3600);
+  assert.ok(Math.abs(reviewTimelineEpochFromCoordinate(200, 100, 400, viewport) - anchor) < 0.001);
+  assert.equal(controller.reviewPosition, ti);
+  assert.deepEqual(controller.state.displayedReviewQuery.range, when);
+  assert.deepEqual(controller.state.desiredReviewQuery.range, when);
+  assert.equal(harness.calls.filter(call => call.type === "frigate_max/v1/review/get").length,
+    queries);
+  const heading = harness.root.querySelector(".review-timeline-lane-headings");
+  const outside = new harness.window.WheelEvent("wheel", {
+    bubbles: true, cancelable: true, deltaY: -100, clientY: 200
+  });
+  Object.defineProperty(outside, "clientY", { value: 200 });
+  assert.equal(heading.dispatchEvent(outside), true);
+  assert.deepEqual(controller.state.timelineViewport, viewport);
+});
+
+test("wheel zoom obeys five-minute, When, and 24-hour limits with edge clamping", t => {
+  const wall = 1800000000;
+  const when = { from: wall - 48 * 3600, to: wall };
+  const harness = createHistoricalHarness({ wallClockMs: wall * 1000,
+    initialReviewRange: when });
+  t.after(() => harness.close());
+  const controller = harness.controller;
+  controller.setTimelineViewport({ from: when.from, to: when.from + 600 });
+  const wheel = (deltaY, clientY) => {
+    const axis = harness.root.querySelector(".review-timeline-axis");
+    axis.getBoundingClientRect = () => ({ top: 100, height: 400 });
+    const event = new harness.window.WheelEvent("wheel", {
+      bubbles: true, cancelable: true, deltaY, clientY
+    });
+    Object.defineProperty(event, "clientY", { value: clientY });
+    axis.dispatchEvent(event);
+  };
+  wheel(-2000, 500);
+  assert.deepEqual(controller.state.timelineViewport,
+    { from: when.from, to: when.from + 300 });
+  wheel(2000, 100);
+  assert.ok(Math.abs(controller.state.timelineViewport.to - controller.state.timelineViewport.from -
+    300 * Math.exp(1.2)) < 0.001);
+  wheel(2000, 100);
+  wheel(2000, 100);
+  wheel(2000, 100);
+  wheel(2000, 100);
+  assert.equal(controller.state.timelineViewport.to - controller.state.timelineViewport.from,
+    24 * 3600);
+  assert.ok(controller.state.timelineViewport.from >= when.from);
+  assert.ok(controller.state.timelineViewport.to <= when.to);
+
+  const shortWhen = { from: wall - 120, to: wall };
+  const short = createHistoricalHarness({ wallClockMs: wall * 1000,
+    initialReviewRange: shortWhen });
+  t.after(() => short.close());
+  const shortAxis = short.root.querySelector(".review-timeline-axis");
+  shortAxis.getBoundingClientRect = () => ({ top: 100, height: 400 });
+  const shortWheel = new short.window.WheelEvent("wheel", {
+    bubbles: true, cancelable: true, deltaY: -100, clientY: 300
+  });
+  Object.defineProperty(shortWheel, "clientY", { value: 300 });
+  shortAxis.dispatchEvent(shortWheel);
+  assert.deepEqual(short.controller.state.timelineViewport, shortWhen);
+});
+
+test("background drag pans without seeking and suppresses its release click", t => {
+  const wall = 1800000000;
+  const when = { from: wall - 7200, to: wall };
+  const harness = createHistoricalHarness({ wallClockMs: wall * 1000,
+    initialReviewRange: when });
+  t.after(() => harness.close());
+  const controller = harness.controller;
+  const initial = { from: wall - 3600, to: wall - 1800 };
+  controller.setTimelineViewport(initial);
+  const content = harness.root.querySelector(".review-rhs-content");
+  const selected = [];
+  controller.selectTimelineTime = epoch => { selected.push(epoch); return Promise.resolve(true); };
+  let captures = 0;
+  let releases = 0;
+  content.setPointerCapture = () => { captures += 1; };
+  content.releasePointerCapture = () => { releases += 1; };
+  const axis = harness.root.querySelector(".review-timeline-axis");
+  axis.getBoundingClientRect = () => ({ top: 100, height: 400 });
+  axis.dispatchEvent(new harness.window.PointerEvent("pointerdown", {
+    bubbles: true, pointerId: 51, button: 0, clientY: 200
+  }));
+  content.dispatchEvent(new harness.window.PointerEvent("pointermove", {
+    bubbles: true, pointerId: 51, clientY: 203
+  }));
+  assert.deepEqual(controller.state.timelineViewport, initial);
+  content.dispatchEvent(new harness.window.PointerEvent("pointerup", {
+    bubbles: true, pointerId: 51, clientY: 203
+  }));
+  axis.dispatchEvent(new harness.window.MouseEvent("click", {
+    bubbles: true, button: 0, clientY: 203
+  }));
+  assert.equal(selected.length, 1);
+
+  const secondAxis = harness.root.querySelector(".review-timeline-axis");
+  secondAxis.getBoundingClientRect = () => ({ top: 100, height: 400 });
+  secondAxis.dispatchEvent(new harness.window.PointerEvent("pointerdown", {
+    bubbles: true, pointerId: 52, button: 0, clientY: 200
+  }));
+  content.dispatchEvent(new harness.window.PointerEvent("pointermove", {
+    bubbles: true, pointerId: 52, clientY: 300
+  }));
+  assert.deepEqual(controller.state.timelineViewport,
+    { from: initial.from + 450, to: initial.to + 450 });
+  assert.equal(captures, 1);
+  content.dispatchEvent(new harness.window.PointerEvent("pointerup", {
+    bubbles: true, pointerId: 52, clientY: 300
+  }));
+  assert.equal(releases, 1);
+  harness.root.querySelector(".review-timeline-axis").dispatchEvent(
+    new harness.window.MouseEvent("click", { bubbles: true, button: 0, clientY: 300 }));
+  assert.equal(selected.length, 1);
+  assert.deepEqual(controller.state.displayedReviewQuery.range, when);
+
+  const backAxis = harness.root.querySelector(".review-timeline-axis");
+  backAxis.getBoundingClientRect = () => ({ top: 100, height: 400 });
+  backAxis.dispatchEvent(new harness.window.PointerEvent("pointerdown", {
+    bubbles: true, pointerId: 53, button: 0, clientY: 300
+  }));
+  content.dispatchEvent(new harness.window.PointerEvent("pointermove", {
+    bubbles: true, pointerId: 53, clientY: 200
+  }));
+  assert.deepEqual(controller.state.timelineViewport, initial);
+  content.dispatchEvent(new harness.window.PointerEvent("pointerup", {
+    bubbles: true, pointerId: 53, clientY: 200
+  }));
+  const edgeAxis = harness.root.querySelector(".review-timeline-axis");
+  edgeAxis.getBoundingClientRect = () => ({ top: 100, height: 400 });
+  edgeAxis.dispatchEvent(new harness.window.PointerEvent("pointerdown", {
+    bubbles: true, pointerId: 54, button: 0, clientY: 200
+  }));
+  content.dispatchEvent(new harness.window.PointerEvent("pointermove", {
+    bubbles: true, pointerId: 54, clientY: 2000
+  }));
+  assert.deepEqual(controller.state.timelineViewport,
+    { from: when.to - 1800, to: when.to });
+  content.dispatchEvent(new harness.window.PointerEvent("pointercancel", {
+    bubbles: true, pointerId: 54
+  }));
+  assert.equal(controller._timelinePan, null);
+  assert.equal(selected.length, 1);
+});
+
+test("TI drag stays separate from pan and playback follow waits for an active pan", t => {
+  const wall = 1800000000;
+  const when = { from: wall - 7200, to: wall };
+  const harness = createHistoricalHarness({ wallClockMs: wall * 1000,
+    now: () => 1000, initialReviewRange: when });
+  t.after(() => harness.close());
+  const controller = harness.controller;
+  controller.setTimelineViewport({ from: wall - 3900, to: wall - 3600 });
+  const axis = harness.root.querySelector(".review-timeline-axis");
+  axis.getBoundingClientRect = () => ({ top: 100, height: 400 });
+  const handle = axis.querySelector(".review-timeline-handle");
+  handle.dispatchEvent(new harness.window.PointerEvent("pointerdown", {
+    bubbles: true, pointerId: 61, button: 0, clientY: 100
+  }));
+  assert.equal(controller._timelinePan, null);
+  assert.ok(controller._timelineDrag);
+  handle.dispatchEvent(new harness.window.PointerEvent("pointercancel", {
+    bubbles: true, pointerId: 61
+  }));
+
+  controller._presentationMode = "historical";
+  controller.clock.setAbsolute(wall - 3700);
+  controller.clock.start();
+  const content = harness.root.querySelector(".review-rhs-content");
+  const panAxis = harness.root.querySelector(".review-timeline-axis");
+  panAxis.getBoundingClientRect = () => ({ top: 100, height: 400 });
+  panAxis.dispatchEvent(new harness.window.PointerEvent("pointerdown", {
+    bubbles: true, pointerId: 62, button: 0, clientY: 200
+  }));
+  content.dispatchEvent(new harness.window.PointerEvent("pointermove", {
+    bubbles: true, pointerId: 62, clientY: 600
+  }));
+  const manualViewport = controller.state.timelineViewport;
+  controller.updateClockDisplay();
+  assert.deepEqual(controller.state.timelineViewport, manualViewport);
+  content.dispatchEvent(new harness.window.PointerEvent("pointercancel", {
+    bubbles: true, pointerId: 62
+  }));
+  assert.equal(controller._timelinePan, null);
+  controller.updateClockDisplay();
+  assert.notDeepEqual(controller.state.timelineViewport, manualViewport);
+  assert.equal(harness.root.querySelector(".review-timeline-cursor").hidden, false);
+  assert.deepEqual(controller.state.displayedReviewQuery.range, when);
+});
+
+test("long When initializes a 24-hour viewport containing TI", t => {
+  const wall = 1800000000;
+  const when = { from: wall - 72 * 3600, to: wall };
+  const harness = createHistoricalHarness({ wallClockMs: wall * 1000, initialReviewRange: when });
+  t.after(() => harness.close());
+  const controller = harness.controller;
+  controller._reviewPosition = wall - 36 * 3600;
+  controller.resetTimelineViewport();
+  assert.deepEqual(controller.state.timelineViewport,
+    { from: wall - 48 * 3600, to: wall - 24 * 3600 });
+  controller.setTimelineViewport({ from: when.from - 1000, to: when.from + 200 });
+  assert.deepEqual(controller.state.timelineViewport,
+    { from: when.from, to: when.from + 1200 });
+});
+
+test("Snap uses full When events and reveals an out-of-viewport target", async t => {
+  const wall = 1800000000;
+  const when = { from: wall - 7200, to: wall };
+  const event = { camera_id: "drive_up", start_time: wall - 1800, type: "person" };
+  const harness = createHistoricalHarness({ wallClockMs: wall * 1000,
+    initialReviewRange: when, reviewEvents: [event] });
+  t.after(() => harness.close());
+  const controller = harness.controller;
+  await controller.refreshReviewQuery();
+  controller._reviewPosition = wall - 3600;
+  controller.setTimelineViewport({ from: wall - 3900, to: wall - 3600 });
+  assert.equal(harness.root.querySelectorAll(".review-timeline-marker").length, 0);
+  assert.equal(controller.getEventNavigationTargets().next, event.start_time);
+  assert.equal(await controller.snapToNextEvent(), true);
+  assert.deepEqual(controller.state.timelineViewport,
+    { from: event.start_time - 270, to: event.start_time + 30 });
+  assert.deepEqual(controller.state.displayedReviewQuery.range, when);
+  const axis = harness.root.querySelector(".review-timeline-axis");
+  assert.ok(axis.classList.contains("review-timeline-snap-arrival"));
+  assert.equal(axis.querySelector(".review-timeline-cursor").style.top, "10%");
+  assert.equal(axis.querySelector(".review-timeline-tick span").textContent,
+    formatNvrClockTime(controller.state.timelineViewport.to, controller.timeZone));
+  assert.equal(axis.querySelector(".review-timeline-marker").style.top, "10%");
+});
+
+test("TI follow starts near either edge and shifts the viewport only as needed", t => {
+  const wall = 1800000000;
+  const when = { from: wall - 7200, to: wall };
+  const harness = createHistoricalHarness({ wallClockMs: wall * 1000,
+    initialReviewRange: when });
+  t.after(() => harness.close());
+  const controller = harness.controller;
+  const original = { from: wall - 3900, to: wall - 3600 };
+  controller.setTimelineViewport(original);
+  const queryCount = harness.calls.filter(call => call.type === "frigate_max/v1/review/get").length;
+  assert.equal(controller.revealTimelinePosition(wall - 3869), false,
+    "lower-edge times outside the 10% margin remain in place");
+  assert.equal(controller.revealTimelinePosition(wall - 3631), false,
+    "upper-edge times outside the 10% margin remain in place");
+  assert.deepEqual(controller.state.timelineViewport, original);
+  controller._reviewPosition = wall - 3615;
+  assert.equal(controller.revealTimelinePosition(wall - 3615), true,
+    "upper-edge times inside the 10% margin follow");
+  assert.deepEqual(controller.state.timelineViewport,
+    { from: wall - 3885, to: wall - 3585 });
+  assert.equal(harness.root.querySelector(".review-timeline-cursor").hidden, false);
+  assert.equal(harness.root.querySelector(".review-timeline-cursor").style.top, "10%");
+  controller.setTimelineViewport(original);
+  controller._reviewPosition = wall - 3885;
+  assert.equal(controller.revealTimelinePosition(wall - 3885), true,
+    "lower-edge times inside the 10% margin follow symmetrically");
+  assert.deepEqual(controller.state.timelineViewport,
+    { from: wall - 3915, to: wall - 3615 });
+  assert.equal(harness.root.querySelector(".review-timeline-cursor").hidden, false);
+  assert.equal(harness.root.querySelector(".review-timeline-cursor").style.top, "90%");
+  assert.equal(harness.calls.filter(call => call.type === "frigate_max/v1/review/get").length,
+    queryCount);
+  assert.deepEqual(controller.state.desiredReviewRange, when);
   assert.equal(controller.clock.running, false);
 });
 
-test("timeline click, drag and markers follow the zoomed When range", async t => {
+test("running TI follows viewport edges without moving When or changing duration", t => {
   const wall = 1800000000;
-  const range = { from: wall - 7200, to: wall + 7200 };
-  const event = { camera_id: "drive_up", start_time: wall - 600, end_time: wall - 300, type: "person" };
-  const outside = { camera_id: "drive_up", start_time: wall - 6000, end_time: wall - 5900, type: "person" };
+  const when = { from: wall - 7200, to: wall };
+  const harness = createHistoricalHarness({ wallClockMs: wall * 1000,
+    now: () => 1000, initialReviewRange: when });
+  t.after(() => harness.close());
+  const controller = harness.controller;
+  controller.setTimelineViewport({ from: wall - 3900, to: wall - 3600 });
+  controller._presentationMode = "historical";
+  controller.clock.setAbsolute(wall - 3500);
+  controller.clock.start();
+  controller.updateClockDisplay();
+  assert.deepEqual(controller.state.timelineViewport,
+    { from: wall - 3770, to: wall - 3470 });
+  assert.equal(harness.root.querySelector(".review-timeline-cursor").hidden, false);
+  assert.equal(harness.root.querySelector(".review-timeline-cursor").style.top, "10%");
+  assert.equal(controller.state.timelineViewport.to - controller.state.timelineViewport.from, 300);
+  assert.deepEqual(controller.state.displayedReviewQuery.range, when);
+});
+
+test("a running clock cannot outrun its own viewport reveal during cursor rendering", t => {
+  const wall = 1800000000;
+  const harness = createHistoricalHarness({ wallClockMs: wall * 1000,
+    initialReviewRange: { from: wall - 7200, to: wall } });
+  t.after(() => harness.close());
+  const controller = harness.controller;
+  controller.setTimelineViewport({ from: wall - 3900, to: wall - 3600 });
+  let monotonic = 0;
+  controller.clock._now = () => { monotonic += 250; return monotonic; };
+  controller._presentationMode = "historical";
+  controller.clock.setAbsolute(wall - 3590);
+  controller.clock.start();
+  controller.updateClockDisplay();
+  const viewport = controller.state.timelineViewport;
+  const ti = controller.reviewPosition;
+  assert.ok(ti > viewport.from && ti < viewport.to);
+  assert.equal(harness.root.querySelector(".review-timeline-cursor").hidden, false);
+  assert.ok(Number.parseFloat(harness.root.querySelector(".review-timeline-cursor").style.top)
+    >= 9 && Number.parseFloat(harness.root.querySelector(".review-timeline-cursor").style.top)
+    <= 11);
+});
+
+test("rapid forward Snaps settle on the latest event and backward Snap keeps TI in view", async t => {
+  const wall = 1800000000;
+  const when = { from: wall - 7200, to: wall };
+  const events = [wall - 3600, wall - 1800].map(start_time => ({
+    camera_id: "drive_up", start_time, type: "person"
+  }));
+  const harness = createHistoricalHarness({ wallClockMs: wall * 1000,
+    initialReviewRange: when, reviewEvents: events });
+  t.after(() => harness.close());
+  const controller = harness.controller;
+  await controller.refreshReviewQuery();
+  controller._reviewPosition = wall - 5400;
+  controller.setTimelineViewport({ from: wall - 5700, to: wall - 5400 });
+  const queries = harness.calls.filter(call => call.type === "frigate_max/v1/review/get").length;
+  const first = controller.snapToNextEvent();
+  const second = controller.snapToNextEvent();
+  await Promise.all([first, second]);
+  assert.equal(controller.reviewPosition, events[1].start_time);
+  assert.deepEqual(controller.state.timelineViewport,
+    { from: events[1].start_time - 270, to: events[1].start_time + 30 });
+  assert.equal(await controller.snapToPreviousEvent(), true);
+  assert.equal(controller.reviewPosition, events[0].start_time);
+  assert.deepEqual(controller.state.timelineViewport,
+    { from: events[0].start_time - 30, to: events[0].start_time + 270 });
+  assert.equal(harness.root.querySelector(".review-timeline-cursor").hidden, false);
+  assert.equal(harness.root.querySelector(".review-timeline-cursor").style.top, "90%");
+  assert.equal(harness.calls.filter(call => call.type === "frigate_max/v1/review/get").length,
+    queries);
+  assert.deepEqual(controller.state.displayedReviewQuery.range, when);
+});
+
+test("reduced motion keeps Snap viewport jumps immediate", async t => {
+  const wall = 1800000000;
+  const when = { from: wall - 7200, to: wall };
+  const event = { camera_id: "drive_up", start_time: wall - 1800, type: "person" };
+  const harness = createHistoricalHarness({ wallClockMs: wall * 1000,
+    initialReviewRange: when, reviewEvents: [event] });
+  t.after(() => harness.close());
+  harness.window.matchMedia = query => ({
+    matches: query === "(prefers-reduced-motion: reduce)"
+  });
+  const controller = harness.controller;
+  await controller.refreshReviewQuery();
+  controller._reviewPosition = wall - 3600;
+  controller.setTimelineViewport({ from: wall - 3900, to: wall - 3600 });
+  assert.equal(await controller.snapToNextEvent(), true);
+  assert.equal(harness.root.querySelector(".review-timeline-axis")
+    .classList.contains("review-timeline-snap-arrival"), false);
+  assert.equal(harness.root.querySelector(".review-timeline-cursor").hidden, false);
+  const css = readFileSync(new URL("../nvr-card.js", import.meta.url), "utf8");
+  assert.match(css, /review-timeline-snap-arrival 180ms ease-out/);
+  assert.match(css, /@media \(prefers-reduced-motion: reduce\)/);
+  assert.match(css, /review-timeline-axis\.review-timeline-snap-arrival\s*{\s*animation:\s*none/);
+});
+
+test("When Apply retains the old viewport until the new displayed query succeeds", async t => {
+  const wall = 1800000000;
+  const when = { from: wall - 7200, to: wall };
+  const harness = createHistoricalHarness({ wallClockMs: wall * 1000,
+    initialReviewRange: when });
+  t.after(() => harness.close());
+  const controller = harness.controller;
+  const viewport = { from: wall - 3900, to: wall - 3600 };
+  controller.setTimelineViewport(viewport);
+  controller.setReviewRangeEndpoint("from", wall - 1800);
+  assert.equal(controller.applyWhenDraft(), true);
+  assert.deepEqual(controller.state.timelineViewport, viewport);
+  assert.deepEqual(controller.state.displayedReviewQuery.range, when);
+  await controller.flushScheduledReviewQuery();
+  assert.deepEqual(controller.state.displayedReviewQuery.range,
+    { from: wall - 1800, to: wall });
+  assert.deepEqual(controller.state.timelineViewport,
+    { from: wall - 1800, to: wall });
+});
+
+test("failed View refresh retains the displayed events and viewport", async t => {
+  const wall = 1800000000;
+  const when = { from: wall - 7200, to: wall };
+  let fail = false;
+  const harness = createHistoricalHarness({ wallClockMs: wall * 1000,
+    initialReviewRange: when,
+    reviewResponder: () => fail ? Promise.reject(new Error("offline")) : Promise.resolve([]) });
+  t.after(() => harness.close());
+  const controller = harness.controller;
+  await controller.refreshReviewQuery();
+  const viewport = { from: wall - 3900, to: wall - 3600 };
+  controller.setTimelineViewport(viewport);
+  const saved = controller.captureReviewViewState();
+  saved.when = { ...saved.when, from: wall - 1800 };
+  fail = true;
+  controller.restoreReviewView(saved);
+  assert.deepEqual(controller.state.timelineViewport, viewport);
+  await controller.flushScheduledReviewQuery();
+  assert.deepEqual(controller.state.displayedReviewQuery.range, when);
+  assert.deepEqual(controller.state.timelineViewport, viewport);
+  fail = false;
+  await controller.refreshReviewQuery();
+  assert.deepEqual(controller.state.timelineViewport,
+    { from: wall - 1800, to: wall });
+});
+
+test("timeline ticks, clipped markers, pointer, and TI share the viewport", async t => {
+  const wall = 1800000000;
+  const when = { from: wall - 7200, to: wall + 7200 };
+  const event = { camera_id: "drive_up", start_time: wall - 3900,
+    end_time: wall - 3300, type: "person" };
+  const outside = { camera_id: "drive_up", start_time: wall - 6000,
+    end_time: wall - 5900, type: "person" };
   const harness = createHistoricalHarness({
-    wallClockMs: wall * 1000, initialReviewRange: range, reviewEvents: [event, outside]
+    wallClockMs: wall * 1000, initialReviewRange: when, reviewEvents: [event, outside]
   });
   t.after(() => harness.close());
   const controller = harness.controller;
   await controller.refreshReviewQuery();
-  controller.setTimelineZoomSpanSeconds(3600);
-  const visible = { from: wall - 3600, to: wall };
-  assert.deepEqual(controller.state.displayedReviewQuery.range, visible);
+  const viewport = { from: wall - 3600, to: wall };
+  const queries = harness.calls.filter(call => call.type === "frigate_max/v1/review/get").length;
+  controller.setTimelineViewport(viewport);
+  assert.deepEqual(controller.state.timelineViewport, viewport);
+  assert.deepEqual(controller.state.displayedReviewQuery.range, when);
+  assert.equal(harness.calls.filter(call => call.type === "frigate_max/v1/review/get").length, queries);
+  const ticks = [...harness.root.querySelectorAll(".review-timeline-tick")];
+  assert.equal(ticks[0].textContent, formatNvrClockTime(viewport.to, controller.timeZone));
+  assert.equal(ticks.at(-1).textContent, formatNvrClockTime(viewport.from, controller.timeZone));
   const markers = [...harness.root.querySelectorAll(".review-timeline-marker")];
   assert.equal(markers.length, 1);
+  assert.equal(markers[0].dataset.startEpoch, String(event.start_time));
   assert.match(markers[0].getAttribute("style"), new RegExp(
-    `top:min\\(${reviewTimelineMarkerGeometry(event, visible).top * 100}%, calc\\(100% - 1px\\)\\)`
+    `top:min\\(${reviewTimelineMarkerGeometry(event, viewport).top * 100}%, calc\\(100% - 1px\\)\\)`
+  ));
+  assert.match(markers[0].getAttribute("style"), new RegExp(
+    `height:max\\(${reviewTimelineMarkerGeometry(event, viewport).height * 100}%, 1px\\)`
   ));
   assert.equal(harness.root.querySelector(".review-timeline-cursor").style.top, "0%");
+  controller._reviewPosition = wall - 5000;
+  controller.updateClockDisplay();
+  assert.equal(harness.root.querySelector(".review-timeline-cursor").hidden, true);
   const axis = harness.root.querySelector(".review-timeline-axis");
   axis.getBoundingClientRect = () => ({ top: 100, height: 400 });
   const selected = [];
@@ -1407,75 +1792,58 @@ test("timeline click, drag and markers follow the zoomed When range", async t =>
     bubbles: true, pointerId: 88, clientY: 400
   }));
   assert.equal(controller.reviewPosition, wall - 2700);
-  handle.dispatchEvent(new harness.window.PointerEvent("pointerup", {
-    bubbles: true, pointerId: 88, button: 0, clientY: 400
+  handle.dispatchEvent(new harness.window.PointerEvent("pointercancel", {
+    bubbles: true, pointerId: 88
   }));
-  assert.equal(selected[1], wall - 2700);
-  assert.deepEqual(controller.state.displayedReviewQuery.range, visible);
+  assert.deepEqual(controller.state.displayedReviewQuery.range, when);
 });
 
-test("paused and playing zoom preserve active historical players and transport intent", async t => {
+test("viewport movement preserves paused and playing Review transport", async t => {
   const wall = 1800000000;
-  const harness = createHistoricalHarness({
-    wallClockMs: wall * 1000, now: () => 1000,
-    initialReviewRange: { from: wall - 7200, to: wall + 7200 }
-  });
+  const when = { from: wall - 7200, to: wall + 7200 };
+  const harness = createHistoricalHarness({ wallClockMs: wall * 1000,
+    now: () => 1000, initialReviewRange: when });
   t.after(() => harness.close());
   const controller = harness.controller;
   await controller.selectTimelineTime(wall - 60);
   controller.pausePlayback();
-  assert.equal(controller.clock.running, false);
   const players = [...controller._historicalPlayers.values()];
   const requestId = controller._reviewRequestId;
   const prepares = harness.calls.filter(call => call.type === "frigate_max/v1/vod/prepare").length;
   const pausedTi = controller.clock.absoluteTime;
-  controller.setTimelineZoomSpanSeconds(4 * 3600);
+  controller.setTimelineViewport({ from: wall - 3600, to: wall });
   assert.equal(controller.clock.absoluteTime, pausedTi);
   assert.equal(controller.clock.running, false);
   assert.deepEqual([...controller._historicalPlayers.values()], players);
   assert.equal(controller._reviewRequestId, requestId);
-  assert.equal(harness.calls.filter(call => call.type === "frigate_max/v1/vod/prepare").length, prepares);
   assert.equal(controller.resumePlayback(), true);
   const starts = harness.starts.length;
   const playingTi = controller.clock.absoluteTime;
-  controller.setTimelineZoomSpanSeconds(3600);
+  controller.setTimelineViewport({ from: wall - 1800, to: wall });
   assert.equal(controller.clock.absoluteTime, playingTi);
   assert.equal(controller.clock.running, true);
   assert.equal(harness.starts.length, starts);
   assert.equal(harness.calls.filter(call => call.type === "frigate_max/v1/vod/prepare").length, prepares);
-  assert.deepEqual([...controller._historicalPlayers.values()], players);
-  assert.equal(controller._reviewRequestId, requestId);
-  assert.deepEqual(controller._historicalPlaybackRange, controller.state.desiredReviewRange);
+  assert.deepEqual(controller._historicalPlaybackRange, when);
 });
 
-test("Review Views use only absolute When bounds after zoom and preserve transient TI on load", t => {
+test("Review Views save When alone and restore the transient viewport", t => {
   const wall = 1800000000;
-  const harness = createHistoricalHarness({
-    wallClockMs: wall * 1000,
-    initialReviewRange: { from: wall - 7200, to: wall + 7200 }
-  });
+  const when = { from: wall - 7200, to: wall + 7200 };
+  const harness = createHistoricalHarness({ wallClockMs: wall * 1000,
+    initialReviewRange: when });
   t.after(() => harness.close());
   const controller = harness.controller;
-  controller._reviewPosition = wall - 1800;
-  controller.setTimelineZoomSpanSeconds(4 * 3600);
+  controller.setTimelineViewport({ from: wall - 1800, to: wall });
   const saved = controller.captureReviewViewState();
-  assert.equal(Object.hasOwn(saved, "zoomSpanSeconds"), false);
-  assert.deepEqual(saved.when, {
-    version: 1, kind: "absolute-range",
-    from: controller.state.desiredReviewRange.from,
-    to: controller.state.desiredReviewRange.to
-  });
-  controller.setTimelineZoomSpanSeconds(3600);
+  assert.deepEqual(saved.when, { version: 1, kind: "absolute-range", ...when });
+  assert.equal(Object.hasOwn(saved, "timelineViewport"), false);
   controller._reviewPosition = wall - 1200;
   const result = controller.restoreReviewView(saved);
   assert.equal(result.result, "restored");
-  assert.deepEqual(controller.state.desiredReviewRange,
-    { from: saved.when.from, to: saved.when.to });
+  assert.deepEqual(controller.state.timelineViewport, when);
   assert.equal(controller.reviewPosition, wall - 1200);
-  assert.equal(Object.hasOwn(result.state, "zoomSpanSeconds"), false);
-  const oldView = { ...saved, zoomSpanSeconds: 3600 };
-  assert.equal(Object.hasOwn(controller.normalizeReviewViewState(oldView).state,
-    "zoomSpanSeconds"), false);
+  assert.equal(Object.hasOwn(result.state, "timelineViewport"), false);
 });
 test("Review criteria update desired query and coalesce into one automatic refresh", async t => {
   const harness = createHistoricalHarness();
@@ -3487,7 +3855,7 @@ test("duration markers retain proportional height with a 1px display floor and c
   assert.ok(controller.getEventNavigationInventory().includes(events.short.start_time));
   assert.equal(controller.getEventNavigationTargets(wall - 121).next, events.short.start_time);
 
-  controller.setTimelineZoomSpanSeconds(3600);
+  controller.setTimelineViewport({ from: wall - 3600, to: wall });
   assert.ok(Math.abs(visiblePixels(markerFor(events.short.start_time)) - 5) < 1e-9);
   assert.equal(markerFor(events.short.start_time).dataset.startEpoch, String(events.short.start_time));
   assert.equal(markerFor(events.short.start_time).dataset.endEpoch, String(events.short.end_time));
@@ -3500,7 +3868,7 @@ test("Timeline consumes all remaining RHS height between its tabs and time foote
   assert.match(source, /\.review-rhs\s*{[^}]*display:\s*flex;[^}]*flex-direction:\s*column;/s);
   assert.match(source, /\.review-rhs-modes\s*{[^}]*flex:\s*0 0 34px;/s);
   assert.match(source, /\.review-rhs-content\s*{[^}]*display:\s*flex;[^}]*flex:\s*1 1 auto;[^}]*min-height:\s*0;[^}]*overflow:\s*hidden;/s);
-  assert.match(source, /\.review-time-truth\s*{[^}]*flex:\s*0 0 66px;/s);
+  assert.match(source, /\.review-time-truth\s*{[^}]*flex:\s*0 0 34px;/s);
   assert.match(source, /\.review-timeline\s*{[^}]*display:\s*flex;[^}]*flex:\s*1 1 auto;[^}]*flex-direction:\s*column;[^}]*min-height:\s*0;/s);
   assert.match(source, /\.review-timeline-lane-headings\s*{[^}]*flex:\s*0 0 28px;/s);
   assert.match(source, /\.review-timeline-axis\s*{[^}]*flex:\s*1 1 auto;[^}]*min-height:\s*0;/s);
@@ -4081,6 +4449,59 @@ test("manual Timeline click pauses placement, prepares the target, and waits for
   assert.equal(harness.starts.length, startsBefore + 2);
 });
 
+test("manual upper/lower edge click and drag preserve TI epoch and viewport through acquisition and seek", async t => {
+  const wall = 1800000000;
+  const when = { from: wall - 7200, to: wall };
+  const viewport = { from: wall - 3900, to: wall - 3600 };
+  const cases = [
+    { input: "click", lifecycle: "initial", y: 105 },
+    { input: "click", lifecycle: "initial", y: 395 },
+    { input: "drag", lifecycle: "seek", y: 105 },
+    { input: "drag", lifecycle: "seek", y: 395 }
+  ];
+  for (const scenario of cases) {
+    const harness = createHistoricalHarness({
+      wallClockMs: wall * 1000, initialReviewRange: when
+    });
+    t.after(() => harness.close());
+    const { controller } = harness;
+    if (scenario.lifecycle === "seek") {
+      await controller.playHistorical(wall - 3750, {
+        autoplay: false, updateDisplayedRange: false, playbackRange: when
+      });
+    }
+    controller.setTimelineViewport(viewport);
+    const axis = harness.root.querySelector(".review-timeline-axis");
+    axis.getBoundingClientRect = () => ({ top: 100, height: 300 });
+    const selected = controller.getTimelinePointerEpoch(axis, scenario.y);
+    assert.ok(selected >= when.from && selected <= when.to);
+    const requestBefore = controller._reviewRequestId;
+    if (scenario.input === "click") {
+      axis.dispatchEvent(new harness.window.MouseEvent("click", {
+        bubbles: true, button: 0, clientY: scenario.y
+      }));
+    } else {
+      const handle = axis.querySelector(".review-timeline-handle");
+      handle.dispatchEvent(new harness.window.PointerEvent("pointerdown", {
+        bubbles: true, pointerId: 31, button: 0, clientY: 250
+      }));
+      handle.dispatchEvent(new harness.window.PointerEvent("pointermove", {
+        bubbles: true, pointerId: 31, button: 0, clientY: scenario.y
+      }));
+      handle.dispatchEvent(new harness.window.PointerEvent("pointerup", {
+        bubbles: true, pointerId: 31, button: 0, clientY: scenario.y
+      }));
+    }
+    await waitForCondition(() => controller._reviewRequestId !== requestBefore &&
+      !controller._historicalPreparing && controller.clock.absoluteTime === selected);
+    assert.deepEqual(controller.state.timelineViewport, viewport,
+      `${scenario.input} ${scenario.lifecycle} placement must retain viewport bounds`);
+    assert.equal(controller.clock.absoluteTime, selected,
+      `${scenario.input} ${scenario.lifecycle} placement must retain its exact epoch`);
+    assert.equal(controller.clock.running, false);
+  }
+});
+
 test("repeated paused Timeline placements keep the newest target and cannot autoplay a stale request", async t => {
   const harness = createHistoricalHarness();
   const firstTarget = harness.controller.state.reviewRange.from + 600;
@@ -4328,6 +4749,23 @@ test("event navigation inventory sorts, deduplicates, and ignores unselected cam
   });
   assert.deepEqual(reviewEventNavigationTargets(inventory, 200), {
     previous: 100, next: 300
+  });
+});
+
+test("event retrieval paging leaves timeline start boundaries and strict Snap starts unchanged", () => {
+  const range = { from: 100, to: 200 };
+  const items = normalizeReviewTimelineItems([
+    { camera_id: "drive_up", start_time: 99, end_time: 150 },
+    { camera_id: "drive_up", start_time: 100, end_time: 110 },
+    { camera_id: "drive_up", start_time: 150, end_time: 175 },
+    { camera_id: "drive_up", start_time: 200 },
+    { camera_id: "drive_up", start_time: 201 }
+  ], range);
+  assert.deepEqual(items.map(item => item.start_time), [100, 150, 200]);
+  const starts = reviewEventNavigationTimestamps(items, ["drive_up"], range);
+  assert.deepEqual(starts, [100, 150, 200]);
+  assert.deepEqual(reviewEventNavigationTargets(starts, 150), {
+    previous: 100, next: 200
   });
 });
 
@@ -4686,6 +5124,150 @@ test("historical speed is shared, rate-aware, and retained through live return a
   assert.equal(harness.root.querySelector(".review-speed-select").value, "8");
 });
 
+test("Review speed stays enabled before acquisition and disables after Review deactivation", t => {
+  const harness = createHistoricalHarness();
+  t.after(() => harness.close());
+  const { controller } = harness;
+  const speed = harness.root.querySelector(".review-speed-select");
+  assert.equal(controller._presentationMode, "live");
+  assert.equal(controller._historicalPlayers.size, 0);
+  assert.equal(speed.disabled, false);
+  assert.equal(controller.setPlaybackSpeed(4), true);
+  assert.equal(controller.state.playbackSpeed, 4);
+  assert.equal(controller.clock.rate, 4);
+  assert.equal(speed.disabled, false);
+  controller.deactivate();
+  controller.updateTransport();
+  assert.equal(controller._active, false);
+  assert.equal(harness.root.querySelector(".review-speed-select"), null);
+  assert.equal(harness.transportRoot.querySelector(".review-speed-select"), null);
+});
+
+test("Review speed eligibility is independent of playback and camera lifecycle state", t => {
+  const harness = createHistoricalHarness();
+  t.after(() => harness.close());
+  const { controller } = harness;
+  const speed = harness.root.querySelector(".review-speed-select");
+  const player = {
+    lifecycleState: "unavailable",
+    video: null,
+    hls: null,
+    heldCanvas: { hidden: false },
+    heldFrameEpoch: 1800000000
+  };
+  controller._historicalPlayers = new Map([["Drive Up", player]]);
+  for (const presentationMode of ["live", "historical"]) {
+    controller._presentationMode = presentationMode;
+    for (const preparing of [false, true]) {
+      controller._historicalPreparing = preparing;
+      for (const lifecycleState of ["preparing", "participating", "unavailable", "failed"]) {
+        player.lifecycleState = lifecycleState;
+        controller.updateTransport();
+        assert.equal(speed.disabled, false,
+          `${presentationMode}, preparing=${preparing}, camera=${lifecycleState}`);
+      }
+    }
+  }
+});
+
+test("speed stays enabled during owned pending Play and changes clock and existing media in place", async t => {
+  let releasePlay;
+  const playGate = new Promise(resolve => { releasePlay = resolve; });
+  const harness = createHistoricalHarness({ playResponder: () => playGate });
+  t.after(() => {
+    releasePlay();
+    harness.close();
+  });
+  const target = 1800000000;
+  const run = harness.controller.playHistorical(target);
+  await waitForCondition(() => !harness.controller._historicalPreparing &&
+    [...harness.controller._historicalPlayers.values()].length > 0 &&
+    [...harness.controller._historicalPlayers.values()].every(player =>
+      player.transition?.reason === "play_release" && player.transition.playPending));
+  const players = [...harness.controller._historicalPlayers.values()];
+  const videos = players.map(player => player.video);
+  const hls = players.map(player => player.hls);
+  assert.equal(harness.controller.clock.running, true);
+  assert.ok(players.every(player => player.lifecycleState === "preparing" &&
+    player.transition?.reason === "play_release" && player.transition.playPending &&
+    harness.controller.isCurrentCameraTransition(player, player.transition)));
+
+  const speed = harness.root.querySelector(".review-speed-select");
+  assert.equal(speed.disabled, false);
+  const clockBefore = harness.controller.clock.absoluteTime;
+  const pauseCounts = videos.map(video => video.pauseCount);
+  const seeks = videos.map(video => [...video.currentTimeWrites]);
+  const playCount = harness.playCalls.length;
+  const hlsCount = harness.instances.length;
+
+  let availabilityEvaluations = 0;
+  harness.controller.queueHistoricalAvailabilityEvaluation = () => {
+    availabilityEvaluations += 1;
+    return Promise.resolve([]);
+  };
+  harness.controller._autoSnapArmed = true;
+  harness.controller._autoSnapActiveEnd = clockBefore + 60;
+  speed.value = "4";
+  speed.dispatchEvent(new harness.window.Event("change"));
+
+  assert.equal(harness.controller.clock.rate, 4);
+  assert.ok(Math.abs(harness.controller.clock.absoluteTime - clockBefore) < 0.1);
+  assert.ok(players.every(player => player.video.playbackRate === 4));
+  assert.ok(players.every((player, index) => player.video === videos[index] &&
+    player.hls === hls[index]));
+  assert.deepEqual(videos.map(video => video.pauseCount), pauseCounts);
+  assert.deepEqual(videos.map(video => video.currentTimeWrites), seeks);
+  assert.equal(harness.playCalls.length, playCount);
+  assert.equal(harness.instances.length, hlsCount);
+  assert.equal(availabilityEvaluations, 0);
+  assert.notEqual(harness.controller._historicalBoundaryTimer, null);
+
+  releasePlay();
+  await run;
+  assert.ok(players.every(player =>
+    player.lifecycleState === "participating" && player.transition === null));
+});
+
+test("speed remains enabled without qualifying stale or cancelled Play transitions", async t => {
+  for (const disposition of ["stale", "cancelled"]) {
+    let releasePlay;
+    const playGate = new Promise(resolve => { releasePlay = resolve; });
+    const harness = createHistoricalHarness({ playResponder: () => playGate });
+    t.after(() => {
+      releasePlay();
+      harness.close();
+    });
+    harness.controller.setSelectedCameraNames(["Drive Up"]);
+    await harness.controller.flushScheduledReviewQuery();
+    const run = harness.controller.playHistorical(1800000000);
+    await waitForCondition(() => !harness.controller._historicalPreparing &&
+      harness.controller._historicalPlayers.get("Drive Up")?.transition?.reason === "play_release" &&
+      harness.controller._historicalPlayers.get("Drive Up")?.transition?.playPending);
+    const player = harness.controller._historicalPlayers.get("Drive Up");
+    const transition = player.transition;
+    assert.equal(harness.root.querySelector(".review-speed-select").disabled, false);
+
+    if (disposition === "stale") {
+      transition.requestId += 1;
+    } else {
+      transition.hls = null;
+      harness.controller.cancelCameraTransition(player);
+    }
+    harness.controller.updateTransport();
+    assert.equal(harness.root.querySelector(".review-speed-select").disabled, false,
+      `${disposition} transition does not determine Review speed availability`);
+    const pauseCount = player.video.pauseCount;
+    const seekWrites = [...player.video.currentTimeWrites];
+    const playbackAttempts = harness.playCalls.length;
+    assert.equal(harness.controller.setPlaybackSpeed(2), true);
+    assert.equal(player.video.pauseCount, pauseCount);
+    assert.deepEqual(player.video.currentTimeWrites, seekWrites);
+    assert.equal(harness.playCalls.length, playbackAttempts);
+    releasePlay();
+    await run;
+  }
+});
+
 test("slow Review speeds use the existing shared control through seek, pause, and reacquisition", async t => {
   const harness = createHistoricalHarness();
   t.after(() => harness.close());
@@ -4914,7 +5496,17 @@ test("all unavailable cameras retain cells and never start an empty historical c
   assert.deepEqual(harness.controller.state.reviewAssignments, assignments);
   assert.equal(harness.root.querySelector(".review-back-ten").disabled, true);
   assert.equal(harness.root.querySelector(".review-play").disabled, false);
-  assert.equal(harness.root.querySelector(".review-speed-select").disabled, true);
+  assert.equal(harness.root.querySelector(".review-speed-select").disabled, false);
+  const evaluations = [];
+  harness.controller.queueHistoricalAvailabilityEvaluation = reason => {
+    evaluations.push(reason);
+    return Promise.resolve([]);
+  };
+  assert.equal(harness.controller.setPlaybackSpeed(2), true);
+  assert.equal(harness.controller.state.playbackSpeed, 2);
+  assert.equal(harness.controller.clock.rate, 2);
+  assert.equal(harness.controller.clock.absoluteTime, target);
+  assert.deepEqual(evaluations, []);
 });
 
 test("zero participating cameras produce no VOD request or layout mutation", async t => {
@@ -4945,6 +5537,7 @@ test("historical loading and VCR states are compact and keep event controls disa
   await Promise.resolve();
   assert.equal(harness.controller.state.historicalPreparing, true);
   assert.match(harness.controller._historicalStatus, /Preparing playback/);
+  assert.equal(harness.root.querySelector(".review-speed-select").disabled, false);
   assert.equal(harness.root.querySelector(".review-historical-state"), null);
   assert.ok([...harness.root.querySelectorAll(".review-camera-presentation-kind")]
     .every(badge => badge.textContent === "Historical"));
@@ -5308,556 +5901,961 @@ test("recording availability cache uses bounded windows and half-open interval t
   assert.equal(inspectRecordingAvailability(availability, window.end).insideWindow, false);
 });
 
-test("Auto Snap chooses the earliest selected-camera recording across bounded windows", async t => {
-  const target = 1800000000;
-  const range = { from: target - 60, to: target + 12000 };
-  const initial = { start: target - 30, end: target + 5 };
-  const intervals = {
-    drive_up: [initial, { start: target + 10000, end: target + 10100 }],
-    drive_down: [initial, { start: target + 9000, end: target + 9100 }]
-  };
-  const harness = createHistoricalHarness({
-    now: () => 1000, wallClockMs: (target + 20000) * 1000,
-    initialReviewRange: range,
-    reviewEvents: [{ camera_id: "drive_up", start_time: target + 8000,
-      end_time: target + 8001, type: "person" }],
-    availabilityResponder: recordingCoverageResponder(intervals)
+test("completed events form one selected-camera union with original times and ongoing uncertainty", () => {
+  const when = { from: 100, to: 200 };
+  const items = normalizeReviewTimelineItems([
+    { camera_id: "drive_up", start_time: 110, end_time: 130 },
+    { camera_id: "drive_down", start_time: 125, end_time: 150 },
+    { camera_id: "drive_up", start_time: 150, end_time: 230 },
+    { camera_id: "drive_down", start_time: 170 },
+    { camera_id: "back", start_time: 175, end_time: 180 },
+    { camera_id: "drive_up", start_time: 90, end_time: 120 }
+  ], when);
+  assert.equal(items.find(item => item.start_time === 150).end_time, 230);
+  assert.deepEqual(buildReviewEventIntervals(items, ["drive_up", "drive_down"], when), {
+    intervals: [{ start: 110, end: 200 }], ongoingStarts: [170]
   });
-  t.after(() => harness.close());
-  const controller = await enterAutoSnapGap(harness, target, range);
-  controller._historicalPlayers.get("Drive Up").availability = normalizeRecordingAvailability({
-    camera: "drive_up", requested_start: target + 10,
-    requested_end: target + 7210, coverage: []
-  }, "drive_up");
-  const before = harness.calls.length;
-  assert.equal(await controller.maybeAutoSnapTo(), true);
-  assert.equal(controller.clock.absoluteTime, target + 9000);
-  assert.equal(controller.clock.running, true);
-  assert.equal(controller._historicalPlayers.get("Drive Down").lifecycleState, "participating");
-  assert.equal(controller._historicalPlayers.get("Drive Up").lifecycleState, "unavailable");
-  const searchCalls = harness.calls.slice(before).filter(call =>
-    call.type === "frigate_max/v1/recordings/availability" &&
-    (call.start === target + 10 || call.start === target + 7210));
-  assert.equal(searchCalls.length, 3);
-  assert.deepEqual([...new Set(searchCalls.map(call => call.start))],
-    [target + 10, target + 7210]);
-  assert.ok(searchCalls.every(call => call.end - call.start <= 7200));
-  assert.equal(controller.getRecentAutoSnapDecisions()[0].outcome, "advanced");
-  assert.equal(controller.getRecentAutoSnapDecisions()[0].targetEpoch, target + 9000);
+  assert.deepEqual(buildReviewEventIntervals(items, ["drive_up"], when), {
+    intervals: [{ start: 110, end: 130 }, { start: 150, end: 200 }], ongoingStarts: []
+  });
 });
 
-test("one Play chains Auto Snap through three recordings and a held Ended gap", async t => {
-  const target = 1800000000;
-  const second = target + 100;
-  const third = target + 200;
-  const range = { from: target - 60, to: target + 300 };
-  const harness = createHistoricalHarness({
-    now: () => 1000, wallClockMs: (target + 1000) * 1000,
-    initialReviewRange: range,
-    availabilityResponder: recordingCoverageResponder({ drive_up: [
-      { start: target - 20, end: target + 5 },
-      { start: second, end: second + 5 },
-      { start: third, end: third + 5 }
-    ] })
-  });
+test("Auto Snap plays from TI, merges camera intervals, advances, then stops without wrapping", async t => {
+  const base = 1800000000;
+  const when = { from: base - 100, to: base + 500 };
+  const harness = createHistoricalHarness({ wallClockMs: when.to * 1000, now: () => 1000,
+    initialReviewRange: when, reviewEvents: [
+      { camera_id: "drive_up", start_time: base, end_time: base + 20 },
+      { camera_id: "drive_down", start_time: base + 15, end_time: base + 30 },
+      { camera_id: "drive_up", start_time: base + 30, end_time: base + 40 },
+      { camera_id: "drive_down", start_time: base + 100, end_time: base + 120 }
+    ] });
+  t.after(() => harness.close());
+  const controller = await enterEventAutoSnap(harness, base + 5, when);
+  controller.setTimelineViewport({ from: base - 100, to: base + 200 });
+  assert.equal(controller.resumePlayback(), true);
+  assert.equal(controller.clock.running, true);
+  assert.equal(controller._autoSnapActiveEnd, base + 40);
+  assert.equal(controller.clock.absoluteTime, base + 5);
+  controller.clock.setAbsolute(base + 40);
+  controller.clock.start();
+  assert.equal(controller.enforceAutoSnapBoundary(), true);
+  await waitForCondition(() => controller.getRecentAutoSnapDecisions()[0]?.outcome === "advanced");
+  assert.equal(controller.clock.absoluteTime, base + 100);
+  assert.equal(controller._autoSnapActiveEnd, base + 120);
+  assert.equal(controller.clock.running, true);
+  controller.clock.setAbsolute(base + 120);
+  controller.clock.start();
+  assert.equal(controller.enforceAutoSnapBoundary(), true);
+  assert.equal(controller.clock.running, false);
+  assert.equal(controller.clock.absoluteTime, base + 120);
+  assert.equal(controller.getRecentAutoSnapDecisions()[0].outcome, "finished");
+  assert.equal(controller.resumePlayback(), false);
+  assert.equal(controller.clock.absoluteTime, base + 120);
+  assert.deepEqual(controller.state.displayedReviewQuery.range, when);
+});
+
+// Diagnostic experiments: media progress is deliberately controlled separately
+// from monotonic ReviewClock time. They demonstrate a possible mechanism, not
+// browser decoder behavior or the cause of a particular runtime observation.
+for (const rate of [1, 2, 4]) {
+  for (const scenario of ["aligned", "presented frame trails by 2.5s", "Play settles after 750ms"]) {
+    test(`Auto Snap event-end timing experiment at ${rate}x: ${scenario}`, async t => {
+      const base = 1800000000;
+      const start = base + 5;
+      const end = base + 20;
+      const when = { from: base - 100, to: base + 500 };
+      let now = 1000;
+      let releasePlay;
+      const delayed = scenario === "Play settles after 750ms";
+      const gate = delayed ? new Promise(resolve => { releasePlay = resolve; }) : null;
+      const harness = createHistoricalHarness({
+        now: () => now, wallClockMs: when.to * 1000, initialReviewRange: when,
+        reviewEvents: [
+          { camera_id: "drive_up", start_time: base, end_time: base + 12 },
+          { camera_id: "drive_up", start_time: base + 10, end_time: end }
+        ],
+        playResponder: delayed ? () => gate : null
+      });
+      t.after(() => harness.close());
+      harness.window.HTMLCanvasElement.prototype.getContext = () => ({ drawImage() {} });
+      harness.controller.setSelectedCameraNames(["Drive Up"]);
+      const controller = await enterEventAutoSnap(harness, start, when);
+      controller.setPlaybackSpeed(rate);
+      const player = controller._historicalPlayers.get("Drive Up");
+      const control = harness.mediaControls.find(item => item.video === player.video);
+      const snapshots = [];
+      let lastRvfc = null;
+      const capture = phase => ({
+        phase, eventStart: base, eventEnd: end, atMs: now,
+        clockEpoch: controller.clock.absoluteTime, clockRate: controller.clock.rate,
+        frameEpoch: player.heldFrameEpoch ?? null,
+        rvfc: lastRvfc,
+        currentTime: player.video?.currentTime ?? null,
+        playbackRate: player.video?.playbackRate ?? null,
+        participation: player.lifecycleState,
+        heldFrameVisible: player.heldCanvas?.hidden === false,
+        holdStartedAtMs: player.holdStartedAtMs ?? null,
+        decision: controller.getRecentAutoSnapDecisions()[0] ?? null,
+        targetEpoch: player.transition?.targetEpoch ?? player.lastTargetEpoch ?? null
+      });
+      const record = controller.recordAutoSnapDecision;
+      controller.recordAutoSnapDecision = function (...args) {
+        const result = record.apply(this, args);
+        if (args[0] === "interval_end") snapshots.push(capture("interval_end"));
+        return result;
+      };
+      assert.equal(controller.resumePlayback(), true);
+      assert.equal(controller._autoSnapActiveEnd, end);
+      if (delayed) {
+        await waitForCondition(() => player.transition?.playPending === true);
+        now += 750;
+        assert.equal(controller.clock.absoluteTime, start + 0.75 * rate);
+        snapshots.push(capture("pending_Play"));
+        releasePlay();
+      }
+      await waitForCondition(() => player.lifecycleState === "participating" &&
+        player.reviewPlay === "fulfilled");
+      assert.equal(player.video.playbackRate, rate);
+      const lag = delayed ? 0.75 * rate : scenario === "aligned" ? 0 : 2.5;
+
+      // Capture the actual production boundary timer; fire it with controlled
+      // monotonic time instead of waiting real seconds or forcing the clock.
+      let scheduled;
+      const setTimeout = harness.window.setTimeout;
+      harness.window.setTimeout = (callback, delay) => {
+        scheduled = { callback, delay };
+        return 987654;
+      };
+      try { controller.scheduleHistoricalBoundaryTimer(); }
+      finally { harness.window.setTimeout = setTimeout; }
+      assert.equal(scheduled.delay, Math.ceil(((end - start) / rate -
+        (delayed ? 0.75 : 0)) * 1000));
+      now = 1000 + (end - start - 0.01) * 1000 / rate;
+      assert.equal(controller.enforceAutoSnapBoundary(), false);
+      now = 1000 + (end - start) * 1000 / rate;
+
+      // Advance fake media naturally to a chosen presented epoch. No controller
+      // seek or media replacement is used to produce the boundary decision.
+      const frameEpoch = end - lag;
+      player.video.requestVideoFrameCallback((atMs, metadata) => {
+        lastRvfc = { atMs, mediaTime: metadata.mediaTime,
+          epoch: mediaToEpoch(player.timing, metadata.mediaTime).epoch };
+      });
+      player.video.currentTime = epochToMedia(player.timing, frameEpoch).mediaTime;
+      await Promise.resolve();
+      control.emitFrame(player.video.currentTime);
+      assert.equal(mediaToEpoch(player.timing, player.video.currentTime).epoch, frameEpoch);
+      assert.equal(player.heldFrameEpoch, frameEpoch);
+      const video = player.video;
+      const hls = player.hls;
+      const pauses = video.pauseCount;
+      const seekWrites = video.currentTimeWrites.length;
+      const plays = harness.playCalls.length;
+      const failures = controller.getRecentReviewFailures().length;
+
+      snapshots.push(capture("before_boundary"));
+      scheduled.callback();
+
+      assert.equal(controller.clock.absoluteTime, end);
+      assert.equal(controller.clock.running, false);
+      assert.equal(controller.getRecentAutoSnapDecisions()[0].outcome, "finished");
+      const boundary = snapshots.find(item => item.phase === "interval_end");
+      assert.equal(boundary.clockEpoch, end);
+      assert.equal(boundary.eventEnd - boundary.frameEpoch, lag);
+      assert.equal(boundary.rvfc.epoch, boundary.frameEpoch);
+      assert.equal(boundary.rvfc.atMs, boundary.atMs);
+      assert.equal(boundary.decision.outcome, "interval_end");
+      assert.equal(boundary.participation, "participating");
+      assert.equal(boundary.heldFrameVisible, false);
+      assert.equal(player.video, video);
+      assert.equal(player.hls, hls);
+      assert.ok(video.pauseCount > pauses);
+      assert.equal(video.currentTimeWrites.length, seekWrites);
+      assert.equal(harness.playCalls.length, plays);
+      assert.equal(controller.getRecentReviewFailures().length, failures);
+      t.diagnostic(JSON.stringify({ rate, scenario, lagRecordingSeconds: lag,
+        scheduledDelayMs: scheduled.delay, snapshots }));
+    });
+  }
+}
+
+test("Auto Snap boundary capture samples RVFC before clamping and includes the next decision", async t => {
+  const base = 1800000000;
+  const when = { from: base - 100, to: base + 500 };
+  let now = 1000;
+  const harness = createHistoricalHarness({ now: () => now,
+    wallClockMs: when.to * 1000, initialReviewRange: when,
+    reviewEvents: [
+      { camera_id: "drive_up", start_time: base, end_time: base + 20 },
+      { camera_id: "drive_up", start_time: base + 100, end_time: base + 120 }
+    ] });
   t.after(() => harness.close());
   harness.window.HTMLCanvasElement.prototype.getContext = () => ({ drawImage() {} });
-  const controller = harness.controller;
-  controller.setSelectedCameraNames(["Drive Up"]);
-  await controller.playHistorical(target, { autoplay: false, playbackRange: range });
-  assert.equal(controller._historicalPlayers.get("Drive Up")?.lifecycleState, "participating",
-    JSON.stringify({ players: [...controller._historicalPlayers.values()].map(player =>
-      ({ state: player.lifecycleState, reason: player.boundaryReason })) }));
-  controller.setAutoSnapTo(true);
-  let explicitPlayCount = 0;
-  const pressPlay = () => { explicitPlayCount += 1; return controller.resumePlayback(); };
-  assert.equal(pressPlay(), true);
-  assert.equal(controller._autoSnapArmed, true);
-  await waitForCondition(() => controller._historicalPlayers.get("Drive Up").lifecycleState === "participating");
-
-  const crossGap = async (recordingStart, expectedTarget) => {
-    const player = controller._historicalPlayers.get("Drive Up");
-    const media = harness.mediaControls.filter(control => control.camera === "Drive Up").at(-1);
-    media.emitFrame();
-    media.emitFrame();
-    assert.equal(Number.isFinite(player.heldFrameEpoch), true,
-      JSON.stringify({ state: player.lifecycleState, callbacks: media.pendingFrameCallbacks().length,
-        currentTime: player.video.currentTime, timing: !!player.timing }));
-    setReviewTi(controller, recordingStart + 6);
-    player.video.currentTime = recordingStart + 6 - player.timing.effective_absolute_origin;
-    assert.equal(controller.enforceHistoricalPresentationBoundary(), true);
-    assert.equal(player.lifecycleState, "unavailable");
-    assert.equal(player.boundaryReason, "authoritative_recording_gap");
-    assert.equal(player.heldCanvas.hidden, false);
-    assert.equal(harness.root.querySelector(
-      '.review-camera-panel[data-camera="Drive Up"] .review-camera-presentation-kind'
-    ).textContent, "Ended");
-    assert.equal(controller.clock.running, true);
-    await controller.queueHistoricalAvailabilityEvaluation("auto_snap_chain_gap");
-    await waitForCondition(() => controller.getRecentAutoSnapDecisions().some(decision =>
-      decision.targetEpoch === expectedTarget && decision.outcome === "advanced"));
-    assert.equal(controller.clock.absoluteTime, expectedTarget);
-    assert.equal(controller.clock.running, true);
-    assert.equal(controller._historicalPlayers.get("Drive Up").lifecycleState, "participating");
-    assert.equal(controller._autoSnapArmed, true);
-    assert.equal(controller._autoSnapAttempted, false);
-  };
-
-  await crossGap(target, second);
-  await crossGap(second, third);
-  assert.equal(explicitPlayCount, 1);
-  assert.deepEqual(controller.getRecentAutoSnapDecisions().slice(0, 2)
-    .map(decision => [decision.outcome, decision.targetEpoch]),
-    [["advanced", third], ["advanced", second]]);
-  assert.ok(harness.playCalls.filter(call => call.camera === "Drive Up").length >= 3);
-  assert.equal(await controller.maybeAutoSnapTo(), false);
-  assert.equal(controller.getRecentAutoSnapDecisions().length, 2);
-});
-
-test("a failed Auto Snap target keeps attempted suppression and does not retry tightly", async t => {
-  const target = 1800000000;
-  const failedTarget = target + 100;
-  const range = { from: target - 60, to: target + 300 };
-  const harness = createHistoricalHarness({
-    now: () => 1000, wallClockMs: (target + 1000) * 1000,
-    initialReviewRange: range,
-    availabilityResponder: recordingCoverageResponder({ drive_up: [
-      { start: target - 20, end: target + 5 },
-      { start: failedTarget, end: failedTarget + 5 }
-    ] }),
-    presentationResponder: message => message.target === failedTarget
-      ? Promise.reject(new Error("synthetic target preparation failure"))
-      : Promise.resolve(presentationPrepared(message.camera, message.target - 21, message.target))
-  });
-  t.after(() => harness.close());
-  const controller = harness.controller;
-  controller.setSelectedCameraNames(["Drive Up"]);
-  await controller.playHistorical(target, { autoplay: false, playbackRange: range });
-  assert.equal(controller._historicalPlayers.get("Drive Up")?.lifecycleState, "participating",
-    JSON.stringify({ players: [...controller._historicalPlayers.values()].map(player =>
-      ({ state: player.lifecycleState, reason: player.boundaryReason })) }));
-  controller.setAutoSnapTo(true);
-  controller.resumePlayback();
+  const controller = await enterEventAutoSnap(harness, base + 5, when);
   const player = controller._historicalPlayers.get("Drive Up");
+  assert.equal(controller.resumePlayback(), true);
   await waitForCondition(() => player.lifecycleState === "participating");
-  setReviewTi(controller, target + 6);
-  player.video.currentTime = target + 6 - player.timing.effective_absolute_origin;
-  assert.equal(controller.enforceHistoricalPresentationBoundary(), true,
-    JSON.stringify({ state: player.lifecycleState, currentTime: player.video.currentTime,
-      mapped: controller.cameraEpochFromMedia(player), cache: player.availability }));
-  assert.equal(await controller.maybeAutoSnapTo(), false);
-  assert.equal(controller.getRecentAutoSnapDecisions()[0].outcome, "target_failed");
-  assert.equal(controller._autoSnapAttempted, true);
-  const attempts = harness.calls.filter(call =>
-    call.type === "frigate_max/v2/vod/prepare" && call.target === failedTarget).length;
+  const control = harness.mediaControls.find(item => item.video === player.video);
+  control.emitFrame();
+  let presentedAt = player.latestPresentedFrameAtMs;
+  now = 1000 + (20 - 5) * 1000 + 250;
+  player.video.currentTime = epochToMedia(player.timing, base + 6).mediaTime;
+  control.emitFrame();
+  presentedAt = player.latestPresentedFrameAtMs;
+  assert.equal(controller.clock.absoluteTime, base + 20.25);
+  const decisionsBefore = controller.getRecentAutoSnapDecisions();
+  assert.equal(controller.enforceAutoSnapBoundary(), true);
+  const capture = controller.getLastAutoSnapBoundaryCapture();
+  assert.equal(capture.reviewClock.epoch, base + 20.25);
+  assert.equal(controller.clock.absoluteTime, base + 100);
+  assert.equal(capture.event.startEpoch, base);
+  assert.equal(capture.event.endEpoch, base + 20);
+  assert.equal(capture.cameras.length, 2);
+  const driveUp = capture.cameras.find(camera => camera.camera === "Drive Up");
+  assert.equal(driveUp.frame.status, "current");
+  assert.equal(driveUp.frame.epoch, base + 6);
+  assert.equal(driveUp.frame.ageMs, now - presentedAt);
+  assert.equal(driveUp.frame.presentationId, player.presentationId);
+  assert.equal(driveUp.frame.secondsBehindEventEnd, 14);
+  assert.equal(driveUp.lifecycleState, "participating");
+  assert.equal(driveUp.video.playbackRate, 1);
+  assert.equal(driveUp.play.outcome, "fulfilled");
+  assert.equal(Number.isFinite(driveUp.play.issueAtMs), true);
+  assert.equal(Number.isFinite(driveUp.play.settlementAtMs), true);
+  assert.equal(driveUp.play.firstPresentedAdvance.epoch, base + 6);
+  assert.equal(capture.boundaryDecision.outcome, "interval_end");
+  assert.equal(capture.nextDecision.outcome, "seek_requested");
+  assert.equal(capture.nextTargetEpoch, base + 100);
+  assert.ok(decisionsBefore.some(({ outcome }) => outcome === "playing_interval"));
+  assert.ok(decisionsBefore.some(({ outcome }) => outcome === "play_requested"));
+  assert.equal(capture.settlementAtMs, null);
+  await waitForCondition(() => controller.getRecentAutoSnapDecisions()[0]?.outcome === "advanced");
+  assert.equal(controller.getLastAutoSnapBoundaryCapture().nextDecision.outcome, "advanced");
+  assert.equal(controller.getLastAutoSnapBoundaryCapture().settlementAtMs, now);
+  assert.equal(controller.clock.running, true);
+  assert.equal(controller.clock.absoluteTime >= base + 100, true);
+});
+
+test("Auto Snap boundary capture identifies missing and stale RVFC samples", async t => {
+  for (const mode of ["missing", "stale"]) {
+    const base = mode === "missing" ? 1800000000 : 1800001000;
+    const when = { from: base - 100, to: base + 500 };
+    let now = 1000;
+    const harness = createHistoricalHarness({ now: () => now,
+      wallClockMs: when.to * 1000, initialReviewRange: when,
+      reviewEvents: [{ camera_id: "drive_up", start_time: base, end_time: base + 10 }] });
+    t.after(() => harness.close());
+    harness.window.HTMLCanvasElement.prototype.getContext = () => ({ drawImage() {} });
+    const controller = await enterEventAutoSnap(harness, base + 1, when);
+    const player = controller._historicalPlayers.get("Drive Up");
+    controller.resumePlayback();
+    await waitForCondition(() => player.lifecycleState === "participating");
+    if (mode === "missing") {
+      player.latestPresentedFrameEpoch = null;
+      player.latestPresentedFrameAtMs = null;
+      player.latestPresentedFramePresentationId = null;
+    } else {
+      player.latestPresentedFrameEpoch = base + 1;
+      player.latestPresentedFrameAtMs = now;
+      player.latestPresentedFramePresentationId = player.presentationId;
+    }
+    now = mode === "stale" ? 2201 : 1200;
+    assert.equal(controller.enforceAutoSnapBoundary(), false);
+    now += 9000;
+    assert.equal(controller.enforceAutoSnapBoundary(), true);
+    const frame = controller.getLastAutoSnapBoundaryCapture().cameras
+      .find(camera => camera.camera === "Drive Up").frame;
+    assert.equal(frame.status, mode);
+    assert.equal(frame.epoch, mode === "stale" ? base + 1 : null);
+    assert.equal(frame.ageMs, mode === "stale" ? 10201 : null);
+  }
+});
+
+test("Auto Snap boundary capture is bounded, detached, and sanitized", async t => {
+  const base = 1800000000;
+  const when = { from: base - 100, to: base + 500 };
+  let now = 1000;
+  const harness = createHistoricalHarness({ now: () => now,
+    wallClockMs: when.to * 1000, initialReviewRange: when,
+    reviewEvents: [{ camera_id: "drive_up", start_time: base, end_time: base + 10 }] });
+  t.after(() => harness.close());
+  harness.window.HTMLCanvasElement.prototype.getContext = () => ({ drawImage() {} });
+  const controller = await enterEventAutoSnap(harness, base + 1, when);
+  const player = controller._historicalPlayers.get("Drive Up");
+  controller.resumePlayback();
+  await waitForCondition(() => player.lifecycleState === "participating");
+  assert.equal(controller.getLastAutoSnapBoundaryCapture(), null);
+  controller.recordReviewFailure(player, { reason: "media_error", targetEpoch: base + 10 });
+  controller.clock.setAbsolute(base + 10);
   controller.clock.start();
-  assert.equal(await controller.maybeAutoSnapTo(), false);
-  assert.equal(await controller.maybeAutoSnapTo(), false);
-  assert.equal(harness.calls.filter(call =>
-    call.type === "frigate_max/v2/vod/prepare" && call.target === failedTarget).length,
-    attempts);
-  assert.equal(controller.getRecentAutoSnapDecisions().length, 1);
+  assert.equal(controller.enforceAutoSnapBoundary(), true);
+  const first = controller.getLastAutoSnapBoundaryCapture();
+  first.cameras.find(camera => camera.camera === "Drive Up").camera = "mutated";
+  first.nextDecision.outcome = "mutated";
+  const detached = controller.getLastAutoSnapBoundaryCapture();
+  assert.equal(detached.cameras.find(camera => camera.camera === "Drive Up").camera, "Drive Up");
+  assert.notEqual(detached.nextDecision.outcome, "mutated");
+  assert.equal(detached.cameras.some(camera => Object.hasOwn(camera, "hls")), false);
+  assert.equal(/password|token|url|path|manifest/i.test(JSON.stringify(detached)), false);
+  assert.equal(detached.nextDecision.outcome, "finished");
+  assert.equal(detached.matchingFailures.length, 1);
+  assert.equal(detached.matchingFailures[0].reason, "media_error");
+  assert.deepEqual(Object.keys(detached.matchingFailures[0]).sort(),
+    ["camera", "coverage", "outcome", "reason", "stage", "targetEpoch"]);
+  const retainedAtMs = detached.capturedAtMs;
+  controller._autoSnapArmed = true;
+  controller._autoSnapActiveStart = base + 20;
+  controller._autoSnapActiveEnd = base + 30;
+  controller.clock.setAbsolute(base + 20);
+  controller.clock.start();
+  now += 10000;
+  assert.equal(controller.enforceAutoSnapBoundary(), true);
+  assert.notEqual(controller.getLastAutoSnapBoundaryCapture().capturedAtMs, retainedAtMs);
 });
 
-test("relative ten-second seeks retain literal behavior when disabled, paused, or still covered", async t => {
+test("Auto Snap starts at the next event instead of playing recorded inactive time", async t => {
   const base = 1800000000;
-  const range = { from: base - 100, to: base + 400 };
-  const coverage = { drive_up: [
-    { start: base - 30, end: base + 40 },
-    { start: base + 100, end: base + 140 }
-  ] };
-  const cases = [
-    ["disabled +10 gap", base + 35, 10, false, true, base + 45],
-    ["disabled -10 gap", base + 105, -10, false, true, base + 95],
-    ["paused +10 gap", base + 35, 10, true, false, base + 45],
-    ["paused -10 gap", base + 105, -10, true, false, base + 95],
-    ["playing +10 covered", base, 10, true, true, base + 10],
-    ["playing -10 covered", base + 20, -10, true, true, base + 10]
-  ];
-  for (const [label, startEpoch, delta, enabled, playing, expected] of cases) {
-    await t.test(label, async t => {
-      const harness = await createRelativeCoverageHarness(t, {
-        range, startEpoch, coverage, enabled, playing
-      });
-      const controller = harness.controller;
-      assert.equal(await controller.seekHistoricalRelative(delta), true);
-      assert.equal(controller.clock.absoluteTime, expected);
-      assert.equal(controller.clock.running, playing && expected === base + 10);
-      assert.equal(controller._autoSnapArmed, enabled && playing);
-    });
-  }
+  const when = { from: base - 100, to: base + 500 };
+  const harness = createHistoricalHarness({ wallClockMs: when.to * 1000, now: () => 1000,
+    initialReviewRange: when, reviewEvents: [
+      { camera_id: "drive_up", start_time: base + 100, end_time: base + 120, type: "motion" },
+      { camera_id: "drive_down", start_time: base + 200, end_time: base + 230, type: "car" }
+    ] });
+  t.after(() => harness.close());
+  const controller = await enterEventAutoSnap(harness, base, when);
+  controller.setTimelineViewport({ from: base - 100, to: base + 100 });
+  assert.equal(controller.resumePlayback(), true);
+  await waitForCondition(() => controller.getRecentAutoSnapDecisions()[0]?.outcome === "advanced");
+  assert.equal(controller.clock.absoluteTime, base + 100);
+  assert.equal(controller._autoSnapActiveEnd, base + 120);
+  assert.equal(controller.clock.running, true);
+  assert.deepEqual(controller.state.displayedReviewQuery.range, when);
+  assert.deepEqual(controller.state.timelineViewport.to - controller.state.timelineViewport.from, 300);
 });
 
-test("gap-aware ten-second seeks choose coverage across selected cameras, never events", async t => {
+test("future When permits verified event playback but cannot prove a final event", async t => {
   const base = 1800000000;
-  const range = { from: base - 100, to: base + 400 };
-  const cases = [
-    ["forward one camera", base, 10,
-      { drive_up: [{ start: base - 30, end: base + 5 },
-        { start: base + 100, end: base + 140 }] }, ["Drive Up"], base + 100],
-    ["backward one camera", base + 105, -10,
-      { drive_up: [{ start: base - 30, end: base + 5 },
-        { start: base + 100, end: base + 140 }] }, ["Drive Up"], base + 4.95],
-    ["forward union", base, 10,
-      { drive_up: [{ start: base - 30, end: base + 5 },
-        { start: base + 120, end: base + 140 }],
-        drive_down: [{ start: base - 30, end: base + 5 },
-          { start: base + 100, end: base + 110 }] },
-      ["Drive Up", "Drive Down"], base + 100],
-    ["backward union", base + 125, -10,
-      { drive_up: [{ start: base + 100, end: base + 108 },
-        { start: base + 120, end: base + 140 }],
-        drive_down: [{ start: base + 100, end: base + 112 }] },
-      ["Drive Up", "Drive Down"], base + 111.95]
-  ];
-  for (const [label, startEpoch, delta, coverage, cameraNames, expected] of cases) {
-    await t.test(label, async t => {
-      const harness = await createRelativeCoverageHarness(t, {
-        range, startEpoch, coverage, cameraNames,
-        reviewEvents: [{ camera_id: "drive_up", start_time: base + 20,
-          end_time: base + 21, type: "person" }]
-      });
-      const controller = harness.controller;
-      const beforeAvailability = harness.calls.filter(call =>
-        call.type === "frigate_max/v1/recordings/availability").length;
-      assert.equal(await controller.seekHistoricalRelative(delta), true);
-      assert.ok(Math.abs(controller.clock.absoluteTime - expected) < 0.00001);
-      assert.equal(controller.clock.running, true);
-      assert.equal(controller._autoSnapArmed, true);
-      assert.ok([...controller._historicalPlayers.values()].some(player =>
-        player.lifecycleState === "participating"));
-      if (label === "forward one camera") assert.equal(harness.calls.filter(call =>
-        call.type === "frigate_max/v1/recordings/availability").length,
-        beforeAvailability);
-    });
-  }
+  const now = base + 200;
+  const when = { from: base - 100, to: base + 500 };
+  const harness = createHistoricalHarness({ wallClockMs: now * 1000,
+    initialReviewRange: when, reviewEvents: [
+      { camera_id: "drive_up", start_time: base + 100, end_time: base + 120 },
+      { camera_id: "drive_down", start_time: base + 150, end_time: base + 170 }
+    ] });
+  t.after(() => harness.close());
+  const controller = await enterEventAutoSnap(harness, base + 5, when);
+  const queries = harness.calls.filter(call => call.type === "frigate_max/v1/review/get");
+  assert.equal(queries.at(-1).to, now);
+  assert.deepEqual(controller.state.timeline.queryRange, { from: when.from, to: now });
+  assert.equal(controller.state.timeline.complete, true);
+  assert.equal(controller.getRecentAutoSnapDecisions().length, 0);
+  assert.equal(controller.resumePlayback(), true);
+  assert.ok(controller.getRecentAutoSnapDecisions().some(decision =>
+    decision.outcome === "play_requested"));
+  assert.ok(controller.getRecentAutoSnapDecisions().some(decision =>
+    decision.outcome === "seek_requested" && decision.targetEpoch === base + 100));
+  await waitForCondition(() => controller.getRecentAutoSnapDecisions()[0]?.outcome === "advanced");
+  assert.ok(controller.clock.absoluteTime >= base + 100 &&
+    controller.clock.absoluteTime < base + 101);
+  controller.clock.setAbsolute(base + 120);
+  controller.clock.start();
+  assert.equal(controller.enforceAutoSnapBoundary(), true);
+  await waitForCondition(() => controller.getRecentAutoSnapDecisions().some(decision =>
+    decision.outcome === "advanced" && decision.targetEpoch === base + 150));
+  assert.ok(controller.clock.absoluteTime >= base + 150 &&
+    controller.clock.absoluteTime < base + 151);
+  controller.clock.setAbsolute(base + 170);
+  controller.clock.start();
+  assert.equal(controller.enforceAutoSnapBoundary(), true);
+  assert.equal(controller.clock.running, false);
+  assert.equal(controller.getRecentAutoSnapDecisions()[0].outcome, "awaiting_future_events");
+  assert.equal(controller.getRecentAutoSnapDecisions().some(decision =>
+    decision.outcome === "finished"), false);
+  assert.deepEqual(controller.state.displayedReviewQuery.range, when);
+  assert.equal(harness.calls.filter(call => call.type === "frigate_max/v1/review/get").length,
+    queries.length);
 });
 
-test("gap-aware relative searches use chronological two-hour windows in both directions", async t => {
+test("future When query eligibility expires when its endpoint becomes historical", async t => {
   const base = 1800000000;
-  const range = { from: base - 100, to: base + 10000 };
-  const cases = [
-    ["forward", base, 10,
-      [{ start: base - 20, end: base + 5 }, { start: base + 9000, end: base + 9020 }],
-      base + 9000],
-    ["backward", base + 9005, -10,
-      [{ start: base + 100, end: base + 110 }, { start: base + 9000, end: base + 9020 }],
-      base + 109.95]
-  ];
-  for (const [label, startEpoch, delta, intervals, expected] of cases) {
-    await t.test(label, async t => {
-      const harness = await createRelativeCoverageHarness(t, {
-        range, startEpoch, coverage: { drive_up: intervals }
-      });
-      const controller = harness.controller;
-      const before = harness.calls.length;
-      assert.equal(await controller.seekHistoricalRelative(delta), true);
-      assert.ok(Math.abs(controller.clock.absoluteTime - expected) < 0.00001);
-      const literal = startEpoch + delta;
-      const firstEnd = delta > 0 ? Math.min(literal + 7200, range.to)
-        : Math.min(literal + 1, range.to);
-      const firstStart = delta > 0 ? literal : Math.max(range.from, firstEnd - 7200);
-      const secondStart = delta > 0 ? firstEnd : range.from;
-      const secondEnd = delta > 0 ? range.to : firstStart;
-      const queries = harness.calls.slice(before).filter(call =>
-        call.type === "frigate_max/v1/recordings/availability" &&
-        ((call.start === firstStart && call.end === firstEnd) ||
-         (call.start === secondStart && call.end === secondEnd)));
-      assert.equal(queries.length, 2);
-      assert.ok(queries.every(call => call.end - call.start <= 7200));
-      if (delta > 0) assert.equal(queries[1].start, queries[0].end);
-      else assert.equal(queries[1].end, queries[0].start);
-    });
-  }
+  const when = { from: base - 100, to: base + 500 };
+  let now = base + 200;
+  const harness = createHistoricalHarness({ wallClockMs: () => now * 1000,
+    initialReviewRange: when, reviewEvents: [
+      { camera_id: "drive_up", start_time: base + 100, end_time: base + 120 }
+    ] });
+  t.after(() => harness.close());
+  const controller = await enterEventAutoSnap(harness, base + 5, when);
+  assert.equal(controller.getAutoSnapInventory()?.reachesWhenEnd, false);
+  now = when.to + 1;
+  assert.equal(controller.resumePlayback(), false);
+  assert.equal(controller.getRecentAutoSnapDecisions()[0].outcome, "blocked_incomplete");
+  await controller.refreshReviewQuery();
+  assert.equal(controller.getAutoSnapInventory()?.reachesWhenEnd, true);
+  assert.equal(controller.resumePlayback(), true);
+  await waitForCondition(() => controller.getRecentAutoSnapDecisions()[0]?.outcome === "advanced");
 });
 
-test("unknown relative coverage never skips a farther known recording", async t => {
+test("future When still blocks incomplete event responses", async t => {
   const base = 1800000000;
-  const range = { from: base - 100, to: base + 10000 };
-  const cases = [
-    ["forward failed availability", base, 10,
-      [{ start: base - 20, end: base + 5 }, { start: base + 9000, end: base + 9020 }],
-      message => message.start === base + 10],
-    ["backward invalid availability", base + 9005, -10,
-      [{ start: base + 100, end: base + 110 }, { start: base + 9000, end: base + 9020 }],
-      message => message.end === base + 8996]
-  ];
-  for (const [label, startEpoch, delta, intervals, failQuery] of cases) {
-    await t.test(label, async t => {
-      let unknownSeen = false;
-      const harness = await createRelativeCoverageHarness(t, {
-        range, startEpoch, coverage: { drive_up: intervals },
-        onRequest: message => {
-          if (!unknownSeen && failQuery(message)) {
-            unknownSeen = true;
-            return delta > 0 ? Promise.reject(new Error("availability failed")) :
-              Promise.resolve({ camera: message.camera, requested_start: message.start,
-                requested_end: message.end, coverage: null });
-          }
-          return undefined;
-        }
-      });
-      const controller = harness.controller;
-      assert.equal(await controller.seekHistoricalRelative(delta), true);
-      assert.equal(unknownSeen, true);
-      assert.equal(controller.clock.absoluteTime, startEpoch + delta);
-      assert.equal(controller.getRecentAutoSnapDecisions().length, 0);
-    });
-  }
+  const when = { from: base - 100, to: base + 500 };
+  const harness = createHistoricalHarness({ wallClockMs: (base + 200) * 1000,
+    initialReviewRange: when, reviewResponder: () => Promise.resolve([
+      { camera_id: "drive_up", start_time: base + 100, end_time: base + 120 }
+    ]) });
+  t.after(() => harness.close());
+  const controller = await enterEventAutoSnap(harness, base + 5, when);
+  assert.equal(controller.state.timeline.complete, false);
+  assert.equal(controller.resumePlayback(), false);
+  assert.deepEqual(controller.getRecentAutoSnapDecisions().slice(0, 2)
+    .map(decision => decision.outcome), ["blocked_incomplete", "play_requested"]);
 });
 
-test("gap-aware relative seeks settle at active When bounds without wrapping", async t => {
+test("Auto Snap Play records preparation deferral before any event decision", async t => {
   const base = 1800000000;
-  const range = { from: base - 100, to: base + 300 };
-  const cases = [
-    ["forward no later recording", base, 10,
-      [{ start: base - 20, end: base + 5 }], range.to],
-    ["backward no earlier recording", base + 105, -10,
-      [{ start: base + 100, end: base + 120 }], range.from]
-  ];
-  for (const [label, startEpoch, delta, intervals, expected] of cases) {
-    await t.test(label, async t => {
-      const harness = await createRelativeCoverageHarness(t, {
-        range, startEpoch, coverage: { drive_up: intervals }
-      });
-      const controller = harness.controller;
-      assert.equal(await controller.seekHistoricalRelative(delta), true);
-      assert.equal(controller.clock.absoluteTime, expected);
-      assert.equal(controller.clock.running, false);
-      assert.equal(controller._autoSnapArmed, true);
-      if (label === "forward no later recording") {
-        const navigation = controller.getReviewNavigationDiagnostics().recent[0];
-        assert.equal(navigation.coverageDecision, "none");
-        assert.equal(navigation.intentionalWhenToStop, true);
-        assert.equal(navigation.selectedEpoch, range.to);
-      }
-    });
-  }
+  const when = { from: base - 100, to: base + 500 };
+  const harness = createHistoricalHarness({ wallClockMs: when.to * 1000,
+    initialReviewRange: when, reviewEvents: [
+      { camera_id: "drive_up", start_time: base + 100, end_time: base + 120 }
+    ] });
+  t.after(() => harness.close());
+  const controller = await enterEventAutoSnap(harness, base + 5, when);
+  controller._historicalPreparing = true;
+  assert.equal(controller.resumePlayback(), true);
+  assert.deepEqual(controller.getRecentAutoSnapDecisions().slice(0, 2)
+    .map(decision => decision.outcome), ["waiting_for_preparation", "play_requested"]);
+  assert.equal(controller.clock.running, false);
 });
 
-test("repeated -10 remains within displayed When and keeps TI visible at its lower bound", async t => {
+test("ongoing events block skips and prevent a false final-event conclusion", async t => {
   const base = 1800000000;
-  const range = { from: base - 100, to: base + 300 };
-  const harness = await createRelativeCoverageHarness(t, {
-    range, startEpoch: base - 75,
-    coverage: { drive_up: [{ start: base - 95, end: base + 30 }] }
-  });
-  const controller = harness.controller;
-  const cursor = harness.root.querySelector(".review-timeline-cursor");
-  for (const expected of [base - 85, base - 95, range.from, range.from, range.from]) {
-    assert.equal(await controller.seekHistoricalRelative(-10), true);
-    assert.equal(controller.clock.absoluteTime, expected);
-    assert.equal(controller._historicalPlaybackRange.from, range.from);
-    assert.deepEqual(controller.state.displayedReviewQuery.range, range);
-    assert.equal(expected >= range.from && expected <= range.to, true);
-    assert.equal(cursor.hidden, false);
-    const navigation = controller.getReviewNavigationDiagnostics().recent[0];
-    assert.equal(navigation.settledEpoch, expected);
-    assert.equal(navigation.historicalFrom, range.from);
-    assert.equal(navigation.cursor.inDisplayedRange, true);
-    assert.equal(navigation.cursor.cursorHidden, false);
-  }
-  for (const [epoch, visible] of [
-    [range.from, true], [range.to, true], [range.from - 0.001, false],
-    [range.to + 0.001, false]
-  ]) {
-    controller.clock.setAbsolute(epoch);
-    controller.updateClockDisplay();
-    const snapshot = controller.getReviewNavigationDiagnostics().cursor;
-    assert.equal(snapshot.reviewPositionEpoch, epoch);
-    assert.equal(snapshot.displayedFrom, range.from);
-    assert.equal(snapshot.displayedTo, range.to);
-    assert.equal(snapshot.inDisplayedRange, visible);
-    assert.equal(snapshot.cursorShouldBeVisible, visible);
-    assert.equal(snapshot.cursorHidden, !visible);
-  }
+  const when = { from: base - 100, to: base + 500 };
+  const harness = createHistoricalHarness({ wallClockMs: when.to * 1000, now: () => 1000,
+    initialReviewRange: when, reviewEvents: [
+      { camera_id: "drive_up", start_time: base, end_time: base + 20 },
+      { camera_id: "drive_down", start_time: base + 10 },
+      { camera_id: "drive_up", start_time: base + 100, end_time: base + 110 }
+    ] });
+  t.after(() => harness.close());
+  const controller = await enterEventAutoSnap(harness, base + 5, when);
+  assert.equal(controller.resumePlayback(), true);
+  controller.clock.setAbsolute(base + 20);
+  controller.clock.start();
+  assert.equal(controller.enforceAutoSnapBoundary(), true);
+  assert.equal(controller.clock.running, false);
+  assert.equal(controller.getRecentAutoSnapDecisions()[0].outcome, "blocked_ongoing");
+  assert.equal(harness.calls.filter(call => call.type === "frigate_max/v2/vod/prepare" &&
+    call.target === base + 100).length, 0);
+  assert.equal(controller.resumePlayback(), false);
 });
 
-test("newer -10 at When.from supersedes a pending backward seek without underflow", async t => {
+test("legacy, refreshing, and failed Review queries block automatic progression", async t => {
   const base = 1800000000;
-  const range = { from: base - 100, to: base + 300 };
-  const harness = await createRelativeCoverageHarness(t, {
-    range, startEpoch: base - 85,
-    coverage: { drive_up: [{ start: base - 95, end: base + 30 }] }
-  });
-  const controller = harness.controller;
-  const evaluate = controller.evaluateHistoricalAvailability.bind(controller);
+  const when = { from: base - 100, to: base + 500 };
+  const event = { camera_id: "drive_up", start_time: base, end_time: base + 20 };
+  let response = [event];
+  const harness = createHistoricalHarness({ wallClockMs: when.to * 1000,
+    initialReviewRange: when, reviewResponder: () => Promise.resolve(response) });
+  t.after(() => harness.close());
+  const controller = await enterEventAutoSnap(harness, base + 5, when);
+  assert.equal(controller.state.timeline.complete, false);
+  assert.equal(controller.resumePlayback(), false);
+  assert.equal(controller.getRecentAutoSnapDecisions()[0].outcome, "blocked_incomplete");
+  response = { schema: 2, complete: true, items: [event] };
+  await controller.refreshReviewQuery();
+  assert.equal(controller.state.timeline.complete, true);
+  controller._desiredReviewQuery = {
+    ...controller._desiredReviewQuery,
+    range: { from: when.from, to: when.to + 1 }
+  };
+  assert.equal(controller.resumePlayback(), false);
+  assert.equal(controller.getRecentAutoSnapDecisions()[0].outcome, "blocked_incomplete");
+  controller._desiredReviewQuery = {
+    ...controller._desiredReviewQuery, range: { ...when }
+  };
   let release;
-  let held = false;
-  controller.evaluateHistoricalAvailability = (epoch, options) =>
-    options.reason === "VCR -10 coverage" && !held
-      ? new Promise(resolve => { held = true; release = () => resolve([]); })
-      : evaluate(epoch, options);
-  const first = controller.seekHistoricalRelative(-10);
-  await waitForCondition(() => typeof release === "function");
-  assert.equal(controller.clock.absoluteTime, base - 95);
-  assert.equal(await controller.seekHistoricalRelative(-10), true);
-  release();
-  assert.equal(await first, false);
-  assert.equal(controller.clock.absoluteTime, range.from);
-  const snapshot = controller.getReviewNavigationDiagnostics();
-  assert.equal(snapshot.cursor.inDisplayedRange, true);
-  assert.equal(snapshot.cursor.cursorHidden, false);
-  assert.equal(snapshot.recent[0].outcome, "superseded");
-  assert.equal(snapshot.recent[1].selectedEpoch, range.from);
-  assert.equal(snapshot.recent[1].settledEpoch, range.from);
+  const originalCallWS = controller._hass.callWS.bind(controller._hass);
+  controller._hass.callWS = message => message.type === "frigate_max/v1/review/get"
+    ? new Promise(resolve => { release = resolve; }) : originalCallWS(message);
+  const pending = controller.refreshReviewQuery();
+  assert.equal(controller.state.timeline.refreshing, true);
+  assert.equal(controller.resumePlayback(), false);
+  release(response);
+  await pending;
+  assert.equal(controller.state.timeline.complete, true);
+  controller._hass.callWS = message => message.type === "frigate_max/v1/review/get"
+    ? Promise.reject(new Error("synthetic timeline failure")) : originalCallWS(message);
+  await controller.refreshReviewQuery();
+  assert.equal(controller.state.timeline.complete, false);
+  assert.equal(controller.resumePlayback(), false);
+  assert.equal(controller.getRecentAutoSnapDecisions()[0].outcome, "blocked_incomplete");
 });
 
-test("rapid +10 during preparation keeps coverage navigation and Play", async t => {
+test("Auto Snap skips an unrecorded event and acquires the next playable event", async t => {
   const base = 1800000000;
-  const range = { from: base - 100, to: base + 300 };
-  for (const [label, end, secondTarget, expectedDecision] of [
-    ["covered", base + 140, base + 110, "covered"],
-    ["gap", base + 105, base + 200, "found"]
-  ]) {
-    await t.test(label, async t => {
-      const harness = await createRelativeCoverageHarness(t, {
-        range, startEpoch: base,
-        coverage: { drive_up: [
-          { start: base - 30, end: base + 5 },
-          { start: base + 100, end },
-          { start: base + 200, end: base + 240 }
-        ] }
-      });
-      const controller = harness.controller;
-      controller.setHistoricalSyncDiagnostics(true);
-      const evaluate = controller.evaluateHistoricalAvailability.bind(controller);
-      let release;
-      let held = false;
-      controller.evaluateHistoricalAvailability = (epoch, options) =>
-        options.reason === "VCR +10 coverage" && !held
-          ? new Promise(resolve => { held = true; release = () => resolve([]); })
-          : evaluate(epoch, options);
-      const first = controller.seekHistoricalRelative(10);
-      await waitForCondition(() => typeof release === "function");
-      assert.equal(controller.clock.absoluteTime, base + 100);
-      assert.equal(controller.clock.running, false);
-      assert.equal(controller._playRequested, true);
-      assert.equal(controller._historicalPreparing, true);
-      assert.equal(await controller.seekHistoricalRelative(10), true);
-      release();
-      assert.equal(await first, false);
-      assert.equal(controller.clock.absoluteTime, secondTarget);
-      assert.equal(controller.clock.running, true);
-      assert.equal(controller._playRequested, false);
-      assert.equal(controller._historicalPreparing, false);
-      const reports = controller.getHistoricalSyncReports();
-      assert.equal(reports.at(-2).source, "VCR +10 coverage");
-      assert.equal(reports.at(-2).disposition, "stale/cancelled");
-      assert.equal(reports.at(-1).source, "VCR +10 coverage");
-      assert.equal(reports.at(-1).selectedEpoch, secondTarget);
-      assert.equal(reports.at(-1).barrier.ready.length, 1);
-      assert.notEqual(secondTarget, range.to);
-      const navigation = controller.getReviewNavigationDiagnostics().recent.find(record =>
-        record.selectedEpoch === secondTarget);
-      assert.equal(navigation.coverageBypassedDuringPreparation, false);
-      assert.equal(navigation.coverageDecision, expectedDecision);
-      assert.equal(navigation.initialHistoricalPreparing, true);
-      assert.equal(navigation.initialPlayRequested, true);
-      assert.equal(navigation.clockRunning, true);
-      assert.equal(navigation.playRequested, false);
-      assert.equal(navigation.historicalPreparing, false);
-      assert.equal(navigation.participantCount, 1);
-      assert.equal(navigation.intentionalWhenToStop, false);
-      assert.equal(navigation.cursor.inDisplayedRange, true);
-    });
-  }
+  const when = { from: base - 100, to: base + 500 };
+  const first = { start: base - 20, end: base + 30 };
+  const last = { start: base + 200, end: base + 230 };
+  const harness = createHistoricalHarness({ wallClockMs: when.to * 1000, now: () => 1000,
+    initialReviewRange: when, reviewEvents: [
+      { camera_id: "drive_up", start_time: base, end_time: base + 20 },
+      { camera_id: "drive_up", start_time: base + 100, end_time: base + 120 },
+      { camera_id: "drive_up", start_time: base + 200, end_time: base + 220 }
+    ], availabilityResponder: recordingCoverageResponder({
+      drive_up: [first, last], drive_down: [first]
+    }) });
+  t.after(() => harness.close());
+  const controller = await enterEventAutoSnap(harness, base + 5, when);
+  assert.equal(controller.resumePlayback(), true);
+  controller.clock.setAbsolute(base + 20);
+  controller.clock.start();
+  controller.enforceAutoSnapBoundary();
+  await waitForCondition(() => controller.getRecentAutoSnapDecisions()[0]?.outcome === "advanced");
+  assert.equal(controller.clock.running, true);
+  assert.equal(controller.clock.absoluteTime, base + 200);
+  assert.equal(controller._autoSnapActiveEnd, base + 220);
+  assert.ok(controller.getRecentAutoSnapDecisions().some(decision =>
+    decision.outcome === "skipped_unrecorded" && decision.targetEpoch === base + 100));
+  assert.equal(harness.calls.some(call => call.type === "frigate_max/v2/vod/prepare" &&
+    call.target === base + 100), false);
+  assert.ok(harness.calls.some(call => call.type === "frigate_max/v2/vod/prepare" &&
+    call.target === base + 200));
 });
 
-test("older preparation cannot release playback while a newer +10 coverage decision is pending", async t => {
+test("Auto Snap targets the exact covered truck epoch inside its original event interval", async t => {
+  const previousEnd = 1791210781.86282;
+  const eventStart = 1791210932.008054;
+  const eventEnd = 1791211014.413864;
+  const expectedTarget = 1791210938;
+  const when = { from: 1791210700, to: 1791211100 };
+  const harness = createHistoricalHarness({ wallClockMs: when.to * 1000, now: () => 1000,
+    initialReviewRange: when, reviewEvents: [
+      { camera_id: "drive_up", start_time: 1791210750, end_time: previousEnd },
+      { camera_id: "drive_up", start_time: eventStart, end_time: eventEnd }
+    ], availabilityResponder: recordingCoverageResponder({
+      drive_up: [{ start: 1791210748, end: 1791210786.990039 },
+        { start: expectedTarget, end: 1791211077.990039 }],
+      drive_down: []
+    }) });
+  t.after(() => harness.close());
+  const controller = await enterEventAutoSnap(harness, 1791210778.608361, when);
+  const before = harness.calls.filter(call =>
+    call.type === "frigate_max/v1/recordings/availability").length;
+  assert.equal(controller.resumePlayback(), true);
+  setReviewTi(controller, previousEnd);
+  assert.equal(controller.enforceAutoSnapBoundary(), true);
+  await waitForCondition(() => controller.getRecentAutoSnapDecisions()[0]?.outcome === "advanced");
+  assert.equal(controller.clock.absoluteTime, expectedTarget);
+  assert.equal(controller._autoSnapActiveStart, eventStart);
+  assert.equal(controller._autoSnapActiveEnd, eventEnd);
+  assert.ok(harness.calls.some(call => call.type === "frigate_max/v2/vod/prepare" &&
+    call.target === expectedTarget));
+  assert.equal(harness.calls.some(call => call.type === "frigate_max/v2/vod/prepare" &&
+    call.target === eventStart), false);
+  assert.equal(harness.calls.filter(call =>
+    call.type === "frigate_max/v1/recordings/availability").length, before);
+});
+
+test("Auto Snap Play from an uncovered TI inside an event starts at later coverage", async t => {
   const base = 1800000000;
-  const range = { from: base - 100, to: base + 300 };
-  const harness = await createRelativeCoverageHarness(t, {
-    range, startEpoch: base,
-    coverage: { drive_up: [
-      { start: base - 30, end: base + 5 },
-      { start: base + 100, end: base + 105 },
-      { start: base + 200, end: base + 240 }
-    ] }
+  const when = { from: base - 100, to: base + 500 };
+  const harness = createHistoricalHarness({ wallClockMs: when.to * 1000, now: () => 1000,
+    initialReviewRange: when, reviewEvents: [
+      { camera_id: "drive_up", start_time: base, end_time: base + 30 }
+    ], availabilityResponder: recordingCoverageResponder({
+      drive_up: [{ start: base + 8, end: base + 30 }], drive_down: []
+    }) });
+  t.after(() => harness.close());
+  const controller = await enterEventAutoSnap(harness, base + 5, when);
+  assert.equal(controller.clock.absoluteTime, base + 5);
+  assert.equal(controller.clock.running, false);
+  assert.equal(controller.resumePlayback(), true);
+  await waitForCondition(() => controller.getRecentAutoSnapDecisions()[0]?.outcome === "advanced");
+  assert.equal(controller.clock.absoluteTime, base + 8);
+  assert.equal(controller._autoSnapActiveStart, base);
+  assert.equal(controller._autoSnapActiveEnd, base + 30);
+});
+
+test("Auto Snap coverage intersection respects half-open event and recording bounds", t => {
+  const harness = createHistoricalHarness();
+  t.after(() => harness.close());
+  const player = coverage => ({
+    availability: normalizeRecordingAvailability({
+      camera: "drive_up", requested_start: 90, requested_end: 140, coverage
+    }, "drive_up")
   });
-  const controller = harness.controller;
-  const evaluate = controller.evaluateHistoricalAvailability.bind(controller);
-  let releaseFirst;
-  let heldFirst = false;
-  controller.evaluateHistoricalAvailability = (epoch, options) =>
-    options.reason === "VCR +10 coverage" && !heldFirst
-      ? new Promise(resolve => { heldFirst = true; releaseFirst = () => resolve([]); })
-      : evaluate(epoch, options);
-  const first = controller.seekHistoricalRelative(10);
-  await waitForCondition(() => typeof releaseFirst === "function");
-  const availabilityWindow = controller.autoSnapAvailabilityWindow.bind(controller);
-  let releaseSearch;
-  controller.autoSnapAvailabilityWindow = (players, start, end, token) =>
-    start === base + 110
-      ? new Promise(resolve => {
-        releaseSearch = () => resolve(availabilityWindow(players, start, end, token));
-      })
-      : availabilityWindow(players, start, end, token);
-  const second = controller.seekHistoricalRelative(10);
-  await waitForCondition(() => typeof releaseSearch === "function");
-  releaseFirst();
-  assert.equal(await first, false);
+  const interval = { start: 100, end: 120 };
+  const resolve = coverage => harness.controller.resolveAutoSnapIntervalTarget(
+    interval, [player(coverage)]);
+  assert.equal(resolve([{ start: 100, end: 105 }, { start: 110, end: 115 }]), 100);
+  assert.equal(resolve([{ start: 95, end: 100 }, { start: 120, end: 130 }]), null);
+  assert.equal(resolve([{ start: 105, end: 107 }, { start: 110, end: 115 }]), 105);
+  assert.equal(resolve([{ start: 119, end: 120 }]), 119);
+  assert.equal(resolve([{ start: 120, end: 130 }]), null);
+  assert.equal(harness.controller.resolveAutoSnapIntervalTarget(interval,
+    [player([{ start: 100, end: 105 }]), { availability: null }]), 100);
+});
+
+test("Auto Snap uses the earliest selected camera coverage without claiming peer coverage", async t => {
+  const base = 1800000000;
+  const when = { from: base - 100, to: base + 500 };
+  const harness = createHistoricalHarness({ wallClockMs: when.to * 1000, now: () => 1000,
+    initialReviewRange: when, reviewEvents: [
+      { camera_id: "drive_up", start_time: base, end_time: base + 20 },
+      { camera_id: "drive_up", start_time: base + 100, end_time: base + 130 }
+    ], availabilityResponder: recordingCoverageResponder({
+      drive_up: [{ start: base - 20, end: base + 30 },
+        { start: base + 110, end: base + 130 }],
+      drive_down: [{ start: base - 20, end: base + 30 },
+        { start: base + 106, end: base + 108 }]
+    }) });
+  t.after(() => harness.close());
+  const controller = await enterEventAutoSnap(harness, base + 5, when);
+  assert.equal(controller.resumePlayback(), true);
+  setReviewTi(controller, base + 20);
+  assert.equal(controller.enforceAutoSnapBoundary(), true);
+  await waitForCondition(() => controller.getRecentAutoSnapDecisions()[0]?.outcome === "advanced");
+  assert.equal(controller.clock.absoluteTime, base + 106);
+  assert.equal(controller._historicalPlayers.get("Drive Down").lifecycleState, "participating");
+  assert.equal(controller._historicalPlayers.get("Drive Up").lifecycleState, "unavailable");
+  assert.equal(controller._autoSnapActiveEnd, base + 130);
+});
+
+for (const { name, finalCoverage, expectedOutcome, expectedTarget } of [
+  { name: "later playable", finalCoverage: true, expectedOutcome: "advanced",
+    expectedTarget: 1800000300 },
+  { name: "all remaining unrecorded", finalCoverage: false, expectedOutcome: "finished",
+    expectedTarget: 1800000020 }
+]) {
+  test(`Auto Snap skips multiple consecutive unrecorded events: ${name}`, async t => {
+    const base = 1800000000;
+    const when = { from: base - 100, to: base + 500 };
+    const coverage = [{ start: base - 20, end: base + 30 }];
+    if (finalCoverage) coverage.push({ start: base + 300, end: base + 330 });
+    const harness = createHistoricalHarness({ wallClockMs: when.to * 1000, now: () => 1000,
+      initialReviewRange: when, reviewEvents: [0, 100, 200, 300].map(offset => ({
+        camera_id: "drive_up", start_time: base + offset, end_time: base + offset + 20
+      })), availabilityResponder: recordingCoverageResponder({
+        drive_up: coverage, drive_down: coverage
+      }) });
+    t.after(() => harness.close());
+    const controller = await enterEventAutoSnap(harness, base + 5, when);
+    assert.equal(controller.resumePlayback(), true);
+    setReviewTi(controller, base + 20);
+    assert.equal(controller.enforceAutoSnapBoundary(), true);
+    await waitForCondition(() => controller.getRecentAutoSnapDecisions()[0]?.outcome ===
+      expectedOutcome);
+    assert.equal(controller.clock.absoluteTime, expectedTarget);
+    assert.equal(controller.clock.running, finalCoverage);
+    assert.equal(controller.getRecentAutoSnapDecisions().filter(decision =>
+      decision.outcome === "skipped_unrecorded").length, finalCoverage ? 2 : 3);
+    assert.equal(harness.calls.some(call => call.type === "frigate_max/v2/vod/prepare" &&
+      [base + 100, base + 200].includes(call.target)), false);
+  });
+}
+
+test("Auto Snap fetches bounded missing coverage and stops scanning after the first overlap", async t => {
+  const base = 1800000000;
+  const eventStart = base + 8000;
+  const target = eventStart + 7300;
+  const when = { from: base - 100, to: base + 30000 };
+  const harness = createHistoricalHarness({ wallClockMs: when.to * 1000, now: () => 1000,
+    initialReviewRange: when, reviewEvents: [
+      { camera_id: "drive_up", start_time: base, end_time: base + 20 },
+      { camera_id: "drive_up", start_time: eventStart, end_time: eventStart + 16000 }
+    ], availabilityResponder: recordingCoverageResponder({
+      drive_up: [{ start: base - 20, end: base + 30 }, { start: target, end: target + 100 }],
+      drive_down: [{ start: base - 20, end: base + 30 }]
+    }) });
+  t.after(() => harness.close());
+  const controller = await enterEventAutoSnap(harness, base + 5, when);
+  assert.equal(controller.resumePlayback(), true);
+  setReviewTi(controller, base + 20);
+  assert.equal(controller.enforceAutoSnapBoundary(), true);
+  assert.equal(controller.getLastAutoSnapBoundaryCapture().nextDecision.outcome,
+    "availability_pending");
+  assert.equal(controller.getLastAutoSnapBoundaryCapture().settlementAtMs, null);
+  await waitForCondition(() => controller.getRecentAutoSnapDecisions()[0]?.outcome === "advanced");
+  assert.equal(controller.clock.absoluteTime, target);
+  assert.equal(controller.getLastAutoSnapBoundaryCapture().nextDecision.outcome, "advanced");
+  assert.equal(controller.getLastAutoSnapBoundaryCapture().nextTargetEpoch, target);
+  const lookup = harness.calls.filter(call =>
+    call.type === "frigate_max/v1/recordings/availability" &&
+    [eventStart, eventStart + 7200].includes(call.start));
+  assert.equal(lookup.length, 4);
+  assert.ok(lookup.every(call => call.end - call.start <= 7200));
+  assert.equal(harness.calls.some(call =>
+    call.type === "frigate_max/v1/recordings/availability" &&
+    call.start === eventStart + 14400), false);
+  assert.equal(controller._autoSnapActiveStart, eventStart);
+  assert.equal(controller._autoSnapActiveEnd, eventStart + 16000);
+});
+
+test("a cached Auto Snap candidate limits peer lookup while preserving the earlier peer start", async t => {
+  const base = 1800000000;
+  const eventStart = base + 8000;
+  const when = { from: base - 100, to: base + 10000 };
+  const first = { start: base - 20, end: base + 30 };
+  const harness = createHistoricalHarness({ wallClockMs: when.to * 1000, now: () => 1000,
+    initialReviewRange: when, reviewEvents: [
+      { camera_id: "drive_up", start_time: base, end_time: base + 20 },
+      { camera_id: "drive_up", start_time: eventStart, end_time: eventStart + 100 }
+    ], availabilityResponder: recordingCoverageResponder({
+      drive_up: [first, { start: eventStart + 5, end: eventStart + 100 }],
+      drive_down: [first, { start: eventStart + 3, end: eventStart + 20 }]
+    }) });
+  t.after(() => harness.close());
+  const controller = await enterEventAutoSnap(harness, base + 5, when);
+  controller._historicalPlayers.get("Drive Up").availability = normalizeRecordingAvailability({
+    camera: "drive_up", requested_start: eventStart, requested_end: eventStart + 100,
+    coverage: [{ start: eventStart + 5, end: eventStart + 100 }]
+  }, "drive_up");
+  assert.equal(controller.resumePlayback(), true);
+  setReviewTi(controller, base + 20);
+  assert.equal(controller.enforceAutoSnapBoundary(), true);
+  await waitForCondition(() => controller.getRecentAutoSnapDecisions()[0]?.outcome === "advanced");
+  assert.equal(controller.clock.absoluteTime, eventStart + 3);
+  const lookups = harness.calls.filter(call =>
+    call.type === "frigate_max/v1/recordings/availability" &&
+    call.start === eventStart);
+  assert.deepEqual(lookups.map(call => [call.camera, call.end]),
+    [["drive_down", eventStart + 5]]);
+});
+
+test("Auto Snap skips fetched unrecorded intervals before a later playable event", async t => {
+  const base = 1800000000;
+  const when = { from: base - 100, to: base + 11000 };
+  const events = [0, 8000, 9000, 9500];
+  const coverage = [{ start: base - 20, end: base + 30 },
+    { start: base + 9505, end: base + 9520 }];
+  const harness = createHistoricalHarness({ wallClockMs: when.to * 1000, now: () => 1000,
+    initialReviewRange: when, reviewEvents: events.map(offset => ({
+      camera_id: "drive_up", start_time: base + offset, end_time: base + offset + 20
+    })), availabilityResponder: recordingCoverageResponder({
+      drive_up: coverage, drive_down: coverage
+    }) });
+  t.after(() => harness.close());
+  const controller = await enterEventAutoSnap(harness, base + 5, when);
+  assert.equal(controller.resumePlayback(), true);
+  setReviewTi(controller, base + 20);
+  assert.equal(controller.enforceAutoSnapBoundary(), true);
+  await waitForCondition(() => controller.getRecentAutoSnapDecisions()[0]?.outcome === "advanced");
+  assert.equal(controller.clock.absoluteTime, base + 9505);
+  assert.deepEqual(controller.getRecentAutoSnapDecisions()
+    .filter(decision => decision.outcome === "skipped_unrecorded")
+    .map(decision => decision.targetEpoch).sort(), [base + 8000, base + 9000]);
+  assert.equal(controller.getLastAutoSnapBoundaryCapture().nextTargetEpoch, base + 9505);
+});
+
+for (const failure of ["error", "incomplete"]) {
+  test(`Auto Snap fails closed on ${failure} recording availability`, async t => {
+    const base = 1800000000;
+    const eventStart = base + 8000;
+    const when = { from: base - 100, to: base + 10000 };
+    const first = { start: base - 20, end: base + 30 };
+    const harness = createHistoricalHarness({ wallClockMs: when.to * 1000, now: () => 1000,
+      initialReviewRange: when, reviewEvents: [
+        { camera_id: "drive_up", start_time: base, end_time: base + 20 },
+        { camera_id: "drive_up", start_time: eventStart, end_time: eventStart + 20 },
+        { camera_id: "drive_up", start_time: eventStart + 100, end_time: eventStart + 120 }
+      ], availabilityResponder: recordingCoverageResponder({
+        drive_up: [first, { start: eventStart + 100, end: eventStart + 120 }],
+        drive_down: [first]
+      }, message => {
+        if (message.start !== eventStart) return undefined;
+        return failure === "error" ? Promise.reject(new Error("coverage failed")) :
+          Promise.resolve({ camera: message.camera, requested_start: message.start,
+            requested_end: message.end - 1, coverage: [] });
+      }) });
+    t.after(() => harness.close());
+    const controller = await enterEventAutoSnap(harness, base + 5, when);
+    assert.equal(controller.resumePlayback(), true);
+    setReviewTi(controller, base + 20);
+    assert.equal(controller.enforceAutoSnapBoundary(), true);
+    await waitForCondition(() => controller.getRecentAutoSnapDecisions()[0]?.outcome ===
+      "coverage_unavailable");
+    assert.equal(controller.clock.absoluteTime, base + 20);
+    assert.equal(controller.clock.running, false);
+    assert.equal(controller.getRecentAutoSnapDecisions().some(decision =>
+      decision.outcome === "skipped_unrecorded"), false);
+    assert.equal(harness.calls.some(call => call.type === "frigate_max/v2/vod/prepare" &&
+      call.target >= eventStart), false);
+  });
+}
+
+for (const supersession of ["Pause", "manual TI", "camera selection"]) {
+  test(`Auto Snap ignores a stale coverage lookup after ${supersession}`, async t => {
+    const base = 1800000000;
+    const eventStart = base + 8000;
+    const when = { from: base - 100, to: base + 10000 };
+    let releaseLookup;
+    const lookup = new Promise(resolve => { releaseLookup = resolve; });
+    const first = { start: base - 20, end: base + 30 };
+    const harness = createHistoricalHarness({ wallClockMs: when.to * 1000, now: () => 1000,
+      initialReviewRange: when, reviewEvents: [
+        { camera_id: "drive_up", start_time: base, end_time: base + 20 },
+        { camera_id: "drive_up", start_time: eventStart, end_time: eventStart + 20 }
+      ], availabilityResponder: recordingCoverageResponder({
+        drive_up: [first], drive_down: [first]
+      }, message => message.start === eventStart ? lookup.then(() => ({
+        camera: message.camera, requested_start: message.start,
+        requested_end: message.end,
+        coverage: [{ start: message.start + 5, end: message.end }]
+      })) : undefined) });
+    t.after(() => harness.close());
+    const controller = await enterEventAutoSnap(harness, base + 5, when);
+    assert.equal(controller.resumePlayback(), true);
+    setReviewTi(controller, base + 20);
+    assert.equal(controller.enforceAutoSnapBoundary(), true);
+    await waitForCondition(() => controller.getRecentAutoSnapDecisions()[0]?.outcome ===
+      "availability_pending");
+    if (supersession === "Pause") assert.equal(controller.pausePlayback(), true);
+    if (supersession === "manual TI") {
+      assert.equal(await controller.selectTimelineTime(base + 50, "manual TI", false), true);
+    }
+    if (supersession === "camera selection") {
+      assert.equal(controller.setSelectedCameraNames(["Drive Up"]), true);
+    }
+    releaseLookup();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(harness.calls.some(call => call.type === "frigate_max/v2/vod/prepare" &&
+      call.target === eventStart + 5), false);
+    assert.equal(controller.getRecentAutoSnapDecisions().some(decision =>
+      decision.outcome === "advanced" && decision.targetEpoch === eventStart + 5), false);
+    if (supersession === "Pause") {
+      assert.equal(controller.clock.absoluteTime, base + 20);
+      assert.equal(controller.clock.running, false);
+      assert.equal(controller._playRequested, false);
+    }
+    if (supersession === "manual TI") assert.equal(controller.clock.absoluteTime, base + 50);
+  });
+}
+
+test("manual Snap and TI retain literal epochs when Auto Snap would choose later coverage", async t => {
+  const base = 1800000000;
+  const eventStart = base + 100;
+  const when = { from: base - 100, to: base + 500 };
+  const harness = createHistoricalHarness({ wallClockMs: when.to * 1000, now: () => 1000,
+    initialReviewRange: when, reviewEvents: [
+      { camera_id: "drive_up", start_time: base, end_time: base + 20 },
+      { camera_id: "drive_up", start_time: eventStart, end_time: eventStart + 30 }
+    ], availabilityResponder: recordingCoverageResponder({
+      drive_up: [{ start: base - 20, end: base + 30 },
+        { start: eventStart + 5, end: eventStart + 30 }],
+      drive_down: [{ start: base - 20, end: base + 30 }]
+    }) });
+  t.after(() => harness.close());
+  const controller = await enterEventAutoSnap(harness, base + 5, when);
+  assert.equal(await controller.snapToNextEvent(), true);
+  assert.equal(controller.clock.absoluteTime, eventStart);
+  assert.equal(controller.clock.running, false);
+  assert.equal(harness.calls.some(call => call.type === "frigate_max/v2/vod/prepare" &&
+    call.target === eventStart + 5), false);
+  assert.equal(await controller.selectTimelineTime(eventStart + 1, "manual TI", false), true);
+  assert.equal(controller.clock.absoluteTime, eventStart + 1);
+  assert.equal(controller.clock.running, false);
+});
+
+test("Pause, manual Snap, and literal ten-second seeks supersede Auto Snap", async t => {
+  const base = 1800000000;
+  const when = { from: base - 100, to: base + 500 };
+  const harness = createHistoricalHarness({ wallClockMs: when.to * 1000, now: () => 1000,
+    initialReviewRange: when, reviewEvents: [
+      { camera_id: "drive_up", start_time: base, end_time: base + 20 },
+      { camera_id: "drive_down", start_time: base + 100, end_time: base + 120 }
+    ] });
+  t.after(() => harness.close());
+  const controller = await enterEventAutoSnap(harness, base + 5, when);
+  assert.equal(controller.resumePlayback(), true);
+  assert.equal(controller.pausePlayback(), true);
+  assert.equal(controller._autoSnapArmed, false);
+  controller.clock.setAbsolute(base + 20);
+  assert.equal(controller.enforceAutoSnapBoundary(), false);
+  assert.equal(await controller.snapToNextEvent(), true);
   assert.equal(controller.clock.absoluteTime, base + 100);
   assert.equal(controller.clock.running, false);
-  assert.equal(controller._playRequested, true);
-  assert.equal(harness.playCalls.length, 1);
-  releaseSearch();
-  assert.equal(await second, true);
-  assert.equal(controller.clock.absoluteTime, base + 200);
-  assert.equal(controller.clock.running, true);
-  assert.equal(controller.getReviewNavigationDiagnostics().recent[0].coverageDecision, "found");
-});
-
-test("Pause cancels a new coverage lookup while an older preparation is pending", async t => {
-  const base = 1800000000;
-  const range = { from: base - 100, to: base + 300 };
-  const harness = await createRelativeCoverageHarness(t, {
-    range, startEpoch: base,
-    coverage: { drive_up: [
-      { start: base - 30, end: base + 5 },
-      { start: base + 100, end: base + 105 },
-      { start: base + 200, end: base + 240 }
-    ] }
-  });
-  const controller = harness.controller;
-  const evaluate = controller.evaluateHistoricalAvailability.bind(controller);
-  let releaseFirst;
-  let heldFirst = false;
-  controller.evaluateHistoricalAvailability = (epoch, options) =>
-    options.reason === "VCR +10 coverage" && !heldFirst
-      ? new Promise(resolve => { heldFirst = true; releaseFirst = () => resolve([]); })
-      : evaluate(epoch, options);
-  const first = controller.seekHistoricalRelative(10);
-  await waitForCondition(() => typeof releaseFirst === "function");
-  const availabilityWindow = controller.autoSnapAvailabilityWindow.bind(controller);
-  let releaseSearch;
-  controller.autoSnapAvailabilityWindow = (players, start, end, token) =>
-    start === base + 110
-      ? new Promise(resolve => {
-        releaseSearch = () => resolve(availabilityWindow(players, start, end, token));
-      })
-      : availabilityWindow(players, start, end, token);
-  const second = controller.seekHistoricalRelative(10);
-  await waitForCondition(() => typeof releaseSearch === "function");
-  assert.equal(controller.pausePlayback(), true);
-  releaseFirst();
-  releaseSearch();
-  assert.equal(await first, false);
-  assert.equal(await second, false);
-  assert.equal(controller.clock.running, false);
-  assert.equal(controller._playRequested, false);
+  assert.equal(controller.resumePlayback(), true);
+  assert.equal(controller._autoSnapActiveEnd, base + 120);
+  assert.equal(await controller.seekHistoricalRelative(10), true);
+  assert.equal(controller.clock.absoluteTime, base + 110);
   assert.equal(controller._autoSnapArmed, false);
-  assert.equal(controller._historicalPreparing, false);
+  assert.equal(await controller.seekHistoricalRelative(-10), true);
+  assert.equal(controller.clock.absoluteTime, base + 100);
 });
 
-test("Review navigation diagnostics are bounded, detached, and contain no media credentials", async t => {
+test("manual TI placement disarms event progression until explicit Play", async t => {
   const base = 1800000000;
-  const range = { from: base - 100, to: base + 300 };
-  const harness = await createRelativeCoverageHarness(t, {
-    range, startEpoch: base,
-    coverage: { drive_up: [{ start: base - 30, end: base + 50 }] }
-  });
+  const when = { from: base - 100, to: base + 500 };
+  const harness = createHistoricalHarness({ wallClockMs: when.to * 1000, now: () => 1000,
+    initialReviewRange: when, reviewEvents: [
+      { camera_id: "drive_up", start_time: base, end_time: base + 20 },
+      { camera_id: "drive_down", start_time: base + 100, end_time: base + 120 }
+    ] });
+  t.after(() => harness.close());
+  const controller = await enterEventAutoSnap(harness, base + 5, when);
+  assert.equal(controller.resumePlayback(), true);
+  assert.equal(await controller.selectTimelineTime(base + 50, "manual TI", false), true);
+  assert.equal(controller._autoSnapArmed, false);
+  assert.equal(controller.clock.running, false);
+  assert.equal(controller.clock.absoluteTime, base + 50);
+  assert.equal(controller.resumePlayback(), true);
+  await waitForCondition(() => controller.getRecentAutoSnapDecisions()[0]?.outcome === "advanced");
+  assert.equal(controller.clock.absoluteTime, base + 100);
+});
+
+test("Pause supersedes pending automatic event acquisition", async t => {
+  const base = 1800000000;
+  const when = { from: base - 100, to: base + 500 };
+  const deferredSeek = new Set();
+  const harness = createHistoricalHarness({ wallClockMs: when.to * 1000, now: () => 1000,
+    deferredSeek, initialReviewRange: when, reviewEvents: [
+      { camera_id: "drive_up", start_time: base + 100, end_time: base + 120 }
+    ] });
+  t.after(() => harness.close());
+  const controller = await enterEventAutoSnap(harness, base, when);
+  deferredSeek.add("Drive Up"); deferredSeek.add("Drive Down");
+  assert.equal(controller.resumePlayback(), true);
+  assert.ok(controller.getRecentAutoSnapDecisions().some(decision =>
+    decision.outcome === "seek_requested"));
+  await waitForCondition(() => harness.mediaControls.every(control =>
+    control.video.currentTimeWrites.length >= 2));
+  assert.equal(controller.pausePlayback(), true);
+  for (const control of harness.mediaControls) control.completeSeek();
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(controller._autoSnapArmed, false);
+  assert.equal(controller.clock.running, false);
+  assert.equal(controller.getRecentAutoSnapDecisions().some(decision =>
+    decision.outcome === "advanced"), false);
+});
+
+test("Auto Snap diagnostics stay bounded and return detached records", () => {
+  const harness = createHistoricalHarness();
   const controller = harness.controller;
+  try {
+    for (let index = 0; index < 100; index += 1) {
+      controller.recordAutoSnapDecision("blocked_incomplete", 1800000000 + index);
+    }
+    const decisions = controller.getRecentAutoSnapDecisions();
+    assert.ok(decisions.length > 0 && decisions.length < 100);
+    decisions[0].outcome = "changed";
+    assert.equal(controller.getRecentAutoSnapDecisions()[0].outcome, "blocked_incomplete");
+    assert.equal(JSON.stringify(decisions).includes("password"), false);
+  } finally {
+    harness.close();
+  }
+});
+
+test("Review navigation diagnostics remain bounded, detached, and sanitized", async t => {
+  const base = 1800000000;
+  const when = { from: base - 100, to: base + 300 };
+  const harness = createHistoricalHarness({ wallClockMs: when.to * 1000,
+    initialReviewRange: when });
+  t.after(() => harness.close());
+  const controller = harness.controller;
+  await controller.playHistorical(base, {
+    autoplay: false, updateDisplayedRange: false, playbackRange: when
+  });
   const player = controller._historicalPlayers.get("Drive Up");
   player.camera.password = "fixture-only-password";
   player.camera.auth = { token: "fixture-token" };
@@ -5877,592 +6875,25 @@ test("Review navigation diagnostics are bounded, detached, and contain no media 
   assert.equal(controller.getReviewNavigationDiagnostics().recent.length, 32);
 });
 
-test("gap-aware +10 with no later coverage returns Review Live at the now bound", async t => {
+test("unchecked Auto Snap retains continuous playback across event boundaries", async t => {
   const base = 1800000000;
-  const range = { from: base - 100, to: base + 300 };
-  const harness = createHistoricalHarness({
-    now: () => 1000, wallClockMs: (base + 150) * 1000,
-    initialReviewRange: range,
-    availabilityResponder: recordingCoverageResponder({
-      drive_up: [{ start: base - 20, end: base + 5 }]
-    })
-  });
+  const when = { from: base - 100, to: base + 500 };
+  const harness = createHistoricalHarness({ wallClockMs: when.to * 1000, now: () => 1000,
+    initialReviewRange: when, reviewEvents: [
+      { camera_id: "drive_up", start_time: base, end_time: base + 20 }
+    ] });
   t.after(() => harness.close());
   const controller = harness.controller;
-  controller.setSelectedCameraNames(["Drive Up"]);
-  await controller.playHistorical(base, { autoplay: false, playbackRange: range });
-  controller.setAutoSnapTo(true);
-  controller.resumePlayback();
-  await waitForCondition(() => controller._historicalPlayers.get("Drive Up").lifecycleState ===
-    "participating");
-  assert.equal(await controller.seekHistoricalRelative(10), true);
-  assert.equal(controller.state.presentationMode, "live");
-  assert.equal(controller._autoSnapArmed, false);
-});
-
-test("Pause during a deferred gap-aware ten-second lookup prevents late movement", async t => {
-  const base = 1800000000;
-  const range = { from: base - 100, to: base + 400 };
-  const coverage = { drive_up: [
-    { start: base - 30, end: base + 40 },
-    { start: base + 100, end: base + 140 }
-  ] };
-  for (const [label, startEpoch, delta] of [
-    ["forward", base + 35, 10], ["backward", base + 105, -10]
-  ]) {
-    await t.test(label, async t => {
-      let release;
-      let defer = false;
-      const literal = startEpoch + delta;
-      const harness = await createRelativeCoverageHarness(t, {
-        range, startEpoch, coverage,
-        onRequest: message => {
-          if (!defer || (delta > 0 ? message.start !== literal
-            : message.end !== literal + 1)) return undefined;
-          defer = false;
-          return new Promise(resolve => { release = resolve; });
-        }
-      });
-      const controller = harness.controller;
-      controller._historicalPlayers.get("Drive Up").availability = null;
-      defer = true;
-      const pending = controller.seekHistoricalRelative(delta);
-      await waitForCondition(() => typeof release === "function");
-      assert.equal(controller.clock.absoluteTime, startEpoch);
-      assert.equal(controller.pausePlayback(), true);
-      release({ camera: "drive_up", requested_start: delta > 0 ? literal : range.from,
-        requested_end: delta > 0 ? range.to : literal + 1,
-        coverage: [] });
-      assert.equal(await pending, false);
-      assert.equal(controller.clock.absoluteTime, startEpoch);
-      assert.equal(controller._autoSnapArmed, false);
-    });
-  }
-});
-
-test("newer ten-second click and manual TI placement supersede deferred coverage results", async t => {
-  const base = 1800000000;
-  const range = { from: base - 100, to: base + 400 };
-  const startEpoch = base + 35;
-  const coverage = { drive_up: [
-    { start: base - 30, end: base + 40 },
-    { start: base + 100, end: base + 140 }
-  ] };
-  for (const [label, action, expected] of [
-    ["newer -10", controller => controller.seekHistoricalRelative(-10), base + 25],
-    ["manual TI", controller => controller.selectTimelineTime(base + 20), base + 20]
-  ]) {
-    await t.test(label, async t => {
-      let release;
-      let defer = false;
-      const harness = await createRelativeCoverageHarness(t, {
-        range, startEpoch, coverage,
-        onRequest: message => {
-          if (!defer || message.start !== base + 45) return undefined;
-          defer = false;
-          return new Promise(resolve => { release = resolve; });
-        }
-      });
-      const controller = harness.controller;
-      controller._historicalPlayers.get("Drive Up").availability = null;
-      defer = true;
-      const old = controller.seekHistoricalRelative(10);
-      await waitForCondition(() => typeof release === "function");
-      assert.equal(await action(controller), true);
-      assert.equal(controller.clock.absoluteTime, expected);
-      release({ camera: "drive_up", requested_start: base + 45,
-        requested_end: range.to,
-        coverage: [{ start: base + 100, end: base + 140 }] });
-      assert.equal(await old, false);
-      assert.equal(controller.clock.absoluteTime, expected);
-    });
-  }
-});
-
-test("normal Auto Snap resumes after gap-aware forward and backward transport", async t => {
-  const base = 1800000000;
-  const range = { from: base - 100, to: base + 300 };
-  const coverage = { drive_up: [
-    { start: base - 20, end: base + 5 },
-    { start: base + 100, end: base + 105 },
-    { start: base + 200, end: base + 205 }
-  ] };
-  for (const [label, startEpoch, delta, manualTarget, automaticTarget, recordingStart] of [
-    ["after +10", base, 10, base + 100, base + 200, base + 100],
-    ["after -10", base + 102, -10, base + 4.95, base + 100, base]
-  ]) {
-    await t.test(label, async t => {
-      const harness = await createRelativeCoverageHarness(t, {
-        range, startEpoch, coverage
-      });
-      const controller = harness.controller;
-      assert.equal(await controller.seekHistoricalRelative(delta), true);
-      assert.ok(Math.abs(controller.clock.absoluteTime - manualTarget) < 0.00001);
-      assert.equal(controller._autoSnapArmed, true);
-      assert.equal(controller.clock.running, true);
-      const player = controller._historicalPlayers.get("Drive Up");
-      setReviewTi(controller, recordingStart + 6);
-      player.video.currentTime = recordingStart + 6 - player.timing.effective_absolute_origin;
-      assert.equal(controller.enforceHistoricalPresentationBoundary(), true);
-      await controller.queueHistoricalAvailabilityEvaluation("relative_seek_followed_by_gap");
-      await waitForCondition(() => controller.getRecentAutoSnapDecisions().some(decision =>
-        decision.outcome === "advanced" && decision.targetEpoch === automaticTarget));
-      assert.equal(controller.clock.absoluteTime, automaticTarget);
-      assert.equal(controller.clock.running, true);
-    });
-  }
-});
-
-test("second -10 keeps Play while the backward coverage seek is preparing", async t => {
-  const base = 1800000000;
-  const range = { from: base - 100, to: base + 300 };
-  const harness = await createRelativeCoverageHarness(t, {
-    range, startEpoch: base + 105,
-    coverage: { drive_up: [
-      { start: base - 30, end: base + 5 },
-      { start: base + 100, end: base + 140 }
-    ] }
+  await controller.playHistorical(base + 5, {
+    autoplay: false, updateDisplayedRange: false, playbackRange: when
   });
-  const controller = harness.controller;
-  controller.setHistoricalSyncDiagnostics(true);
-  const evaluate = controller.evaluateHistoricalAvailability.bind(controller);
-  let release;
-  let held = false;
-  controller.evaluateHistoricalAvailability = (epoch, options) =>
-    options.reason === "VCR -10 coverage" && !held
-    ? new Promise(resolve => { held = true; release = () => resolve([]); })
-    : evaluate(epoch, options);
-  const first = controller.seekHistoricalRelative(-10);
-  await waitForCondition(() => typeof release === "function");
-  assert.ok(Math.abs(controller.clock.absoluteTime - (base + 4.95)) < 0.00001);
-  assert.equal(controller.clock.running, false);
-  assert.equal(controller._playRequested, true);
-  assert.equal(await controller.seekHistoricalRelative(-10), true);
-  release();
-  assert.equal(await first, false);
-  assert.ok(Math.abs(controller.clock.absoluteTime - (base - 5.05)) < 0.00001);
-  assert.equal(controller.clock.running, true);
-  const reports = controller.getHistoricalSyncReports();
-  assert.equal(reports.at(-2).source, "VCR -10 coverage");
-  assert.equal(reports.at(-2).disposition, "stale/cancelled");
-  assert.equal(reports.at(-1).source, "VCR -10 coverage");
-  assert.notEqual(reports.at(-1).barrier.reviewClockAnchorMs, null);
-  assert.ok(harness.playCalls.at(-1).clockRunning);
-});
-
-test("rapid second -10 crosses another gap using the preceding coverage", async t => {
-  const base = 1800000000;
-  const range = { from: base - 100, to: base + 300 };
-  const harness = await createRelativeCoverageHarness(t, {
-    range, startEpoch: base + 105,
-    coverage: { drive_up: [
-      { start: base - 80, end: base - 30 },
-      { start: base, end: base + 5 },
-      { start: base + 100, end: base + 140 }
-    ] }
-  });
-  const controller = harness.controller;
-  const evaluate = controller.evaluateHistoricalAvailability.bind(controller);
-  let release;
-  let held = false;
-  controller.evaluateHistoricalAvailability = (epoch, options) =>
-    options.reason === "VCR -10 coverage" && !held
-      ? new Promise(resolve => { held = true; release = () => resolve([]); })
-      : evaluate(epoch, options);
-  const first = controller.seekHistoricalRelative(-10);
-  await waitForCondition(() => typeof release === "function");
-  assert.ok(Math.abs(controller.clock.absoluteTime - (base + 4.95)) < 0.00001);
-  assert.equal(controller._historicalPreparing, true);
-  assert.equal(controller._playRequested, true);
-  assert.equal(await controller.seekHistoricalRelative(-10), true);
-  release();
-  assert.equal(await first, false);
-  assert.ok(Math.abs(controller.clock.absoluteTime - (base - 30.05)) < 0.00001);
-  assert.equal(controller.clock.running, true);
-  const navigation = controller.getReviewNavigationDiagnostics().recent.find(record =>
-    Math.abs(record.selectedEpoch - (base - 30.05)) < 0.00001);
-  assert.equal(navigation.coverageDecision, "found");
-  assert.equal(navigation.coverageBypassedDuringPreparation, false);
-  assert.equal(navigation.participantCount, 1);
-});
-
-test("operator Pause during a pending backward seek keeps the next -10 paused", async t => {
-  const base = 1800000000;
-  const range = { from: base - 100, to: base + 300 };
-  const harness = await createRelativeCoverageHarness(t, {
-    range, startEpoch: base + 105,
-    coverage: { drive_up: [
-      { start: base - 30, end: base + 5 },
-      { start: base + 100, end: base + 140 }
-    ] }
-  });
-  const controller = harness.controller;
-  const evaluate = controller.evaluateHistoricalAvailability.bind(controller);
-  let release;
-  controller.evaluateHistoricalAvailability = (epoch, options) => options.reason === "VCR -10 coverage"
-    ? new Promise(resolve => { release = () => resolve([]); })
-    : evaluate(epoch, options);
-  const first = controller.seekHistoricalRelative(-10);
-  await waitForCondition(() => typeof release === "function");
-  assert.equal(controller.pausePlayback(), true);
-  assert.equal(controller._playRequested, false);
-  const playsBefore = harness.playCalls.length;
-  assert.equal(await controller.seekHistoricalRelative(-10), true);
-  release();
-  assert.equal(await first, false);
-  assert.equal(controller.clock.running, false);
-  assert.equal(harness.playCalls.length, playsBefore);
-});
-
-test("second -10 keeps Play while Auto Snap prepares after a backward gap jump", async t => {
-  const base = 1800000000;
-  const range = { from: base - 100, to: base + 300 };
-  const harness = await createRelativeCoverageHarness(t, {
-    range, startEpoch: base + 18,
-    coverage: { drive_up: [
-      { start: base - 30, end: base + 5 },
-      { start: base + 13, end: base + 50 }
-    ] }
-  });
-  const controller = harness.controller;
-  controller.setHistoricalSyncDiagnostics(true);
-  assert.equal(await controller.seekHistoricalRelative(-10), true);
-  assert.ok(Math.abs(controller.clock.absoluteTime - (base + 4.95)) < 0.00001);
-  assert.equal(controller.clock.running, true);
-  const player = controller._historicalPlayers.get("Drive Up");
-  const evaluate = controller.evaluateHistoricalAvailability.bind(controller);
-  let release;
-  controller.evaluateHistoricalAvailability = (epoch, options) => options.reason === "auto snap"
-    ? new Promise(resolve => { release = () => resolve([]); })
-    : evaluate(epoch, options);
-  setReviewTi(controller, base + 5.1);
-  player.video.currentTime = base + 5.1 - player.timing.effective_absolute_origin;
-  assert.equal(controller.enforceHistoricalPresentationBoundary(), true);
-  await controller.queueHistoricalAvailabilityEvaluation("backward_jump_gap");
-  await waitForCondition(() => typeof release === "function");
-  assert.equal(controller.clock.absoluteTime, base + 13);
-  assert.equal(controller.clock.running, false);
-  assert.equal(controller._playRequested, true);
-  assert.equal(await controller.seekHistoricalRelative(-10), true);
-  release();
-  await waitForCondition(() => controller.getRecentAutoSnapDecisions().some(decision =>
-    decision.outcome === "superseded" && decision.targetEpoch === base + 13));
-  assert.equal(controller.clock.absoluteTime, base + 3);
-  assert.equal(controller.clock.running, true);
-  const reports = controller.getHistoricalSyncReports();
-  assert.equal(reports.at(-2).source, "auto snap");
-  assert.equal(reports.at(-2).disposition, "stale/cancelled");
-  assert.equal(reports.at(-1).source, "VCR -10 coverage");
-  assert.notEqual(reports.at(-1).barrier.reviewClockAnchorMs, null);
-});
-
-test("+10 keeps Play when it supersedes an automatic snap's temporary pause", async t => {
-  const base = 1800000000;
-  const range = { from: base - 100, to: base + 300 };
-  const coverage = { drive_up: [
-    { start: base - 30, end: base + 5 },
-    { start: base + 100, end: base + 140 }
-  ] };
-  const harness = createHistoricalHarness({
-    now: () => 1000, wallClockMs: (range.to + 1000) * 1000,
-    initialReviewRange: range, availabilityResponder: recordingCoverageResponder(coverage)
-  });
-  t.after(() => harness.close());
-  const controller = harness.controller;
-  controller.setSelectedCameraNames(["Drive Up"]);
-  await enterAutoSnapGap(harness, base, range);
-  const evaluate = controller.evaluateHistoricalAvailability.bind(controller);
-  let release;
-  controller.evaluateHistoricalAvailability = (epoch, options) => options.reason === "auto snap"
-    ? new Promise(resolve => { release = () => resolve([]); })
-    : evaluate(epoch, options);
-  const automatic = controller.maybeAutoSnapTo();
-  await waitForCondition(() => typeof release === "function");
-  assert.equal(controller.clock.absoluteTime, base + 100);
-  assert.equal(controller.clock.running, false);
-  assert.equal(controller._playRequested, true);
-  assert.equal(await controller.seekHistoricalRelative(10), true);
-  release();
-  assert.equal(await automatic, false);
-  assert.equal(controller.clock.absoluteTime, base + 110);
-  assert.equal(controller.clock.running, true);
-  assert.equal(controller.getRecentAutoSnapDecisions()[0].outcome, "superseded");
-  assert.ok(harness.playCalls.at(-1).clockRunning);
-});
-
-test("Auto Snap blocks unknown availability and manual Pause supersedes a pending search", async t => {
-  const target = 1800000000;
-  const range = { from: target - 60, to: target + 9000 };
-  const initial = { start: target - 30, end: target + 5 };
-  let resolveSearch;
-  let defer = false;
-  const responder = recordingCoverageResponder({
-    drive_up: [initial, { start: target + 5000, end: target + 5100 }],
-    drive_down: [initial, { start: target + 6000, end: target + 6100 }]
-  }, message => defer && message.start === target + 10 && message.camera === "drive_down"
-    ? new Promise(resolve => { resolveSearch = resolve; }) : undefined);
-  const harness = createHistoricalHarness({
-    now: () => 1000, wallClockMs: (target + 20000) * 1000,
-    initialReviewRange: range, availabilityResponder: responder
-  });
-  t.after(() => harness.close());
-  const controller = await enterAutoSnapGap(harness, target, range);
-  defer = true;
-  const pending = controller.maybeAutoSnapTo();
-  await waitForCondition(() => typeof resolveSearch === "function");
-  assert.equal(controller.clock.absoluteTime, target + 10);
-  assert.equal(controller.pausePlayback(), true);
-  resolveSearch({ camera: "drive_down", requested_start: target + 10,
-    requested_end: target + 7210,
-    coverage: [{ start: target + 6000, end: target + 6100 }] });
-  assert.equal(await pending, false);
-  assert.equal(controller.clock.absoluteTime, target + 10);
-  assert.equal(controller._autoSnapArmed, false);
-  assert.equal(controller.getRecentAutoSnapDecisions()[0].outcome, "superseded");
-  const snapshot = controller.getRecentAutoSnapDecisions();
-  snapshot[0].outcome = "injected";
-  assert.equal(controller.getRecentAutoSnapDecisions()[0].outcome, "superseded");
   assert.equal(controller.resumePlayback(), true);
-  assert.equal(controller._autoSnapArmed, true);
-});
-
-test("Auto Snap requires every camera's current gap and treats a start at TI as current coverage", async t => {
-  const target = 1800000000;
-  const range = { from: target - 60, to: target + 9000 };
-  const current = target + 10;
-  const intervals = {
-    drive_up: [{ start: target - 30, end: target + 5 },
-      { start: current, end: current + 100 }],
-    drive_down: [{ start: target - 30, end: target + 5 },
-      { start: target + 5000, end: target + 5100 }]
-  };
-  const harness = createHistoricalHarness({
-    now: () => 1000, wallClockMs: (target + 20000) * 1000,
-    initialReviewRange: range, availabilityResponder: recordingCoverageResponder(intervals)
-  });
-  t.after(() => harness.close());
-  const controller = await enterAutoSnapGap(harness, target, range);
-  assert.equal(await controller.maybeAutoSnapTo(), false);
-  assert.equal(controller.clock.absoluteTime, current);
-  assert.equal(controller.getRecentAutoSnapDecisions()[0].outcome, "current_coverage");
-  assert.equal(await controller.maybeAutoSnapTo(), false);
-  assert.equal(controller.clock.absoluteTime, current);
-  controller.clock.setAbsolute(current + 100);
+  controller.clock.setAbsolute(base + 50);
   controller.clock.start();
-  assert.equal(await controller.maybeAutoSnapTo(), true);
-  assert.equal(controller.clock.absoluteTime, target + 5000);
+  assert.equal(controller.enforceAutoSnapBoundary(), false);
+  assert.equal(controller.clock.running, true);
+  assert.equal(controller._autoSnapActiveEnd, null);
 });
-
-test("Auto Snap waits for a participating peer, then the normal availability evaluation triggers it", async t => {
-  const target = 1800000000;
-  const range = { from: target - 60, to: target + 9000 };
-  const initial = { start: target - 30, end: target + 5 };
-  const harness = createHistoricalHarness({
-    now: () => 1000, wallClockMs: (target + 20000) * 1000,
-    initialReviewRange: range,
-    availabilityResponder: recordingCoverageResponder({
-      drive_up: [initial, { start: target + 5000, end: target + 5100 }],
-      drive_down: [initial]
-    })
-  });
-  t.after(() => harness.close());
-  const controller = harness.controller;
-  await controller.playHistorical(target, { autoplay: false, playbackRange: range });
-  controller.setAutoSnapTo(true);
-  controller.resumePlayback();
-  await controller.queueHistoricalAvailabilityEvaluation("auto_snap_test_start");
-  controller.clock.setAbsolute(target + 10);
-  controller.clock.start();
-  const up = controller._historicalPlayers.get("Drive Up");
-  const down = controller._historicalPlayers.get("Drive Down");
-  controller.leaveHistoricalCamera(down, "authoritative_recording_gap", target + 10);
-  assert.equal(await controller.maybeAutoSnapTo(), false);
-  assert.equal(controller.clock.absoluteTime, target + 10);
-  controller.leaveHistoricalCamera(up, "authoritative_recording_gap", target + 10);
-  await controller.queueHistoricalAvailabilityEvaluation("auto_snap_test_gap");
-  await waitForCondition(() => controller.getRecentAutoSnapDecisions().length > 0);
-  assert.equal(controller.clock.absoluteTime, target + 5000);
-  assert.equal(controller.getRecentAutoSnapDecisions()[0].outcome, "advanced");
-});
-
-test("Auto Snap stops at an unknown camera before a known later recording", async t => {
-  const target = 1800000000;
-  const range = { from: target - 60, to: target + 15000 };
-  const initial = { start: target - 30, end: target + 5 };
-  const searched = [];
-  const responder = recordingCoverageResponder({
-    drive_up: [initial, { start: target + 9000, end: target + 9100 }],
-    drive_down: [initial]
-  }, message => {
-    if (message.start >= target + 10) searched.push(message);
-    if (message.camera === "drive_down" && message.start === target + 10) {
-      return Promise.reject(new Error("availability unavailable"));
-    }
-    return undefined;
-  });
-  const harness = createHistoricalHarness({
-    now: () => 1000, wallClockMs: (target + 20000) * 1000,
-    initialReviewRange: range, availabilityResponder: responder
-  });
-  t.after(() => harness.close());
-  const controller = await enterAutoSnapGap(harness, target, range);
-  assert.equal(await controller.maybeAutoSnapTo(), false);
-  assert.equal(controller.clock.absoluteTime, target + 10);
-  assert.equal(controller.getRecentAutoSnapDecisions()[0].outcome, "blocked_unknown");
-  assert.equal(searched.some(call => call.start > target + 10), false);
-  assert.equal(await controller.maybeAutoSnapTo(), false);
-  assert.equal(searched.length, 2);
-});
-
-test("Auto Snap rejects invalid and out-of-window availability as unknown", async t => {
-  const target = 1800000000;
-  const range = { from: target - 60, to: target + 9000 };
-  const initial = { start: target - 30, end: target + 5 };
-  for (const invalid of [
-    { coverage: null },
-    { requested_start: target + 11, requested_end: target + 7210, coverage: [] }
-  ]) {
-    await t.test(invalid.coverage === null ? "invalid coverage" : "partial response window", async t => {
-      const responder = recordingCoverageResponder({
-        drive_up: [initial, { start: target + 5000, end: target + 5100 }],
-        drive_down: [initial]
-      }, message => message.start === target + 10 && message.camera === "drive_down"
-        ? Promise.resolve({ camera: message.camera, requested_start: message.start,
-          requested_end: message.end, ...invalid }) : undefined);
-      const harness = createHistoricalHarness({
-        now: () => 1000, wallClockMs: (target + 20000) * 1000,
-        initialReviewRange: range, availabilityResponder: responder
-      });
-      t.after(() => harness.close());
-      const controller = await enterAutoSnapGap(harness, target, range);
-      assert.equal(await controller.maybeAutoSnapTo(), false);
-      assert.equal(controller.clock.absoluteTime, target + 10);
-      assert.equal(controller.getRecentAutoSnapDecisions()[0].outcome, "blocked_unknown");
-    });
-  }
-});
-
-test("Auto Snap diagnostics retain only detached sanitized recent decisions", t => {
-  const harness = createHistoricalHarness();
-  t.after(() => harness.close());
-  const controller = harness.controller;
-  for (let token = 1; token <= 20; token += 1) {
-    controller.recordAutoSnapDecision(token, 1800000000, 1800000000, 1800007200,
-      2, token % 2 ? "blocked_unknown" : "no_later_coverage");
-  }
-  const snapshot = controller.getRecentAutoSnapDecisions();
-  assert.equal(snapshot.length, 16);
-  assert.equal(snapshot[0].token, 20);
-  assert.equal(snapshot.at(-1).token, 5);
-  assert.deepEqual(Object.keys(snapshot[0]).sort(), [
-    "atMs", "outcome", "searchedEnd", "searchedStart", "selectedCount",
-    "sourceEpoch", "targetEpoch", "token"
-  ]);
-  snapshot[0].outcome = "changed";
-  assert.equal(controller.getRecentAutoSnapDecisions()[0].outcome, "no_later_coverage");
-});
-
-test("Auto Snap settles a fully known exhausted historical range only once", async t => {
-  const target = 1800000000;
-  const range = { from: target - 60, to: target + 9000 };
-  const initial = { start: target - 30, end: target + 5 };
-  const harness = createHistoricalHarness({
-    now: () => 1000, wallClockMs: (target + 20000) * 1000,
-    initialReviewRange: range,
-    availabilityResponder: recordingCoverageResponder({ drive_up: [initial], drive_down: [initial] })
-  });
-  t.after(() => harness.close());
-  const controller = await enterAutoSnapGap(harness, target, range);
-  assert.equal(await controller.maybeAutoSnapTo(), false);
-  assert.equal(controller.clock.absoluteTime, range.to);
-  assert.equal(controller.clock.running, false);
-  assert.equal(controller.getRecentAutoSnapDecisions()[0].outcome, "no_later_coverage");
-  const count = harness.calls.filter(call => call.type === "frigate_max/v1/recordings/availability").length;
-  assert.equal(await controller.maybeAutoSnapTo(), false);
-  assert.equal(harness.calls.filter(call => call.type === "frigate_max/v1/recordings/availability").length,
-    count);
-});
-
-test("Auto Snap late search results cannot undo operator context changes", async t => {
-  const target = 1800000000;
-  const range = { from: target - 60, to: target + 9000 };
-  const initial = { start: target - 30, end: target + 5 };
-  const actions = [
-    ["manual TI", controller => controller.selectTimelineTime(target + 50)],
-    ["zoom", controller => controller.setTimelineZoomSpanSeconds(3600)],
-    ["View load", controller => controller.restoreReviewView(controller.captureReviewViewState())],
-    ["camera selection", controller => controller.setSelectedCameraNames(["Drive Up"])],
-    ["option off", controller => controller.setAutoSnapTo(false)],
-    ["leave Review", controller => controller.returnToLive()]
-  ];
-  for (const [label, action] of actions) {
-    await t.test(label, async t => {
-      let release;
-      let defer = false;
-      const responder = recordingCoverageResponder({
-        drive_up: [initial, { start: target + 5000, end: target + 5100 }],
-        drive_down: [initial, { start: target + 6000, end: target + 6100 }]
-      }, message => defer && message.start === target + 10 && message.camera === "drive_down"
-        ? new Promise(resolve => { release = resolve; }) : undefined);
-      const harness = createHistoricalHarness({
-        now: () => 1000, wallClockMs: (target + 20000) * 1000,
-        initialReviewRange: range, availabilityResponder: responder
-      });
-      t.after(() => harness.close());
-      const controller = await enterAutoSnapGap(harness, target, range);
-      defer = true;
-      const pending = controller.maybeAutoSnapTo();
-      await waitForCondition(() => typeof release === "function");
-      await action(controller);
-      const operatorTi = controller.clock.absoluteTime;
-      release({ camera: "drive_down", requested_start: target + 10,
-        requested_end: target + 7210,
-        coverage: [{ start: target + 6000, end: target + 6100 }] });
-      assert.equal(await pending, false);
-      assert.equal(controller.clock.absoluteTime, operatorTi);
-      assert.equal(controller.getRecentAutoSnapDecisions()[0].outcome, "superseded");
-    });
-  }
-});
-
-test("a new Play decision can advance while an older Auto Snap lookup is unresolved", async t => {
-  const target = 1800000000;
-  const range = { from: target - 60, to: target + 9000 };
-  const initial = { start: target - 30, end: target + 5 };
-  let releaseOld;
-  let delayed = false;
-  const responder = recordingCoverageResponder({
-    drive_up: [initial, { start: target + 5000, end: target + 5100 }],
-    drive_down: [initial, { start: target + 6000, end: target + 6100 }]
-  }, message => {
-    if (delayed && message.start === target + 10 && message.camera === "drive_down") {
-      delayed = false;
-      return new Promise(resolve => { releaseOld = resolve; });
-    }
-    return undefined;
-  });
-  const harness = createHistoricalHarness({
-    now: () => 1000, wallClockMs: (target + 20000) * 1000,
-    initialReviewRange: range, availabilityResponder: responder
-  });
-  t.after(() => harness.close());
-  const controller = await enterAutoSnapGap(harness, target, range);
-  delayed = true;
-  const oldDecision = controller.maybeAutoSnapTo();
-  await waitForCondition(() => typeof releaseOld === "function");
-  controller.pausePlayback();
-  controller.resumePlayback();
-  assert.equal(await controller.maybeAutoSnapTo(), true);
-  assert.equal(controller.clock.absoluteTime, target + 5000);
-  releaseOld({ camera: "drive_down", requested_start: target + 10,
-    requested_end: target + 7210,
-    coverage: [{ start: target + 6000, end: target + 6100 }] });
-  assert.equal(await oldDecision, false);
-  assert.equal(controller.clock.absoluteTime, target + 5000);
-  assert.deepEqual(controller.getRecentAutoSnapDecisions().slice(0, 2)
-    .map(decision => decision.outcome), ["superseded", "advanced"]);
-});
-
 test("an initially unavailable camera joins at Review TI without disturbing its peer", async t => {
   const target = 1800000000;
   const harness = createHistoricalHarness({
@@ -8062,4 +8493,365 @@ test("Review failure ledger retains finite exhaustion separately from failed con
     .outcome, "normal_terminal");
   assert.equal(records.find(record => record.reason === "camera_prepare_failed").outcome,
     "failure");
+});
+
+async function createContinuationFailureExperiment(t, {
+  rate = 1, failure = "none", cameras = ["Drive Up"], deferRecovery = false,
+  coverageIntervals = null, autoSnap = false
+} = {}) {
+  const base = 1800000000;
+  const when = { from: base - 30, to: base + 100 };
+  let elapsedMs = 0;
+  const attempts = new Map();
+  const trace = [];
+  let releaseRecovery;
+  const recoveryGate = new Promise(resolve => { releaseRecovery = resolve; });
+  const harness = createHistoricalHarness({
+    now: () => elapsedMs,
+    wallClockMs: (base + 500) * 1000,
+    initialReviewRange: when,
+    ...(autoSnap ? { reviewEvents: [{ camera_id: "drive_up", start_time: base,
+      end_time: when.to }] } : {}),
+    ...(coverageIntervals ? { availabilityResponder: recordingCoverageResponder({
+      drive_up: coverageIntervals, drive_down: coverageIntervals
+    }) } : {}),
+    presentationResponder: message => {
+      const count = (attempts.get(message.camera) ?? 0) + 1;
+      attempts.set(message.camera, count);
+      if (message.camera === "drive_up" && count === 3 && deferRecovery) {
+        return recoveryGate.then(() => Promise.reject(
+          new Error("superseded recovery preparation")));
+      }
+      if (message.camera === "drive_up" && count > 1 &&
+          (failure === "always" || (failure === "once" && count === 2))) {
+        return Promise.reject(new Error("simulated successor VOD preparation failure"));
+      }
+      const end = message.camera === "drive_up" && count === 1
+        ? base + 20 : when.to;
+      return Promise.resolve(presentationPrepared(
+        message.camera, message.target - 21, message.target, end
+      ));
+    }
+  });
+  t.after(() => harness.close());
+  harness.window.HTMLCanvasElement.prototype.getContext = () => ({ drawImage() {} });
+  const controller = harness.controller;
+  controller.setSelectedCameraNames(cameras);
+  await controller.refreshReviewQuery();
+  controller.setPlaybackSpeed(rate);
+  await controller.playHistorical(base, {
+    autoplay: false, updateDisplayedRange: false,
+    playbackRange: when, cameraNames: cameras
+  });
+  const player = controller._historicalPlayers.get("Drive Up");
+  assert.equal(player.lifecycleState, "participating");
+  assert.equal(player.timing.logical_wall_end, base + 20);
+  if (autoSnap) controller.setAutoSnapTo(true);
+  harness.mediaControls.find(control => control.camera === "Drive Up").emitFrame();
+  assert.ok(player.heldCanvas && Number.isFinite(player.heldFrameEpoch));
+  const snapshot = phase => {
+    const failureRecord = controller.getRecentReviewFailures().find(record =>
+      record.camera === "Drive Up" && record.outcome === "failure");
+    const state = {
+      phase,
+      tiOffset: Number((controller.clock.absoluteTime - base).toFixed(3)),
+      clockRunning: controller.clock.running,
+      playRequested: controller._playRequested,
+      cameraState: player.lifecycleState,
+      participatingCount: [...controller._historicalPlayers.values()].filter(candidate =>
+        candidate.lifecycleState === "participating").length,
+      presentationEndOffset: Number((player.timing?.logical_wall_end ??
+        player.lastTiming?.logical_wall_end ?? base) - base),
+      prepareAttempts: attempts.get("drive_up") ?? 0,
+      recoveryAttempts: player.continuationRecovery?.attempts ?? 0,
+      recoveryExhausted: player.continuationRecovery?.exhausted ?? false,
+      heldFrameVisible: player.heldCanvas?.hidden === false,
+      badge: controller.historicalVideoStateBadge(player),
+      failureReason: failureRecord?.reason ?? null
+    };
+    trace.push(state);
+    return state;
+  };
+  snapshot("initial_paused");
+  assert.equal(controller.resumePlayback(), true);
+  await waitForCondition(() => player.lifecycleState === "participating" &&
+    player.video.paused === false);
+  snapshot("playing_initial");
+  elapsedMs = 20000 / rate;
+  player.video.currentTime = player.timing.logical_media_end_position;
+  assert.equal(controller.enforceHistoricalPresentationBoundary(), true);
+  snapshot("exhausted_preparing_successor");
+  if (coverageIntervals) {
+    await waitForCondition(() => player.lifecycleState === "unavailable");
+    snapshot("recording_gap");
+  } else {
+    await waitForCondition(() => (attempts.get("drive_up") ?? 0) === 2 &&
+      player.lifecycleState === (failure === "none" ? "participating" : "failed"));
+    snapshot(failure === "none" ? "successor_playing" : "successor_failed");
+  }
+  return {
+    base, when, harness, controller, player, attempts, trace, snapshot,
+    advanceWallClock(ms) { elapsedMs += ms; },
+    releaseRecovery,
+    diagnostic() { t.diagnostic(JSON.stringify(trace)); }
+  };
+}
+
+test("experiment: covered finite presentation continues when successor preparation succeeds", async t => {
+  const run = await createContinuationFailureExperiment(t);
+  const { controller, player, trace } = run;
+  assert.deepEqual(trace.map(entry => entry.phase), [
+    "initial_paused", "playing_initial", "exhausted_preparing_successor", "successor_playing"
+  ]);
+  assert.equal(trace[2].heldFrameVisible, true);
+  assert.equal(trace[2].badge, "Ended");
+  assert.equal(trace[3].cameraState, "participating");
+  assert.equal(trace[3].participatingCount, 1);
+  assert.equal(trace[3].heldFrameVisible, false);
+  assert.equal(trace[3].clockRunning, true);
+  assert.equal(player.video.paused, false);
+  assert.equal(controller.getRecentReviewFailures().some(record =>
+    record.reason === "camera_prepare_failed"), false);
+  run.diagnostic();
+});
+
+for (const rate of [1, 16]) {
+  test(`covered successor automatically recovers after one transient failure at ${rate}x`, async t => {
+    const run = await createContinuationFailureExperiment(t, { rate, failure: "once" });
+    const { controller, player, attempts, trace } = run;
+    assert.equal(trace[3].cameraState, "failed");
+    assert.equal(trace[3].participatingCount, 0);
+    assert.equal(trace[3].heldFrameVisible, true);
+    assert.equal(trace[3].badge, "Ended");
+    assert.equal(trace[3].clockRunning, false);
+    assert.equal(trace[3].playRequested, true);
+    assert.equal(trace[3].recoveryAttempts, 1);
+    const failureRecord = controller.getRecentReviewFailures().find(record =>
+      record.reason === "camera_prepare_failed");
+    assert.equal(failureRecord?.stage, "prepare");
+    assert.equal(failureRecord?.coverage, "covered");
+    assert.equal(failureRecord?.hasTimingMap, false);
+    assert.equal(failureRecord?.play, "not_attempted");
+    run.advanceWallClock(999);
+    await controller.queueHistoricalAvailabilityEvaluation("continuation_experiment");
+    assert.equal(attempts.get("drive_up"), 2);
+    assert.equal(controller.clock.absoluteTime, run.base + 20);
+    run.advanceWallClock(1);
+    await controller.queueHistoricalAvailabilityEvaluation("continuation_experiment");
+    await waitForCondition(() => player.lifecycleState === "participating" &&
+      controller.clock.running && player.video.paused === false);
+    run.snapshot("automatic_recovery");
+    assert.equal(attempts.get("drive_up"), 3);
+    assert.equal(trace.at(-1).recoveryAttempts, 0);
+    run.harness.mediaControls.filter(control => control.camera === "Drive Up")
+      .at(-1).emitFrame();
+    run.snapshot("first_successor_frame");
+    assert.equal(trace.at(-1).heldFrameVisible, false);
+    run.diagnostic();
+  });
+}
+
+test("persistent covered successor failure stops after three attempts without clock drift", async t => {
+  const run = await createContinuationFailureExperiment(t, { failure: "always" });
+  const { controller, player, attempts, trace } = run;
+  assert.equal(controller.clock.running, false);
+  assert.equal(controller._playRequested, true);
+  run.advanceWallClock(1000);
+  await controller.queueHistoricalAvailabilityEvaluation("continuation_experiment");
+  await waitForCondition(() => player.lifecycleState === "failed" &&
+    player.continuationRecovery?.attempts === 2);
+  run.snapshot("second_failure");
+  run.advanceWallClock(2000);
+  await controller.queueHistoricalAvailabilityEvaluation("continuation_experiment");
+  await waitForCondition(() => player.lifecycleState === "failed" &&
+    player.continuationRecovery?.exhausted);
+  run.snapshot("recovery_exhausted");
+  assert.equal(attempts.get("drive_up"), 4);
+  assert.equal(player.lifecycleState, "failed");
+  assert.equal(trace.at(-1).participatingCount, 0);
+  assert.equal(trace.at(-1).clockRunning, false);
+  assert.equal(trace.at(-1).playRequested, false);
+  assert.equal(trace.at(-1).recoveryAttempts, 3);
+  assert.equal(controller.resumePlayback(), false);
+  run.advanceWallClock(10000);
+  await controller.queueHistoricalAvailabilityEvaluation("continuation_experiment");
+  assert.equal(attempts.get("drive_up"), 4);
+  assert.equal(controller.clock.absoluteTime, run.base + 20);
+  assert.equal(trace.at(-1).heldFrameVisible, true);
+  run.diagnostic();
+});
+
+test("experiment: one failed successor leaves a selected peer participating", async t => {
+  const run = await createContinuationFailureExperiment(t, {
+    failure: "always", cameras: ["Drive Up", "Drive Down"]
+  });
+  const { controller, player, attempts, trace } = run;
+  const peer = controller._historicalPlayers.get("Drive Down");
+  assert.equal(player.lifecycleState, "failed");
+  assert.equal(peer.lifecycleState, "participating");
+  assert.equal(peer.video.paused, false);
+  assert.equal(controller.clock.running, true);
+  assert.equal(trace.at(-1).participatingCount, 1);
+  assert.equal(attempts.get("drive_up"), 2);
+  assert.equal(attempts.get("drive_down"), 1);
+  run.advanceWallClock(1000);
+  await controller.queueHistoricalAvailabilityEvaluation("continuation_experiment");
+  await waitForCondition(() => player.continuationRecovery?.attempts === 2);
+  assert.equal(peer.lifecycleState, "participating");
+  assert.equal(controller.clock.running, true);
+  assert.equal(attempts.get("drive_down"), 1);
+  run.diagnostic();
+});
+
+test("a selected peer keeps playing while its failed camera recovers", async t => {
+  const run = await createContinuationFailureExperiment(t, {
+    failure: "once", cameras: ["Drive Up", "Drive Down"]
+  });
+  const { controller, player, attempts } = run;
+  const peer = controller._historicalPlayers.get("Drive Down");
+  assert.equal(controller.clock.running, true);
+  assert.equal(controller._playRequested, false);
+  run.advanceWallClock(1000);
+  await controller.queueHistoricalAvailabilityEvaluation("continuation_experiment");
+  await waitForCondition(() => player.lifecycleState === "participating" &&
+    player.video.paused === false);
+  assert.equal(peer.lifecycleState, "participating");
+  assert.equal(peer.video.paused, false);
+  assert.equal(controller.clock.running, true);
+  assert.equal(attempts.get("drive_up"), 3);
+  assert.equal(attempts.get("drive_down"), 1);
+  run.diagnostic();
+});
+
+test("Pause cancels pending continuation recovery", async t => {
+  const run = await createContinuationFailureExperiment(t, { failure: "once" });
+  const { controller, player, attempts } = run;
+  assert.equal(controller.pausePlayback(), true);
+  run.advanceWallClock(5000);
+  await controller.queueHistoricalAvailabilityEvaluation("continuation_experiment");
+  assert.equal(attempts.get("drive_up"), 2);
+  assert.equal(player.lifecycleState, "failed");
+  assert.equal(controller.clock.running, false);
+  assert.equal(controller._playRequested, false);
+  run.diagnostic();
+});
+
+test("Pause during in-flight recovery cannot restart playback", async t => {
+  const run = await createContinuationFailureExperiment(t, {
+    failure: "once", deferRecovery: true
+  });
+  const { controller, player, attempts } = run;
+  run.advanceWallClock(1000);
+  await controller.queueHistoricalAvailabilityEvaluation("continuation_experiment");
+  await waitForCondition(() => attempts.get("drive_up") === 3 &&
+    player.lifecycleState === "preparing");
+  assert.equal(controller.pausePlayback(), true);
+  assert.equal(player.transition, null);
+  assert.equal(player.lifecycleState, "failed");
+  assert.equal(player.continuationRecovery.attempts, 1);
+  run.releaseRecovery();
+  await waitForCondition(() => player.lifecycleState === "failed");
+  assert.equal(controller.clock.running, false);
+  assert.equal(controller._playRequested, false);
+  run.advanceWallClock(5000);
+  await controller.queueHistoricalAvailabilityEvaluation("continuation_experiment");
+  assert.equal(attempts.get("drive_up"), 3);
+  run.diagnostic();
+});
+
+test("Play after cancelling recovery owns the replacement before the stale request settles", async t => {
+  const run = await createContinuationFailureExperiment(t, {
+    failure: "once", deferRecovery: true
+  });
+  const { controller, player, attempts } = run;
+  run.advanceWallClock(1000);
+  await controller.queueHistoricalAvailabilityEvaluation("continuation_experiment");
+  await waitForCondition(() => attempts.get("drive_up") === 3 &&
+    player.lifecycleState === "preparing");
+  assert.equal(controller.pausePlayback(), true);
+  assert.equal(player.transition, null);
+  assert.equal(controller.resumePlayback(), true);
+  await waitForCondition(() => attempts.get("drive_up") === 4 &&
+    player.lifecycleState === "participating" && controller.clock.running &&
+    player.video.paused === false);
+  const ownedHls = player.hls;
+  const ownedPresentation = player.presentationId;
+  run.releaseRecovery();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(player.hls, ownedHls);
+  assert.equal(player.presentationId, ownedPresentation);
+  assert.equal(player.lifecycleState, "participating");
+  assert.equal(player.video.paused, false);
+  assert.equal(controller.clock.running, true);
+  assert.equal(player.continuationRecovery, null);
+});
+
+test("Auto Snap resumes its verified event interval after covered successor recovery", async t => {
+  const run = await createContinuationFailureExperiment(t, {
+    failure: "once", autoSnap: true
+  });
+  const { controller, player } = run;
+  assert.equal(controller._autoSnapArmed, true);
+  assert.equal(controller.clock.running, false);
+  run.advanceWallClock(1000);
+  await controller.queueHistoricalAvailabilityEvaluation("continuation_experiment");
+  await waitForCondition(() => player.lifecycleState === "participating" &&
+    controller.clock.running && player.video.paused === false);
+  assert.equal(controller._autoSnapArmed, true);
+  assert.equal(controller._autoSnapActiveEnd, run.when.to);
+  run.diagnostic();
+});
+
+test("authoritative recording gap keeps ordinary clock advancement", async t => {
+  const base = 1800000000;
+  const run = await createContinuationFailureExperiment(t, {
+    coverageIntervals: [{ start: base - 30, end: base + 20 },
+      { start: base + 40, end: base + 100 }]
+  });
+  const { controller, player, attempts } = run;
+  assert.equal(player.lifecycleState, "unavailable");
+  assert.equal(player.boundaryReason, "authoritative_recording_gap");
+  assert.equal(player.continuationRecovery, null);
+  assert.equal(controller.clock.running, true);
+  run.advanceWallClock(1000);
+  assert.equal(controller.clock.absoluteTime, base + 21);
+  assert.equal(attempts.get("drive_up"), 1);
+  run.diagnostic();
+});
+
+test("manual TI supersedes a pending continuation recovery", async t => {
+  const run = await createContinuationFailureExperiment(t, {
+    failure: "once", deferRecovery: true
+  });
+  const { base, controller, player, attempts } = run;
+  run.advanceWallClock(1000);
+  await controller.queueHistoricalAvailabilityEvaluation("continuation_experiment");
+  await waitForCondition(() => attempts.get("drive_up") === 3 &&
+    player.lifecycleState === "preparing");
+  assert.equal(await controller.selectTimelineTime(base + 25, "manual TI", false), true);
+  assert.equal(player.lifecycleState, "participating");
+  assert.equal(controller.clock.running, false);
+  run.releaseRecovery();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(player.lifecycleState, "participating");
+  assert.equal(controller._playRequested, false);
+  assert.equal(attempts.get("drive_up"), 4);
+  run.diagnostic();
+});
+
+test("camera deselection supersedes a pending continuation recovery", async t => {
+  const run = await createContinuationFailureExperiment(t, {
+    failure: "once", deferRecovery: true, cameras: ["Drive Up", "Drive Down"]
+  });
+  const { controller, player, attempts } = run;
+  run.advanceWallClock(1000);
+  await controller.queueHistoricalAvailabilityEvaluation("continuation_experiment");
+  await waitForCondition(() => attempts.get("drive_up") === 3 &&
+    player.lifecycleState === "preparing");
+  controller.setSelectedCameraNames(["Drive Down"]);
+  run.releaseRecovery();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(controller._selectedCameraNames, ["Drive Down"]);
+  assert.equal(controller._historicalPlayers.has("Drive Up"), false);
+  run.diagnostic();
 });
