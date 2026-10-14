@@ -5,6 +5,35 @@ tests, and direct runtime evidence outrank this handoff if they disagree.
 VISION.md governs product design. Inspect only source relevant to the next
 task; do not reconstruct the whole repository or conversation history.
 
+## Current Review stabilization (2026-10-14)
+
+The user runtime-tested all four Snap to Event / Skip Deadspace combinations
+in Home Assistant/Frigate, including the previously problematic section at 8x.
+This is user-provided runtime acceptance of the implementation before cleanup.
+
+- Both OFF preserves nominal continuous playback.
+- Snap to Event alone navigates literal merged event intervals.
+- Skip Deadspace alone skips event-associated WHITE recording gaps, including
+  leading, internal, and trailing portions. BLACK time plays nominally even
+  without recording. Recorded time on any selected camera prevents a skip.
+- Both ON retain independent event navigation and WHITE skipping, with Auto
+  Snap owning event completion and next-event selection.
+- The investigation clock owns time. Deliberate navigation retains the bounded
+  preparation hold; transient Preparing overlays stay hidden and held frames
+  keep their normal presentation. Camera recovery remains independent.
+- Review speeds are 0.25x, 0.5x, 0.75x, 1x, 2x, 4x, and 8x. The `snapPastCrap`
+  key, default OFF, and existing Review Saved Views schema remain compatible.
+
+Conservative cleanup removes only the temporary opt-in navigation recorder,
+its three public console controls, its harness shim, exclusive tests, and
+documentation. Existing support diagnostics, functional regressions, the local
+browser geometry regression, and older playback/Lab experiments are retained.
+Cleanup has automated validation but has not been separately runtime-tested.
+No new protected tag is authorized by this acceptance or by a source commit.
+
+The historical experimental evidence below remains useful context; it does not
+override the current production Review acceptance or authorize new experiments.
+
 ## 1. Protected Git baseline
 
 - Branch: main.
@@ -67,7 +96,8 @@ task; do not reconstruct the whole repository or conversation history.
   demonstrates a need. Do not automatically revive the older coordinator.
 - Desired gap behavior is truthful context: a camera may hold its last
   validated edge frame while peers continue, with the gap still shown on the
-  timeline. Final production gap and boundary behavior remain unaccepted.
+  timeline. Current production Review gap and boundary behavior has the user
+  acceptance described above; older experimental paths retain their own limits.
 - The earlier dynamic production multi-camera join/leave state machine passed
   tests but failed runtime acceptance with black/Preparing/video cycling,
   unreliable joins, and temporal divergence. Do not tune that state machine

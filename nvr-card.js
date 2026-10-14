@@ -2011,6 +2011,7 @@ class NVRCard extends HTMLElement {
     this._reviewController.setTimeFormat(normalized.timeFormat);
     this._reviewController.setVideoStateBadgePosition(normalized.videoStateBadgePosition);
     this._reviewController.setDebug(config.review_debug === true);
+    this._reviewController.setPreparationTimeout(config.review_preparation_timeout_ms);
     if (JSON.stringify(this._autoDimConfig) !== JSON.stringify(normalized.autoDim)) {
       this.applyAutoDimConfig(normalized.autoDim);
     }
@@ -3429,6 +3430,20 @@ class NVRCard extends HTMLElement {
         grid-template-columns: 1fr 1fr;
       }
 
+      .review-options-controls {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr);
+      }
+
+      .review-options-controls label {
+        display: flex;
+        align-items: center;
+      }
+
+      .review-options-controls input {
+        flex-shrink: 0;
+      }
+
       .review-diagnostics button {
         width: 100%;
         padding: 0 8px;
@@ -3997,6 +4012,20 @@ class NVRCard extends HTMLElement {
         border-left: 0;
         background: transparent;
         opacity: 0.9;
+      }
+      .review-timeline-marker-gap {
+        position: absolute;
+        left: 4px;
+        width: calc(100% - 8px);
+        box-sizing: border-box;
+        background: #e8eef2;
+        opacity: 0.85;
+        pointer-events: none;
+      }
+      .review-timeline-marker-gap.point {
+        height: 0 !important;
+        border-top: 3px solid #e8eef2;
+        background: transparent;
       }
       .review-timeline-cursor {
         position: absolute;

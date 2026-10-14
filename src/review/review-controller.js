@@ -23,6 +23,12 @@ const REVIEW_QUERY_DEBOUNCE_MS = 400;
 const REVIEW_MEDIA_READY_TIMEOUT_MS = 15000;
 const REVIEW_AVAILABILITY_WINDOW_SECONDS = 2 * 60 * 60;
 const REVIEW_AVAILABILITY_EDGE_REFRESH_SECONDS = 30;
+const REVIEW_COVERAGE_CONCURRENCY = 3;
+const REVIEW_COVERAGE_LIVE_MARGIN_SECONDS = 90;
+const REVIEW_COVERAGE_OPEN_TTL_SECONDS = 60;
+const REVIEW_COVERAGE_RETRY_SECONDS = 30;
+const REVIEW_COVERAGE_MAX_ENTRIES = 1024;
+const REVIEW_COVERAGE_EPSILON_SECONDS = 0.001;
 const REVIEW_CONTINUATION_MAX_ATTEMPTS = 3;
 const REVIEW_CONTINUATION_RETRY_MS = 1000;
 const REVIEW_AUTO_SNAP_FRAME_STALE_MS = 1000;
@@ -75,7 +81,7 @@ function safeReviewHlsError(data) {
     httpStatus: Number.isInteger(status) && status >= 100 && status <= 599 ? status : null
   };
 }
-export const REVIEW_PLAYBACK_SPEEDS = Object.freeze([0.25, 0.5, 0.75, 1, 2, 4, 8, 16]);
+export const REVIEW_PLAYBACK_SPEEDS = Object.freeze([0.25, 0.5, 0.75, 1, 2, 4, 8]);
 export function formatNvrClockTime(value, timeZone, format = "24-hour", kind = "time") {
   const options = {
     ...(timeZone ? { timeZone } : {}),
@@ -250,13 +256,20 @@ export function reviewTimelineMarkerTop(epoch, range) {
   return Math.min(1, Math.max(0, (range.to - epoch) / (range.to - range.from)));
 }
 
-export function reviewTimelineMarkerGeometry(item, range) {
+function timelineEventInterval(item) {
   const start = Number(item?.start_time);
-  if (!Number.isFinite(start) || !(range?.from < range?.to)) return null;
+  if (!Number.isFinite(start)) return null;
   const candidateEnd = item?.end_time == null ? start : Number(item.end_time);
   const end = Number.isFinite(candidateEnd) && candidateEnd >= start
     ? candidateEnd
     : start;
+  return { start, end };
+}
+
+export function reviewTimelineMarkerGeometry(item, range) {
+  const interval = timelineEventInterval(item);
+  if (!interval || !(range?.from < range?.to)) return null;
+  const { start, end } = interval;
   const top = reviewTimelineMarkerTop(end, range);
   const bottom = reviewTimelineMarkerTop(start, range);
   if (!Number.isFinite(top) || !Number.isFinite(bottom)) return null;
@@ -527,17 +540,6 @@ export function inspectRecordingAvailability(availability, epoch) {
   });
 }
 
-function firstCoveredEpochInInterval(availability, start, end) {
-  const from = Math.max(start, Number(availability?.requested_start));
-  const to = Math.min(end, Number(availability?.requested_end));
-  if (!(from < to)) return null;
-  for (const interval of availability.coverage) {
-    const candidate = Math.max(from, interval.start);
-    if (candidate < Math.min(to, interval.end)) return candidate;
-  }
-  return null;
-}
-
 export function buildRecordingAvailabilityWindow(targetEpoch, bounds = null) {
   const target = Number(targetEpoch);
   if (!Number.isFinite(target)) throw new Error("Recording availability target must be finite.");
@@ -575,6 +577,222 @@ export function planContinuousHandoffPrototype(activeTiming, availability) {
     range,
     coverage: interval ? Object.freeze({ ...interval }) : null
   });
+}
+
+// Shared recording coverage backs timeline gaps and eligible WHITE skipping.
+// Fixed absolute-time windows let pans and zooms reuse answers, and a gap is
+// only ever derived from a window whose availability request succeeded.
+export function recordingCoverageWindowStarts(from, to,
+  windowSeconds = REVIEW_AVAILABILITY_WINDOW_SECONDS) {
+  if (!Number.isFinite(from) || !Number.isFinite(to) || !(from < to)) return [];
+  const starts = [];
+  for (let start = Math.floor(from / windowSeconds) * windowSeconds; start < to;
+    start += windowSeconds) starts.push(start);
+  return starts;
+}
+
+// Gaps are the parts of each successfully queried window that coverage does not
+// reach, clipped to [from, to]. Unqueried, pending, or failed time is not a gap.
+export function confirmedRecordingGaps(windows, from, to) {
+  const gaps = [];
+  const ordered = [...windows].sort((left, right) => left.start - right.start);
+  for (const window of ordered) {
+    let cursor = window.start;
+    for (const interval of [...window.coverage, { start: window.end, end: window.end }]) {
+      const start = Math.max(cursor, from);
+      const end = Math.min(interval.start, window.end, to);
+      if (end - start > REVIEW_COVERAGE_EPSILON_SECONDS) {
+        const previous = gaps[gaps.length - 1];
+        if (previous && start - previous.end <= REVIEW_COVERAGE_EPSILON_SECONDS) {
+          previous.end = end;
+        } else {
+          gaps.push({ start, end });
+        }
+      }
+      cursor = Math.max(cursor, interval.end);
+    }
+  }
+  return gaps;
+}
+
+// The parts of one event that lie inside confirmed gaps. A zero-length event
+// counts when its instant is inside a gap.
+export function recordingGapIntersections(item, gaps) {
+  const interval = timelineEventInterval(item);
+  if (!interval) return [];
+  const { start, end } = interval;
+  const parts = [];
+  for (const gap of gaps) {
+    if (end - start <= REVIEW_COVERAGE_EPSILON_SECONDS) {
+      if (start >= gap.start && start < gap.end) parts.push({ start, end: start });
+      continue;
+    }
+    const from = Math.max(start, gap.start);
+    const to = Math.min(end, gap.end);
+    if (to - from > REVIEW_COVERAGE_EPSILON_SECONDS) parts.push({ start: from, end: to });
+  }
+  return parts;
+}
+
+export class RecordingCoverageCache {
+  constructor({
+    request,
+    onUpdate = () => {},
+    now = () => Date.now() / 1000,
+    concurrency = REVIEW_COVERAGE_CONCURRENCY,
+    windowSeconds = REVIEW_AVAILABILITY_WINDOW_SECONDS
+  }) {
+    this._request = request;
+    this._onUpdate = onUpdate;
+    this._now = now;
+    this._concurrency = concurrency;
+    this._windowSeconds = windowSeconds;
+    this._entries = new Map();
+    this._queue = [];
+    this._playbackQueue = [];
+    this._inFlight = 0;
+  }
+
+  key(camera, windowStart) {
+    return `${camera}@${windowStart}`;
+  }
+
+  // Replace the outstanding wish list with the windows covering [from, to] for
+  // each camera, newest first. Queued work for windows no longer displayed is
+  // dropped; requests already in flight still complete and are cached.
+  want(cameras, from, to) {
+    const now = this._now();
+    const queue = [];
+    for (const start of recordingCoverageWindowStarts(from, to, this._windowSeconds).reverse()) {
+      // Never ask about the newest moments, so an unpublished tail is not a gap.
+      const end = Math.min(start + this._windowSeconds,
+        now - REVIEW_COVERAGE_LIVE_MARGIN_SECONDS);
+      if (!(end - start > REVIEW_COVERAGE_EPSILON_SECONDS)) continue;
+      for (const camera of cameras) {
+        if (!camera) continue;
+        const entry = this._entries.get(this.key(camera, start));
+        if (entry && (entry.state === "pending" || !(entry.expiresAt <= now))) continue;
+        queue.push({ camera, start, end });
+      }
+    }
+    this._queue = queue;
+    this.pump();
+  }
+
+  windowsFor(camera, from, to) {
+    const windows = [];
+    for (const start of recordingCoverageWindowStarts(from, to, this._windowSeconds)) {
+      const availability = this._entries.get(this.key(camera, start))?.availability;
+      if (availability) windows.push({
+        start: availability.requested_start,
+        end: availability.requested_end,
+        coverage: availability.coverage
+      });
+    }
+    return windows;
+  }
+
+  gapsFor(camera, from, to) {
+    return confirmedRecordingGaps(this.windowsFor(camera, from, to), from, to);
+  }
+
+  availabilityAt(camera, epoch) {
+    const start = Math.floor(epoch / this._windowSeconds) * this._windowSeconds;
+    const entry = this._entries.get(this.key(camera, start));
+    return entry?.state === "loaded" && entry.expiresAt > this._now() &&
+      inspectRecordingAvailability(entry.availability, epoch).insideWindow
+      ? entry.availability : null;
+  }
+
+  requirePlaybackWindows(cameras, epoch) {
+    const start = Math.floor(epoch / this._windowSeconds) * this._windowSeconds;
+    const now = this._now();
+    const end = Math.min(start + this._windowSeconds, now - REVIEW_COVERAGE_LIVE_MARGIN_SECONDS);
+    this._playbackQueue = end > epoch ? cameras.filter(camera => {
+      const entry = this._entries.get(this.key(camera, start));
+      return !entry || (entry.state !== "pending" && entry.expiresAt <= now);
+    }).map(camera => ({ camera, start, end })) : [];
+    this.pump();
+  }
+
+  clearPlaybackDemand() {
+    this._playbackQueue = [];
+  }
+
+  evidenceExpiry(cameras, epoch) {
+    const start = Math.floor(epoch / this._windowSeconds) * this._windowSeconds;
+    return Math.min(...cameras.map(camera => this._entries.get(this.key(camera, start))?.expiresAt ?? 0));
+  }
+
+  pump() {
+    while (this._inFlight < this._concurrency && (this._playbackQueue.length || this._queue.length)) {
+      const job = this._playbackQueue.shift() ?? this._queue.shift();
+      const entry = this._entries.get(this.key(job.camera, job.start));
+      if (entry && (entry.state === "pending" || entry.expiresAt > this._now())) continue;
+      this.fetch(job);
+    }
+  }
+
+  fetch({ camera, start, end }) {
+    const key = this.key(camera, start);
+    const entry = {
+      state: "pending",
+      availability: this._entries.get(key)?.availability ?? null,
+      expiresAt: Infinity
+    };
+    this._entries.delete(key);
+    this._entries.set(key, entry);
+    while (this._entries.size > REVIEW_COVERAGE_MAX_ENTRIES) {
+      const disposable = [...this._entries].find(([, value]) => value.state !== "pending");
+      if (!disposable) break;
+      this._entries.delete(disposable[0]);
+    }
+    this._inFlight += 1;
+    let request;
+    try {
+      request = Promise.resolve(this._request(camera, start, end));
+    } catch (error) {
+      request = Promise.reject(error);
+    }
+    request.then(availability => {
+      availability = normalizeRecordingAvailability(availability, camera);
+      if (!(Math.abs(availability?.requested_start - start) <= REVIEW_COVERAGE_EPSILON_SECONDS) ||
+          !(Math.abs(availability?.requested_end - end) <= REVIEW_COVERAGE_EPSILON_SECONDS)) {
+        throw new Error("Recording coverage answered a different interval.");
+      }
+      this.settle(key, entry, availability, start, end);
+    }).catch(() => this.settle(key, entry, null, start, end));
+  }
+
+  settle(key, entry, availability, start, end) {
+    this._inFlight -= 1;
+    if (this._entries.get(key) === entry) {
+      const now = this._now();
+      if (availability) {
+        entry.state = "loaded";
+        entry.availability = availability;
+        entry.expiresAt = end < start + this._windowSeconds
+          ? now + REVIEW_COVERAGE_OPEN_TTL_SECONDS
+          : Infinity;
+      } else {
+        // Keep any earlier confirmed answer; a failure never creates a gap.
+        entry.state = "failed";
+        entry.expiresAt = now + REVIEW_COVERAGE_RETRY_SECONDS;
+      }
+    }
+    this.pump();
+    this._onUpdate();
+  }
+}
+
+export function planRecordingGapSkip(answers, epoch, upper) {
+  if (!answers.length || !Number.isFinite(epoch) || !(epoch < upper)) return { kind: "unknown" };
+  const inspected = answers.map(answer => inspectRecordingAvailability(answer, epoch));
+  if (inspected.some(answer => answer.containing)) return { kind: "covered" };
+  if (inspected.some(answer => !answer.insideWindow)) return { kind: "unknown" };
+  const end = Math.min(upper, ...answers.map(answer => answer.requested_end));
+  const next = Math.min(...inspected.map(answer => answer.nextStart ?? Infinity));
+  return next < end ? { kind: "recording", target: next } : { kind: "empty", end };
 }
 
 export function sanitizeReviewError(error) {
@@ -753,10 +971,12 @@ export class ReviewController {
     datePickerFactory = globalThis.flatpickr,
     queryDebounceMs = REVIEW_QUERY_DEBOUNCE_MS,
     mediaReadyTimeoutMs = REVIEW_MEDIA_READY_TIMEOUT_MS,
+    preparationTimeoutMs = 1500,
     scheduleInitialDeadline = (callback, delay) => {
       const timer = setTimeout(callback, delay);
       return () => clearTimeout(timer);
-    }
+    },
+    recordingCoverage = true
   } = {}) {
     this._document = documentRef;
     this._loadHls = loadHls;
@@ -796,8 +1016,8 @@ export class ReviewController {
     this._historicalPlaybackRange = null;
     this._historicalBoundaryTimer = null;
     this._historicalPreparing = false;
-    this._playRequested = false;
     this._initialDeadlineCancel = null;
+    this._playbackPreparation = null;
     this._historicalStatus = "";
     this._mediaPanels = new Map();
     this._diagnosticTimer = null;
@@ -816,14 +1036,16 @@ export class ReviewController {
     this._now = now;
     this._rhsMode = "timeline";
     this._selectedFilters = new Set();
-    this._reviewOptions = { autoSnapTo: false };
+    this._reviewOptions = { autoSnapTo: false, snapPastCrap: false };
+    this._recordingGapSkipToken = 0;
+    this._recordingGapSkipSearch = null;
+    this._recordingGapAssociations = null;
     this._autoSnapArmed = false;
     this._autoSnapDecisionToken = 0;
     this._autoSnapActiveStart = null;
     this._autoSnapActiveEnd = null;
     this._lastAutoSnapBoundaryCapture = null;
     this._autoSnapBoundaryCaptureSequence = 0;
-    this._autoSnapStartPending = false;
     this._autoSnapDecisions = [];
     this._navigationDiagnostics = [];
     this._navigationDiagnosticSequence = 0;
@@ -844,6 +1066,7 @@ export class ReviewController {
     this._queryDebounceMs = queryDebounceMs;
     this._mediaReadyTimeoutMs = mediaReadyTimeoutMs;
     this._scheduleInitialDeadline = scheduleInitialDeadline;
+    this.setPreparationTimeout(preparationTimeoutMs);
     this._timeline = {
       status: "idle", refreshing: false, complete: false, items: [], error: null, queryRange: null
     };
@@ -853,7 +1076,80 @@ export class ReviewController {
     this._timelineRefreshDeferred = false;
     this._timelineClickSuppressionTimer = null;
     this._sceneExperiment = null;
+    this._recordingCoverageRenderPending = false;
+    this._recordingCoverage = recordingCoverage ? new RecordingCoverageCache({
+      request: (camera, start, end) =>
+        this.requestRecordingAvailability({ frigateCamera: camera }, { start, end }),
+      now: () => this._wallClock() / 1000,
+      onUpdate: () => this.scheduleRecordingCoverageRender()
+    }) : null;
     this.clock = new ReviewClock(now);
+  }
+
+  get _playRequested() {
+    // Derived diagnostic only: a navigation hold is an owned scheduled release.
+    return this._playbackPreparation !== null;
+  }
+
+  setPreparationTimeout(value = 1500) {
+    this._preparationTimeoutMs = typeof value === "number" && Number.isFinite(value)
+      ? Math.min(5000, Math.max(0, value)) : 1500;
+  }
+
+  get playbackRequested() {
+    return this.clock.running || this._playbackPreparation !== null;
+  }
+
+  cancelPlaybackPreparation() {
+    const preparation = this._playbackPreparation;
+    this._playbackPreparation = null;
+    preparation?.cancelDeadline?.();
+  }
+
+  beginPlaybackPreparation(players) {
+    this.cancelPlaybackPreparation();
+    const preparation = {
+      generation: this._generation, requestId: this._reviewRequestId,
+      pending: new Set(players), cancelDeadline: null, starts: []
+    };
+    this._playbackPreparation = preparation;
+    const release = () => this.releasePlaybackPreparation(preparation);
+    if (this._preparationTimeoutMs === 0 || preparation.pending.size === 0) release();
+    else preparation.cancelDeadline = this._scheduleInitialDeadline(release, this._preparationTimeoutMs);
+    this.updateTransport();
+    return preparation;
+  }
+
+  settlePlaybackReadiness(player, preparation = this._playbackPreparation) {
+    if (!preparation || this._playbackPreparation !== preparation ||
+        preparation.requestId !== player.requestId || !this.isCurrentCameraWork(player)) return;
+    const coverage = this.inspectPlayerAvailability(player, this.clock.absoluteTime);
+    // Failed/unknown acquisition consumes the window; only proven gaps are exempt.
+    if (player.lifecycleState === "participating" ||
+        (coverage.insideWindow && !coverage.containing)) preparation.pending.delete(player);
+    if (preparation.pending.size === 0) this.releasePlaybackPreparation(preparation);
+  }
+
+  releasePlaybackPreparation(preparation) {
+    if (this._playbackPreparation !== preparation) return false;
+    if (preparation.generation !== this._generation || preparation.requestId !== this._reviewRequestId ||
+        !this._active || this._suspended || this._presentationMode !== "historical") {
+      this.cancelPlaybackPreparation();
+      return false;
+    }
+    this.cancelPlaybackPreparation();
+    // Literal navigation already positioned the sole clock. Readiness never reanchors it.
+    this.clock.start();
+    for (const player of this._historicalPlayers.values()) {
+      if (!preparation.pending.has(player) && player.lifecycleState === "participating" &&
+          player.video?.paused && player.hls) {
+        preparation.starts.push(this.startOwnedPlayback(player));
+      }
+    }
+    this.scheduleHistoricalBoundaryTimer(preparation.generation, { queueAvailabilityEvaluation: false });
+    this.updateTransport();
+    this.updateDiagnostics();
+    return true;
   }
 
   get timeZone() {
@@ -1325,8 +1621,17 @@ export class ReviewController {
     if (typeof enabled !== "boolean" || this._reviewOptions.autoSnapTo === enabled) return false;
     this.invalidateAutoSnapDecision();
     this._autoSnapArmed = false;
-    this._reviewOptions = { autoSnapTo: enabled };
+    this._reviewOptions = { ...this._reviewOptions, autoSnapTo: enabled };
     const input = this._root?.querySelector(".review-auto-snap-to");
+    if (input) input.checked = enabled;
+    return true;
+  }
+
+  setSnapPastCrap(enabled) {
+    if (typeof enabled !== "boolean" || this._reviewOptions.snapPastCrap === enabled) return false;
+    this.invalidateRecordingGapSkip();
+    this._reviewOptions = { ...this._reviewOptions, snapPastCrap: enabled };
+    const input = this._root?.querySelector(".review-snap-past-crap");
     if (input) input.checked = enabled;
     return true;
   }
@@ -1432,8 +1737,7 @@ export class ReviewController {
       boundaryDecision: { outcome: "interval_end", targetEpoch: capture.event.endEpoch },
       nextDecision: selected,
       nextTargetEpoch: targetEpoch,
-      settlementAtMs: ["seek_requested", "availability_pending"].includes(
-        selected?.outcome) ? null : this._now(),
+      settlementAtMs: selected?.outcome === "seek_requested" ? null : this._now(),
       matchingFailures
     }));
   }
@@ -1441,8 +1745,7 @@ export class ReviewController {
   settleAutoSnapBoundaryCapture(sourceEpoch, outcome, targetEpoch = null, endEpoch = null) {
     const capture = this._lastAutoSnapBoundaryCapture;
     if (!capture || capture.event.endEpoch !== sourceEpoch ||
-        !["seek_requested", "availability_pending"].includes(
-          capture.nextDecision?.outcome)) return;
+        capture.nextDecision?.outcome !== "seek_requested") return;
     capture.nextDecision = { outcome, targetEpoch, endEpoch, sourceEpoch };
     capture.nextTargetEpoch = finiteReviewNumber(targetEpoch);
     capture.settlementAtMs = outcome === "seek_requested" ? null : this._now();
@@ -1529,11 +1832,11 @@ export class ReviewController {
   }
 
   invalidateAutoSnapDecision() {
+    this.invalidateRecordingGapSkip();
     this._autoSnapDecisionToken += 1;
     this._autoSnapArmed = false;
     this._autoSnapActiveStart = null;
     this._autoSnapActiveEnd = null;
-    this._autoSnapStartPending = false;
     this.clearHistoricalBoundaryTimer();
   }
 
@@ -1630,9 +1933,9 @@ export class ReviewController {
     const validOptions = options === undefined ||
       (options && typeof options === "object" && !Array.isArray(options));
     if (!validOptions || (validOptions && options &&
-        (Object.keys(options).some(key => key !== "autoSnapTo") ||
-         (Object.hasOwn(options, "autoSnapTo") &&
-          typeof options.autoSnapTo !== "boolean")))) partial = true;
+        (Object.keys(options).some(key => !["autoSnapTo", "snapPastCrap"].includes(key)) ||
+         ["autoSnapTo", "snapPastCrap"].some(key => Object.hasOwn(options, key) &&
+          typeof options[key] !== "boolean")))) partial = true;
 
     return {
       result: partial ? "partial" : "restored",
@@ -1648,7 +1951,9 @@ export class ReviewController {
         },
         filters: REVIEW_FILTERS.filter(filter => requestedFilters.has(filter)),
         options: { autoSnapTo: validOptions && typeof options?.autoSnapTo === "boolean"
-          ? options.autoSnapTo : false }
+          ? options.autoSnapTo : false,
+          snapPastCrap: validOptions && typeof options?.snapPastCrap === "boolean"
+            ? options.snapPastCrap : false }
       })),
       issues: {
         staleCameras,
@@ -2403,7 +2708,6 @@ export class ReviewController {
     const target = this.getEventNavigationTargets()[direction];
     if (!Number.isFinite(target) || selectedNames.length === 0) return false;
     this.invalidateAutoSnapDecision();
-    this._playRequested = false;
     const generation = this._generation + 1;
     await this.playHistorical(target, {
       autoplay: false,
@@ -2415,10 +2719,7 @@ export class ReviewController {
     if (this._generation !== generation || this._presentationMode !== "historical") {
       return false;
     }
-    if (!this.clock.running) {
-      this.clock.setAbsolute(target);
-      this.updateTransport();
-    }
+    this.updateTransport();
     return true;
   }
 
@@ -2440,7 +2741,6 @@ export class ReviewController {
     if (!Number.isFinite(targetEpoch) || !(range?.from < range?.to) ||
         targetEpoch < range.from || targetEpoch > range.to) return false;
     this.invalidateAutoSnapDecision();
-    if (autoplay === false) this._playRequested = false;
     const displayedNames = this.canonicalCameraNames(displayedQuery.cameraNames);
     const assignedNames = this.canonicalCameraNames(this._selectedCameraNames);
     if (displayedNames.length !== assignedNames.length ||
@@ -2469,7 +2769,7 @@ export class ReviewController {
     }
     if (this._presentationMode === "historical" && Number.isFinite(this.clock.absoluteTime)) {
       return this.seekHistoricalToEpoch(targetEpoch, {
-        autoplay: typeof autoplay === "boolean" ? autoplay : this.clock.running,
+        autoplay: typeof autoplay === "boolean" ? autoplay : this.playbackRequested,
         source, manualPlacement
       });
     }
@@ -2638,8 +2938,16 @@ export class ReviewController {
     autoSnapInput.className = "review-auto-snap-to";
     autoSnapInput.checked = this._reviewOptions.autoSnapTo;
     autoSnapInput.addEventListener("change", () => this.setAutoSnapTo(autoSnapInput.checked));
-    autoSnapLabel.append(autoSnapInput, "Auto Snap To");
+    autoSnapLabel.append(autoSnapInput, "Snap to Event");
     optionsContent.appendChild(autoSnapLabel);
+    const gapSkipLabel = this._document.createElement("label");
+    const gapSkipInput = this._document.createElement("input");
+    gapSkipInput.type = "checkbox";
+    gapSkipInput.className = "review-snap-past-crap";
+    gapSkipInput.checked = this._reviewOptions.snapPastCrap;
+    gapSkipInput.addEventListener("change", () => this.setSnapPastCrap(gapSkipInput.checked));
+    gapSkipLabel.append(gapSkipInput, "Skip Deadspace");
+    optionsContent.appendChild(gapSkipLabel);
     controls.appendChild(this.createSection("options", "Options", optionsContent));
     if (this._debugEnabled) {
       const diagnosticContent = this._document.createElement("div");
@@ -3068,8 +3376,8 @@ export class ReviewController {
       return `<div class="review-timeline-lane-heading" style="--review-camera-color:${lane.color}" title="${name}"><span>${name}</span></div>`;
     }).join("");
     const laneBodies = lanes.map(lane => {
-      const markers = this._timeline.items.filter(item => item.camera_id === lane.cameraId &&
-        item.start_time <= range.to && (item.end_time ?? item.start_time) >= range.from)
+      const laneEvents = this.timelineLaneEvents(lane, range);
+      const markers = laneEvents
         .map(item => {
           const geometry = reviewTimelineMarkerGeometry(item, range);
           if (!geometry) return "";
@@ -3087,8 +3395,9 @@ export class ReviewController {
             : "0%";
           return `<div class="review-timeline-marker${point}" style="top:${top};height:${height};--review-camera-color:${lane.color}"${diagnostics} title="${type}"></div>`;
         }).join("");
-      return `<div class="review-timeline-lane" data-camera-id="${escapeViewerHtml(lane.cameraId ?? "")}" style="--review-camera-color:${lane.color}">${markers}</div>`;
+      return `<div class="review-timeline-lane" data-camera-id="${escapeViewerHtml(lane.cameraId ?? "")}" style="--review-camera-color:${lane.color}">${markers}${this.renderTimelineRecordingGaps(lane, range, laneEvents)}</div>`;
     }).join("");
+    this.requestTimelineRecordingCoverage(lanes, range);
     let message = "";
     if (this._timeline.status === "idle") message = "<div class=\"review-timeline-message\">Loading activity…</div>";
     else if (this._timeline.status === "error") message = `<div class="review-timeline-message error">${this._timeline.error}</div>`;
@@ -3103,6 +3412,62 @@ export class ReviewController {
       "(prefers-reduced-motion: reduce)")?.matches === true;
     const arrival = animateSnap && !reduceMotion ? " review-timeline-snap-arrival" : "";
     return `<div class="review-timeline" aria-label="Review activity timeline" style="--review-timeline-lane-count:${laneCount};--review-timeline-time-gutter:${gutter}">${refresh}<div class="review-timeline-lane-headings"><div class="review-timeline-time-heading">Time</div>${headers}</div><div class="review-timeline-axis${arrival}" role="button" aria-label="Select Review playback time">${ticks}<div class="review-timeline-lanes">${laneBodies}</div>${message}<div class="review-timeline-cursor" hidden aria-hidden="true"><span class="review-timeline-handle" role="slider" aria-label="Drag Review time"></span></div></div></div>`;
+  }
+
+  // Recording gaps are shown only where they overlap an existing event marker:
+  // each segment is the exact intersection of one displayed event and the
+  // confirmed gaps for its camera. Empty timeline regions are never drawn.
+  renderTimelineRecordingGaps(lane, range, events = this.timelineLaneEvents(lane, range)) {
+    if (!this._recordingCoverage || !lane.cameraId || events.length === 0) return "";
+    const gaps = this._recordingCoverage.gapsFor(lane.cameraId, range.from, range.to);
+    return events.flatMap(item => recordingGapIntersections(item, gaps)).map(part => {
+      const geometry = reviewTimelineMarkerGeometry(
+        { start_time: part.start, end_time: part.end }, range);
+      if (!geometry) return "";
+      const diagnostics = this._debugEnabled
+        ? ` data-start-epoch="${geometry.startEpoch}" data-end-epoch="${geometry.endEpoch}"`
+        : "";
+      const point = geometry.height === 0 ? " point" : "";
+      const top = geometry.height > 0
+        ? `min(${geometry.top * 100}%, calc(100% - 1px))`
+        : `${geometry.top * 100}%`;
+      const height = geometry.height > 0 ? `max(${geometry.height * 100}%, 1px)` : "0%";
+      return `<div class="review-timeline-marker-gap${point}" style="top:${top};height:${height}"${diagnostics}></div>`;
+    }).join("");
+  }
+
+  timelineLaneEvents(lane, range) {
+    return this._timeline.items.filter(item => item.camera_id === lane.cameraId &&
+      item.start_time <= range.to && (item.end_time ?? item.start_time) >= range.from);
+  }
+
+  requestTimelineRecordingCoverage(lanes, range) {
+    if (!this._recordingCoverage || !this._active || this._suspended ||
+        typeof this._hass?.callWS !== "function") return;
+    this._recordingCoverage.want(lanes.map(lane => lane.cameraId), range.from, range.to);
+  }
+
+  // Arriving coverage only replaces event gap segments, leaving markers, the cursor,
+  // and any pan, drag, or snap animation on the current timeline untouched.
+  refreshTimelineRecordingGaps() {
+    if (!this._active || this._suspended || this._rhsMode !== "timeline" || !this._root) return;
+    const range = this.ensureTimelineViewport();
+    const elements = [...this._root.querySelectorAll(".review-timeline-lane")];
+    for (const lane of this.getTimelineLanes()) {
+      const element = elements.find(candidate => candidate.dataset.cameraId === lane.cameraId);
+      if (!element) continue;
+      element.querySelectorAll(".review-timeline-marker-gap").forEach(gap => gap.remove());
+      element.insertAdjacentHTML("beforeend", this.renderTimelineRecordingGaps(lane, range));
+    }
+  }
+
+  scheduleRecordingCoverageRender() {
+    if (this._recordingCoverageRenderPending) return;
+    this._recordingCoverageRenderPending = true;
+    queueMicrotask(() => {
+      this._recordingCoverageRenderPending = false;
+      this.refreshTimelineRecordingGaps();
+    });
   }
 
   attachTimelineSelection(content) {
@@ -3249,7 +3614,7 @@ export class ReviewController {
     if (!(range?.from < range?.to)) return;
     event.preventDefault();
     event.stopPropagation();
-    const wasRunning = this.clock.running;
+    const wasRunning = this.playbackRequested;
     if (wasRunning) this.pausePlayback();
     this._timelineDrag = {
       pointerId: event.pointerId,
@@ -3391,7 +3756,7 @@ export class ReviewController {
       if (!this.isCurrentCameraWork(player)) {
         const status = this._document.createElement("div");
         status.className = "review-camera-status";
-        status.textContent = "Preparing...";
+        status.hidden = true;
         media.appendChild(status);
       } else {
         const video = this._document.createElement("video");
@@ -3412,8 +3777,8 @@ export class ReviewController {
       media.appendChild(video);
       const status = this._document.createElement("div");
       status.className = "review-camera-status";
-      status.textContent = player.message ?? "Preparing...";
-      status.hidden = !status.textContent;
+      status.textContent = player.message ?? "";
+      status.hidden = !status.textContent || this.isTransientPreparationMessage(status.textContent);
       player.statusElement = status;
       media.appendChild(status);
       const diagnostic = player.diagnosticReport?.cameras?.[camera.name];
@@ -3634,12 +3999,12 @@ export class ReviewController {
     const back = this._transportRoot?.querySelector(".review-back-ten");
     const forward = this._transportRoot?.querySelector(".review-forward-ten");
     if (pause) {
-      pause.disabled = !inHistorical || (!this.clock.running && !this._playRequested);
-      pause.classList.toggle("selected", inHistorical && this.clock.running);
+      pause.disabled = !inHistorical || !this.playbackRequested;
+      pause.classList.toggle("selected", inHistorical && this.playbackRequested);
     }
     if (play) {
-      play.disabled = !inHistorical || this.clock.running;
-      play.classList.toggle("selected", inHistorical && !this.clock.running);
+      play.disabled = !inHistorical || this.playbackRequested;
+      play.classList.toggle("selected", inHistorical && !this.playbackRequested);
     }
     if (back) back.disabled = !readyHistorical;
     if (forward) forward.disabled = !readyHistorical;
@@ -3668,8 +4033,8 @@ export class ReviewController {
   }
 
   pausePlayback() {
-    if (this._presentationMode !== "historical" || (!this.clock.running && !this._playRequested)) return false;
-    this._playRequested = false;
+    if (this._presentationMode !== "historical" || !this.playbackRequested) return false;
+    this.cancelPlaybackPreparation();
     this.invalidateAutoSnapDecision();
     this._autoSnapArmed = false;
     const players = [...this._historicalPlayers.values()].filter(player =>
@@ -3696,52 +4061,25 @@ export class ReviewController {
   }
 
   resumePlayback() {
-    if (this._presentationMode !== "historical" || this.clock.running) {
-      if (this._reviewOptions.autoSnapTo) this.recordAutoSnapDecision(
-        this.clock.running ? "play_ignored_running" : "play_ignored_not_historical",
-        this.clock.absoluteTime);
-      return false;
-    }
-    this._playRequested = true;
+    if (this._presentationMode !== "historical" || this.playbackRequested) return false;
+    // Only an owned, bounded navigation hold may defer clock release.
     this.invalidateAutoSnapDecision();
     this._autoSnapArmed = this._reviewOptions.autoSnapTo;
-    const selected = [...this._historicalPlayers.values()];
-    const participating = selected.filter(player =>
-      player.lifecycleState === "participating" && player.video);
-    if (!this._historicalPreparing && participating.length === 0 &&
-        selected.some(player => player.lifecycleState === "failed" ||
-          player.continuationRecovery)) {
-      const recoverable = selected.some(player => player.continuationRecovery &&
-        !player.continuationRecovery.exhausted);
-      this._playRequested = recoverable;
-      if (recoverable) void this.queueHistoricalAvailabilityEvaluation("play_recovery");
-      else this._autoSnapArmed = false;
-      this.updateTransport();
-      this.updateDiagnostics();
-      return recoverable;
-    }
     if (this._autoSnapArmed) {
       this.recordAutoSnapDecision("play_requested", this.clock.absoluteTime);
-      if (this._historicalPreparing) {
-        this._autoSnapStartPending = true;
-        this.recordAutoSnapDecision("waiting_for_preparation", this.clock.absoluteTime);
-        this.updateTransport();
-        return true;
-      }
       return this.startAutoSnapProgression();
     }
     if (this._historicalPreparing) {
-      this.updateTransport();
+      this.beginPlaybackPreparation([...this._historicalPlayers.values()]
+        .filter(player => player.lifecycleState !== "participating"));
       return true;
     }
-    const players = participating;
-    if (players.length === 0 && this._historicalPlayers.size === 0) {
-      this._playRequested = false;
-      return false;
-    }
-    this._playRequested = false;
     this.clock.start();
-    players.forEach(player => { void this.startOwnedPlayback(player); });
+    for (const player of this._historicalPlayers.values()) {
+      if (player.lifecycleState === "participating" && player.video) {
+        void this.startOwnedPlayback(player);
+      }
+    }
     this.scheduleHistoricalBoundaryTimer();
     this.updateTransport();
     this.updateDiagnostics();
@@ -3784,7 +4122,7 @@ export class ReviewController {
       }
       diagnostic.selectedEpoch = target;
       const operation = this.seekHistoricalToEpoch(target, {
-        autoplay: this.clock.running || this._playRequested,
+        autoplay: this.playbackRequested,
         source: "VCR seek"
       });
       diagnostic.ownerRequestId = this._reviewRequestId;
@@ -3796,20 +4134,23 @@ export class ReviewController {
   }
 
   async seekHistoricalToEpoch(targetEpoch, {
-    autoplay = this.clock.running,
+    autoplay = this.playbackRequested,
     source = "explicit historical seek",
     autoSnap = false,
     decisionToken = null,
-    manualPlacement = false
+    manualPlacement = false,
+    // Retained for callers of the old API; all autoplay seeks now advance.
+    advanceThroughConfirmedGap = false
   } = {}) {
     const target = Number(targetEpoch);
     if (this._presentationMode !== "historical" || !Number.isFinite(target)) return false;
     if (decisionToken !== null && decisionToken !== this._autoSnapDecisionToken) return false;
     if (!autoSnap && decisionToken === null) this.invalidateAutoSnapDecision();
+    this.cancelPlaybackPreparation();
+    this._initialDeadlineCancel?.();
     const generation = this._generation;
     // Explicit placement supersedes older work even when it reuses the source.
     const requestId = ++this._reviewRequestId;
-    this._playRequested = autoplay;
     this._historicalPreparing = true;
     this.endSyncReport(source);
     const players = [...this._historicalPlayers.values()];
@@ -3819,6 +4160,10 @@ export class ReviewController {
     for (const player of players) {
       for (const cancel of [...player.waitCancellations]) cancel();
       player.requestId = requestId;
+      // A new operation must not await or accept an obsolete availability request.
+      player.availabilityRequestToken += 1;
+      player.availabilityPromise = null;
+      player.initialTimedOut = false;
       player.diagnosticReport = report;
       const diagnostic = report?.cameras?.[player.camera.name];
       if (diagnostic) Object.assign(diagnostic, {
@@ -3853,38 +4198,28 @@ export class ReviewController {
     }
     this.clock.pause();
     this.clock.setAbsolute(target);
+    const preparation = autoplay ? this.beginPlaybackPreparation(players) : null;
+    if (this.enforceHistoricalPlaybackBoundary()) {
+      this._historicalPreparing = false;
+      return true;
+    }
+    this.scheduleHistoricalBoundaryTimer(generation, { queueAvailabilityEvaluation: false });
     if (!manualPlacement) this.revealTimelinePosition(target);
     const results = await this.evaluateHistoricalAvailability(target, {
       explicit: true, reason: source, autoplay: false
     });
-    if (decisionToken !== null && decisionToken !== this._autoSnapDecisionToken) {
-      this.retireSupersededHistoricalSeek(requestId, generation);
-      return false;
-    }
     if (generation !== this._generation || requestId !== this._reviewRequestId ||
         !this._active || this._suspended) return false;
+    await Promise.allSettled(preparation?.starts ?? []);
+    if (requestId !== this._reviewRequestId || generation !== this._generation) return false;
     const playable = players.filter(player =>
       player.lifecycleState === "participating" && player.video && player.hls);
-    const resolvedEpochs = playable
-      .map(player => Number(player.resolvedEpoch))
-      .filter(Number.isFinite);
-    const resolvedEpoch = manualPlacement
-      ? target : resolvedEpochs.length ? Math.min(...resolvedEpochs) : target;
-    this.clock.setAbsolute(resolvedEpoch);
-    if (!manualPlacement) this.revealTimelinePosition(resolvedEpoch);
     this._historicalPreparing = false;
-    if (this._playRequested && playable.length && !this._autoSnapStartPending) {
-      this.clock.start();
-      await Promise.allSettled(playable.map(player => this.startOwnedPlayback(player)));
-    }
-    if (decisionToken !== null && decisionToken !== this._autoSnapDecisionToken) {
-      this.retireSupersededHistoricalSeek(requestId, generation);
-      return false;
+    if (this.clock.running) {
+      await Promise.allSettled(playable.filter(player => player.video.paused)
+        .map(player => this.startOwnedPlayback(player)));
     }
     if (requestId !== this._reviewRequestId || generation !== this._generation) return false;
-    const pendingAutoSnap = this._autoSnapStartPending && this._autoSnapArmed;
-    this._autoSnapStartPending = false;
-    this._playRequested = false;
     if (report && generation === this._generation && this._syncSession === report) {
       const atMs = this._now();
       report.barrier = {
@@ -3903,26 +4238,13 @@ export class ReviewController {
     }
     this._historicalPreparing = false;
     this.updateHistoricalAvailabilityStatus();
-    if (playable.length) this.scheduleHistoricalBoundaryTimer(generation);
+    this.scheduleHistoricalBoundaryTimer(generation);
     this.updateTransport();
     this.updateClockDisplay();
     this.updateDiagnostics();
-    if (pendingAutoSnap) void this.startAutoSnapProgression();
     return true;
   }
 
-  retireSupersededHistoricalSeek(requestId, generation) {
-    if (requestId !== this._reviewRequestId || generation !== this._generation) return;
-    this.clock.pause();
-    for (const player of this._historicalPlayers.values()) player.video?.pause();
-    this._historicalPreparing = false;
-    const pendingAutoSnap = this._autoSnapStartPending && this._autoSnapArmed;
-    this._autoSnapStartPending = false;
-    this._playRequested = false;
-    this.updateTransport();
-    this.updateDiagnostics();
-    if (pendingAutoSnap) void this.startAutoSnapProgression();
-  }
   clearHistoricalBoundaryTimer() {
     if (this._historicalBoundaryTimer === null) return;
     const view = this._root?.ownerDocument?.defaultView ?? globalThis;
@@ -3963,18 +4285,6 @@ export class ReviewController {
       }).catch(() => {});
     }
     return left;
-  }
-
-  pauseClockForStrandedCameras() {
-    if ((!this.clock.running && !this._playRequested) ||
-        [...this._historicalPlayers.values()].some(player =>
-      player.lifecycleState === "participating")) return;
-    this.clock.pause();
-    this._playRequested = [...this._historicalPlayers.values()].some(player =>
-      player.continuationRecovery && !player.continuationRecovery.exhausted);
-    this.clearHistoricalBoundaryTimer();
-    this.updateTransport();
-    this.updateDiagnostics();
   }
 
   enforceHistoricalPresentationBoundary(generation = this._generation) {
@@ -4022,6 +4332,7 @@ export class ReviewController {
     const hls = player.hls;
     if (player.endResolution?.timing === timing &&
         player.endResolution?.hls === hls) return;
+    const requestId = player.requestId;
     const resolution = { timing, hls };
     player.endResolution = resolution;
     try {
@@ -4043,6 +4354,8 @@ export class ReviewController {
           reason: "media_logical_end"
         });
       } catch (error) {
+        if (requestId !== this._reviewRequestId || !this.isCurrentCameraWork(player, generation) ||
+            player.timing !== timing || player.hls !== hls) return;
         this.recordReviewFailure(player, { reason: "availability_api_failure",
           outcome: "retained_after_failure", stage: "availability",
           targetEpoch: logicalWallEnd, occurrence: player.availabilityRequestToken });
@@ -4054,7 +4367,7 @@ export class ReviewController {
         player.video?.pause();
         return;
       }
-      if (!this.isCurrentCameraWork(player, generation) ||
+      if (requestId !== this._reviewRequestId || !this.isCurrentCameraWork(player, generation) ||
           player.timing !== timing || player.hls !== hls) return;
       const boundary = this.inspectPlayerAvailability(player, logicalWallEnd);
       if (!boundary.containing) {
@@ -4079,11 +4392,16 @@ export class ReviewController {
     player.unavailable = unavailable;
     if (player.statusElement) {
       player.statusElement.textContent = message;
-      player.statusElement.hidden = !message || player.holdStartedAtMs != null;
+      player.statusElement.hidden = !message || this.isTransientPreparationMessage(message) ||
+        player.holdStartedAtMs != null;
       player.statusElement.classList.toggle("unavailable", unavailable);
       player.statusElement.classList.toggle("held", player.holdStartedAtMs != null);
     }
     this.updateHistoricalVideoStateBadge(player);
+  }
+
+  isTransientPreparationMessage(message) {
+    return /^(?:Loading(?:\.\.\.|\u2026)|Preparing(?:\.\.\.|\u2026)|Preparing playback\u2026)$/.test(message ?? "");
   }
 
   recordCameraBoundary(player, kind, details = {}) {
@@ -4196,79 +4514,18 @@ export class ReviewController {
       start: range.start,
       end: range.end
     });
-    return normalizeRecordingAvailability(result, player.frigateCamera);
+    const availability = normalizeRecordingAvailability(result, player.frigateCamera);
+    if (Math.abs(availability.requested_start - range.start) > 0.001 ||
+        Math.abs(availability.requested_end - range.end) > 0.001) {
+      throw new Error("Recording availability answered a different interval.");
+    }
+    return availability;
   }
 
   autoSnapDecisionCurrent(token) {
     return token === this._autoSnapDecisionToken && this._active && !this._suspended &&
       this._presentationMode === "historical" && this._reviewOptions.autoSnapTo &&
       this._autoSnapArmed;
-  }
-
-  autoSnapAcquisitionCurrent(token, context, interval) {
-    if (!this.autoSnapDecisionCurrent(token) || !this._playRequested ||
-        this._reviewRequestId !== context.requestId ||
-        this._generation !== context.generation ||
-        this._assignmentRevision !== context.assignmentRevision ||
-        this._queryRefreshCount !== context.queryRefreshCount ||
-        this.canonicalCameraNames(this._selectedCameraNames).join("\u0000") !==
-          context.selectedNames ||
-        context.players.some(player => this._historicalPlayers.get(player.camera.name) !== player)) {
-      return false;
-    }
-    return this.getAutoSnapInventory()?.intervals.some(candidate =>
-      candidate.start === interval.start && candidate.end === interval.end) === true;
-  }
-
-  resolveAutoSnapIntervalTarget(interval, players, token, context, eventInterval) {
-    for (const player of players) {
-      if (this.inspectPlayerAvailability(player, interval.start).containing) {
-        return interval.start;
-      }
-    }
-    let earliest = null;
-    for (const player of players) {
-      const candidate = firstCoveredEpochInInterval(
-        player.availability, interval.start, interval.end);
-      if (candidate !== null && (earliest === null || candidate < earliest)) {
-        earliest = candidate;
-      }
-    }
-    const complete = players.every(player =>
-      player.availability?.requested_start <= interval.start &&
-      player.availability?.requested_end >= interval.end);
-    if (complete) return earliest;
-    return this.fetchAutoSnapIntervalTarget(
-      interval, players, earliest, token, context, eventInterval);
-  }
-
-  async fetchAutoSnapIntervalTarget(interval, players, knownCandidate,
-    token, context, eventInterval) {
-    const searchEnd = knownCandidate ?? interval.end;
-    for (let cursor = interval.start; cursor < searchEnd;) {
-      if (!this.autoSnapAcquisitionCurrent(token, context, eventInterval)) return null;
-      const end = Math.min(searchEnd, cursor + REVIEW_AVAILABILITY_WINDOW_SECONDS);
-      const snapshots = await Promise.all(players.map(async player => {
-        const cached = player.availability;
-        if (cached?.requested_start <= cursor && cached.requested_end >= end) return cached;
-        const fetched = await this.requestRecordingAvailability(player, { start: cursor, end });
-        if (fetched.requested_start > cursor || fetched.requested_end < end) {
-          throw new Error("Auto Snap recording availability was incomplete.");
-        }
-        return fetched;
-      }));
-      if (!this.autoSnapAcquisitionCurrent(token, context, eventInterval)) return null;
-      let earliest = null;
-      for (const availability of snapshots) {
-        const candidate = firstCoveredEpochInInterval(availability, cursor, end);
-        if (candidate !== null && (earliest === null || candidate < earliest)) {
-          earliest = candidate;
-        }
-      }
-      if (earliest !== null) return earliest;
-      cursor = end;
-    }
-    return knownCandidate;
   }
 
   planAutoSnapAt(epoch, inventory) {
@@ -4287,11 +4544,11 @@ export class ReviewController {
   }
 
   stopAutoSnap(outcome, sourceEpoch = this.clock.absoluteTime) {
+    this.invalidateRecordingGapSkip();
+    this.cancelPlaybackPreparation();
     this._autoSnapArmed = false;
     this._autoSnapActiveStart = null;
     this._autoSnapActiveEnd = null;
-    this._autoSnapStartPending = false;
-    this._playRequested = false;
     this.clock.pause();
     this.clearHistoricalBoundaryTimer();
     for (const player of this._historicalPlayers.values()) {
@@ -4307,111 +4564,16 @@ export class ReviewController {
   seekAutoSnapInterval(interval, target, token, sourceEpoch) {
     this._autoSnapActiveStart = interval.start;
     this._autoSnapActiveEnd = interval.end;
-    this._playRequested = true;
     this.recordAutoSnapDecision("seek_requested", sourceEpoch, target, interval.end);
     this.settleAutoSnapBoundaryCapture(sourceEpoch, "seek_requested", target, interval.end);
+    // Navigation commits synchronously. Camera acquisition cannot cancel it.
     const operation = this.seekHistoricalToEpoch(target, {
       autoplay: true, source: "auto snap event", autoSnap: true, decisionToken: token
     });
-    void operation.then(moved => {
-      if (!this.autoSnapDecisionCurrent(token)) return;
-      const playable = [...this._historicalPlayers.values()].some(player =>
-        player.lifecycleState === "participating" && player.video && player.hls);
-      if (!moved || !playable || !this.clock.running ||
-          this.clock.absoluteTime < interval.start ||
-          this.clock.absoluteTime >= interval.end) {
-        this.stopAutoSnap("target_unavailable", sourceEpoch);
-        this.settleAutoSnapBoundaryCapture(sourceEpoch, "target_unavailable",
-          target, interval.end);
-        return;
-      }
-      if (this.enforceAutoSnapBoundary()) return;
-      this.recordAutoSnapDecision("advanced", sourceEpoch, target, interval.end);
-      this.settleAutoSnapBoundaryCapture(sourceEpoch, "advanced", target, interval.end);
-      this.scheduleHistoricalBoundaryTimer();
-    }).catch(() => {
-      if (this.autoSnapDecisionCurrent(token)) {
-        this.stopAutoSnap("target_unavailable", sourceEpoch);
-        this.settleAutoSnapBoundaryCapture(sourceEpoch, "target_unavailable",
-          target, interval.end);
-      }
-    });
+    this.recordAutoSnapDecision("advanced", sourceEpoch, target, interval.end);
+    this.settleAutoSnapBoundaryCapture(sourceEpoch, "advanced", target, interval.end);
+    void operation.catch(() => {});
     return true;
-  }
-
-  async continueAutoSnapProgression(pending, plan, inventory, players,
-    context, token, sourceEpoch) {
-    for (let remaining = inventory.intervals.length; remaining > 0; remaining -= 1) {
-      const target = await pending;
-      if (!this.autoSnapAcquisitionCurrent(token, context, plan.interval)) {
-        if (this.autoSnapDecisionCurrent(token) && this._playRequested) {
-          this.stopAutoSnap("blocked_incomplete", sourceEpoch);
-          this.settleAutoSnapBoundaryCapture(sourceEpoch, "blocked_incomplete");
-        }
-        return;
-      }
-      if (target !== null) {
-        this.seekAutoSnapInterval(plan.interval, target, token, sourceEpoch);
-        return;
-      }
-      this.recordAutoSnapDecision("skipped_unrecorded", sourceEpoch,
-        plan.interval.start, plan.interval.end);
-      plan = this.planAutoSnapAt(plan.interval.end, inventory);
-      if (plan.kind !== "seek") {
-        this.stopAutoSnap(plan.kind, sourceEpoch);
-        this.settleAutoSnapBoundaryCapture(sourceEpoch, plan.kind);
-        return;
-      }
-      pending = this.resolveAutoSnapIntervalTarget(plan.interval, players,
-        token, context, plan.interval);
-    }
-    this.stopAutoSnap("blocked_incomplete", sourceEpoch);
-    this.settleAutoSnapBoundaryCapture(sourceEpoch, "blocked_incomplete");
-  }
-
-  advanceAutoSnapProgression(plan, inventory, token, sourceEpoch) {
-    const players = [...this._historicalPlayers.values()];
-    const selectedNames = this.canonicalCameraNames(this._selectedCameraNames).join("\u0000");
-    if (players.length === 0 || players.some(player =>
-      !player.frigateCamera || !this.isCurrentCameraWork(player, player.generation) ||
-      !this._selectedCameraNames.includes(player.camera.name))) {
-      return this.stopAutoSnap("coverage_unavailable", sourceEpoch);
-    }
-    this._playRequested = true;
-    const context = {
-      requestId: this._reviewRequestId, generation: this._generation,
-      assignmentRevision: this._assignmentRevision,
-      queryRefreshCount: this._queryRefreshCount, selectedNames, players
-    };
-    for (let remaining = inventory.intervals.length; remaining > 0; remaining -= 1) {
-      const acquisition = {
-        start: Math.max(sourceEpoch, plan.interval.start), end: plan.interval.end
-      };
-      const target = this.resolveAutoSnapIntervalTarget(
-        acquisition, players, token, context, plan.interval);
-      if (target instanceof Promise) {
-        this._playRequested = true;
-        this.recordAutoSnapDecision("availability_pending", sourceEpoch,
-          plan.interval.start, plan.interval.end);
-        this.updateTransport();
-        void this.continueAutoSnapProgression(target, plan, inventory, players,
-          context, token, sourceEpoch).catch(() => {
-          if (this.autoSnapDecisionCurrent(token)) {
-            this.stopAutoSnap("coverage_unavailable", sourceEpoch);
-            this.settleAutoSnapBoundaryCapture(sourceEpoch, "coverage_unavailable");
-          }
-        });
-        return true;
-      }
-      if (target !== null) {
-        return this.seekAutoSnapInterval(plan.interval, target, token, sourceEpoch);
-      }
-      this.recordAutoSnapDecision("skipped_unrecorded", sourceEpoch,
-        plan.interval.start, plan.interval.end);
-      plan = this.planAutoSnapAt(plan.interval.end, inventory);
-      if (plan.kind !== "seek") return this.stopAutoSnap(plan.kind, sourceEpoch);
-    }
-    return this.stopAutoSnap("blocked_incomplete", sourceEpoch);
   }
 
   startAutoSnapProgression() {
@@ -4421,41 +4583,38 @@ export class ReviewController {
     const inventory = this.getAutoSnapInventory();
     if (!inventory) return this.stopAutoSnap("blocked_incomplete", sourceEpoch);
     const plan = this.planAutoSnapAt(sourceEpoch, inventory);
-    if (plan.kind === "blocked_ongoing" || plan.kind === "blocked_incomplete" ||
-        plan.kind === "finished" || plan.kind === "awaiting_future_events") {
+    if (plan.kind !== "current" && plan.kind !== "seek") {
       return this.stopAutoSnap(plan.kind, sourceEpoch);
     }
-    if (plan.kind === "current") {
-      const players = [...this._historicalPlayers.values()].filter(player =>
-        player.lifecycleState === "participating" && player.video && player.hls);
-      if (players.length > 0) {
-        this._autoSnapActiveStart = plan.interval.start;
-        this._autoSnapActiveEnd = plan.interval.end;
-        this._playRequested = false;
-        this.clock.start();
-        players.forEach(player => { void this.startOwnedPlayback(player); });
-        this.scheduleHistoricalBoundaryTimer();
-        this.recordAutoSnapDecision("playing_interval", sourceEpoch,
-          sourceEpoch, plan.interval.end);
-        this.updateTransport();
-        return true;
+    if (plan.kind === "seek") {
+      return this.seekAutoSnapInterval(plan.interval, plan.interval.start, token, sourceEpoch);
+    }
+    this._autoSnapActiveStart = plan.interval.start;
+    this._autoSnapActiveEnd = plan.interval.end;
+    if (this._historicalPreparing) {
+      this.beginPlaybackPreparation([...this._historicalPlayers.values()]
+        .filter(player => player.lifecycleState !== "participating"));
+    } else this.clock.start();
+    for (const player of this._historicalPlayers.values()) {
+      if (this.clock.running && player.lifecycleState === "participating" && player.video && player.hls) {
+        void this.startOwnedPlayback(player);
       }
     }
-    if (this._historicalPreparing) {
-      this._autoSnapStartPending = true;
-      this._playRequested = true;
-      this.recordAutoSnapDecision("waiting_for_preparation", sourceEpoch,
-        plan.interval.start, plan.interval.end);
-      this.updateTransport();
-      return true;
-    }
-    return this.advanceAutoSnapProgression(plan, inventory, token, sourceEpoch);
+    this.scheduleHistoricalBoundaryTimer();
+    this.recordAutoSnapDecision("playing_interval", sourceEpoch, sourceEpoch, plan.interval.end);
+    this.updateTransport();
+    return true;
   }
 
   enforceAutoSnapBoundary() {
-    if (!this._autoSnapArmed || !this.clock.running || this._historicalPreparing ||
+    if (!this._autoSnapArmed || !this.clock.running ||
         !Number.isFinite(this._autoSnapActiveEnd) ||
         this.clock.absoluteTime < this._autoSnapActiveEnd) return false;
+    return this.completeAutoSnapInterval();
+  }
+
+  completeAutoSnapInterval() {
+    this.invalidateRecordingGapSkip();
     const end = this._autoSnapActiveEnd;
     const clockEpoch = this.clock.absoluteTime;
     const eventStart = finiteReviewNumber(this._autoSnapActiveStart);
@@ -4474,6 +4633,150 @@ export class ReviewController {
       .reverse().find(decision => decision.outcome !== "interval_end") ?? null;
     this.completeAutoSnapBoundaryCapture(boundaryCapture, nextDecision);
     return true;
+  }
+
+  invalidateRecordingGapSkip() {
+    this._recordingGapSkipToken += 1;
+    this._recordingGapSkipSearch = null;
+    this._recordingCoverage?.clearPlaybackDemand();
+  }
+
+  recordingGapAssociationAt(epoch, cameras, names) {
+    const query = this._displayedReviewQuery;
+    const range = this._historicalPlaybackRange;
+    if (this._timeline.status !== "loaded" || !range ||
+        query?.range?.from !== range.from || query?.range?.to !== range.to ||
+        this.canonicalCameraNames(query.cameraNames).join("\u0000") !== names.join("\u0000")) return null;
+    const selection = cameras.join("\u0000");
+    let cached = this._recordingGapAssociations;
+    if (!cached || cached.items !== this._timeline.items || cached.selection !== selection ||
+        cached.from !== range.from || cached.to !== range.to) {
+      const selected = new Set(cameras);
+      const parts = this._timeline.items.filter(item => selected.has(item.camera_id))
+        .map(item => timelineEventInterval(item)).filter(interval => interval &&
+          interval.end - interval.start > REVIEW_COVERAGE_EPSILON_SECONDS)
+        .map(interval => ({ start: Math.max(range.from, interval.start), end: Math.min(range.to, interval.end) }))
+        .filter(interval => interval.start < interval.end)
+        .sort((a, b) => a.start - b.start || a.end - b.end);
+      const intervals = [];
+      for (const part of parts) {
+        const last = intervals.at(-1);
+        if (last && part.start <= last.end) last.end = Math.max(last.end, part.end);
+        else intervals.push({ ...part });
+      }
+      cached = this._recordingGapAssociations = {
+        items: this._timeline.items, selection, from: range.from, to: range.to, intervals,
+        events: this._timeline.items.filter(item => selected.has(item.camera_id))
+      };
+    }
+    return cached.intervals.find(interval => interval.start <= epoch && epoch < interval.end) ?? null;
+  }
+
+  recordingWhiteEndAt(epoch, cameras, answers) {
+    const range = this._historicalPlaybackRange;
+    const white = cameras.flatMap((camera, index) => {
+      const answer = answers[index];
+      if (!answer) return [];
+      const gaps = confirmedRecordingGaps([{
+        start: answer.requested_start, end: answer.requested_end, coverage: answer.coverage
+      }], range.from, range.to);
+      return this._recordingGapAssociations.events.filter(item => item.camera_id === camera)
+        .flatMap(item => recordingGapIntersections(item, gaps)).filter(part => part.start < part.end);
+    }).sort((a, b) => a.start - b.start || a.end - b.end);
+    let end = null;
+    for (const part of white) {
+      if (end === null && part.start <= epoch && epoch < part.end) end = part.end;
+      else if (end !== null && part.start <= end) end = Math.max(end, part.end);
+    }
+    return end;
+  }
+
+  evaluateRecordingGapSkip() {
+    const cache = this._recordingCoverage;
+    if (!this._reviewOptions.snapPastCrap || !cache || !this._active || this._suspended ||
+        this._presentationMode !== "historical" || !this.clock.running || this._playbackPreparation) return false;
+    const epoch = this.clock.absoluteTime;
+    const names = this.canonicalCameraNames(this._selectedCameraNames);
+    const cameras = names.map(name => this.getFrigateCameraId(this._cameras.find(camera => camera.name === name)));
+    if (!names.length || cameras.some(camera => !camera)) {
+      this.invalidateRecordingGapSkip();
+      return false;
+    }
+    const association = this.recordingGapAssociationAt(epoch, cameras, names);
+    if (!association) {
+      this.invalidateRecordingGapSkip();
+      return false;
+    }
+    const eventEnd = this._autoSnapArmed ? this._autoSnapActiveEnd : null;
+    if (this._reviewOptions.autoSnapTo && !Number.isFinite(eventEnd)) return false;
+    const upper = Math.min(this._historicalPlaybackRange?.to ?? epoch,
+      this._wallClock() / 1000, eventEnd ?? Infinity, association.end);
+    if (!(epoch < upper)) return false;
+    const selection = cameras.join("\u0000");
+    let search = this._recordingGapSkipSearch;
+    if (!search || search.token !== this._recordingGapSkipToken ||
+        search.generation !== this._generation || search.requestId !== this._reviewRequestId ||
+        search.selection !== selection || search.eventStart !== this._autoSnapActiveStart ||
+        search.eventEnd !== eventEnd || search.associationStart !== association.start ||
+        search.associationEnd !== association.end || search.timelineItems !== this._timeline.items ||
+        search.rangeFrom !== this._historicalPlaybackRange.from ||
+        search.rangeTo !== this._historicalPlaybackRange.to || search.validUntil <= this._wallClock() / 1000) {
+      this.invalidateRecordingGapSkip();
+      search = this._recordingGapSkipSearch = {
+        token: this._recordingGapSkipToken, generation: this._generation,
+        requestId: this._reviewRequestId, selection,
+        rangeFrom: this._historicalPlaybackRange.from, rangeTo: this._historicalPlaybackRange.to,
+        eventStart: this._autoSnapActiveStart, eventEnd,
+        associationStart: association.start, associationEnd: association.end, timelineItems: this._timeline.items,
+        from: epoch, cursor: epoch, validUntil: Infinity
+      };
+    }
+    search.from = epoch;
+    search.cursor = Math.max(search.cursor, epoch);
+    // Reuse the shared cache and timer; inspect at most two windows per tick.
+    for (let step = 0; step < 2 && search.cursor < upper; step += 1) {
+      cache.requirePlaybackWindows(cameras, search.cursor);
+      const answers = cameras.map(camera => cache.availabilityAt(camera, search.cursor));
+      let plan = planRecordingGapSkip(answers, search.cursor, upper);
+      if (plan.kind === "unknown") return false;
+      let stopAtWhiteEnd = false;
+      if (plan.kind !== "covered") {
+        const whiteEnd = this.recordingWhiteEndAt(search.cursor, cameras, answers);
+        if (whiteEnd === null && search.cursor === epoch) {
+          this.invalidateRecordingGapSkip();
+          return false;
+        }
+        const end = whiteEnd ?? search.cursor;
+        if (end < (plan.kind === "recording" ? plan.target : plan.end)) {
+          plan = { kind: "empty", end };
+          stopAtWhiteEnd = true;
+        }
+      }
+      search.validUntil = Math.min(search.validUntil, cache.evidenceExpiry(cameras, search.cursor));
+      if (plan.kind === "empty") {
+        search.cursor = plan.end;
+        const current = this.clock.absoluteTime;
+        if (search.cursor === eventEnd && search.from <= current && current < eventEnd) {
+          return this.completeAutoSnapInterval();
+        }
+        if (search.cursor !== upper && !stopAtWhiteEnd) continue;
+      }
+      const target = plan.kind === "recording" ? plan.target : search.cursor;
+      const current = this.clock.absoluteTime;
+      // Each earlier slice proved an empty prefix up to cursor. This window
+      // proves its remaining prefix to target; only the still-forward suffix is skipped.
+      if (!(search.from <= current && current < target)) {
+        this.invalidateRecordingGapSkip();
+        return false;
+      }
+      this.invalidateRecordingGapSkip();
+      void this.seekHistoricalToEpoch(target, {
+        autoplay: true, source: "recording gap skip", autoSnap: this._autoSnapArmed,
+        decisionToken: this._autoSnapArmed ? this._autoSnapDecisionToken : null
+      }).catch(() => {});
+      return true;
+    }
+    return false;
   }
   availabilityWindowForTarget(targetEpoch) {
     return buildRecordingAvailabilityWindow(targetEpoch, this._historicalPlaybackRange);
@@ -4513,22 +4816,29 @@ export class ReviewController {
     transition = null,
     reason = "availability_check"
   } = {}) {
-    this.assertCurrentCameraWork(player, player.generation);
-    if (transition) this.assertCurrentCameraTransition(player, transition);
+    const requestId = player.requestId;
+    const generation = player.generation;
+    const assertOwned = () => {
+      this.assertCurrentCameraWork(player, generation);
+      if (requestId !== this._reviewRequestId || player.initialTimedOut) {
+        throw new Error("Historical availability operation was superseded.");
+      }
+      if (transition) this.assertCurrentCameraTransition(player, transition);
+    };
+    assertOwned();
     if (!force && !this.availabilityNeedsRefresh(player, targetEpoch)) {
       this.updateAvailabilityDiagnostic(player, targetEpoch, reason);
       return player.availability;
     }
     if (player.availabilityPromise) {
       const cached = await player.availabilityPromise;
-      if (transition) this.assertCurrentCameraTransition(player, transition);
+      assertOwned();
       if (!force && !this.availabilityNeedsRefresh(player, targetEpoch)) return cached;
     }
     const range = this.availabilityWindowForTarget(targetEpoch);
     const requestToken = ++player.availabilityRequestToken;
     const request = this.requestRecordingAvailability(player, range).then(availability => {
-      this.assertCurrentCameraWork(player, player.generation);
-      if (transition) this.assertCurrentCameraTransition(player, transition);
+      assertOwned();
       if (requestToken !== player.availabilityRequestToken) {
         throw new Error("Historical availability request was superseded.");
       }
@@ -4725,7 +5035,6 @@ export class ReviewController {
     const video = player.video;
     const oldHls = player.hls;
     try { video.pause(); } catch {}
-    this.clock.pause();
     this.recordContinuousHandoffPrototype(report, "handoff:replace-source", {
       handoffEpoch,
       mediaTime: Number(video.currentTime),
@@ -4784,6 +5093,7 @@ export class ReviewController {
     );
     this.assertCurrentGeneration(generation);
     report.handoff.playbackRateAfterAttachment = Number(video.playbackRate);
+    player.seek = calculateHistoricalSeek(this.clock.absoluteTime, player.timing);
     await this.seekHistoricalPlayer(player, generation);
     video.defaultPlaybackRate = report.rate;
     video.playbackRate = report.rate;
@@ -4794,9 +5104,7 @@ export class ReviewController {
       player.timing.effective_absolute_origin + Number(video.currentTime);
     report.handoff.playbackRateAfterReadiness = Number(video.playbackRate);
 
-    this.clock.setAbsolute(handoffEpoch);
-    this.clock.setRate(report.rate);
-    if (shouldResume) {
+    if (this.clock.running) {
       let playingEventSeen = false;
       const markPlayingEvent = () => { playingEventSeen = true; };
       video.addEventListener("playing", markPlayingEvent, { once: true });
@@ -4805,9 +5113,9 @@ export class ReviewController {
         this._mediaReadyTimeoutMs, player.waitCancellations
       );
       try {
-        this.clock.start();
-        await Promise.resolve(video.play());
+        const started = await this.startOwnedPlayback(player);
         await playing;
+        if (!started) throw new Error("Historical prototype Play failed.");
       } finally {
         video.removeEventListener("playing", markPlayingEvent);
       }
@@ -5474,8 +5782,15 @@ export class ReviewController {
     transition.playPending = true;
     try {
       let play;
-      try { play = Promise.resolve(player.video.play()); }
+      const video = player.video;
+      const hls = player.hls;
+      try { play = Promise.resolve(video.play()); }
       catch (error) { play = Promise.reject(error); }
+      // Interrupting our wait cannot cancel the browser's native Play promise.
+      void play.then(() => {
+        if (this.isCurrentCameraWork(player, transition.generation) &&
+            player.video === video && player.hls === hls && !this.clock.running) video.pause();
+      }, () => {});
       try { await Promise.race([play, deadline, interrupted]); }
       catch (error) {
         const failure = error instanceof Error ? error : new Error(String(error));
@@ -5614,12 +5929,14 @@ export class ReviewController {
     deferInitialPlacement = false
   } = {}) {
     const generation = player.generation;
+    const requestId = player.requestId;
     this.assertCurrentCameraWork(player, generation);
     if (!availabilityKnown) {
       try {
         player.reviewStage = "availability";
         await this.ensureCameraAvailability(player, targetEpoch, { reason });
       } catch (error) {
+        if (requestId !== this._reviewRequestId || !this.isCurrentCameraWork(player, generation)) return false;
         if (player.lifecycleState === "participating") {
           this.recordReviewFailure(player, { reason: "availability_api_failure",
             outcome: "retained_after_failure", stage: "availability", targetEpoch,
@@ -5640,6 +5957,7 @@ export class ReviewController {
       }
     }
     this.assertCurrentCameraWork(player, generation);
+    if (requestId !== this._reviewRequestId) return false;
     let inspected = this.inspectPlayerAvailability(player, targetEpoch);
     if (!inspected.insideWindow || !inspected.containing) {
       this.setCameraLifecycle(player, "unavailable", {
@@ -5759,8 +6077,8 @@ export class ReviewController {
       });
       player.continuationRecovery = null;
       this.installHistoricalLifecycleListeners(player, generation);
-      if (autoplay && !followReviewClock) {
-        await Promise.resolve(player.video.play());
+      if (this.clock.running && !followReviewClock) {
+        if (!await this.startOwnedPlayback(player)) return false;
         this.assertCurrentCameraWork(player, generation);
       }
       this.recordCameraBoundary(player, "join-complete", {
@@ -5768,7 +6086,7 @@ export class ReviewController {
         achievedEpoch: player.initialPlacement?.verifiedFrame
           ? player.initialPlacement.landedEpoch : currentTarget,
         transitionToken: transition.token, playbackRate: player.video.playbackRate,
-        playIntent: (followReviewClock ? this.clock.running : autoplay) ? "playing" : "paused"
+        playIntent: this.clock.running ? "playing" : "paused"
       });
       return true;
     } catch (error) {
@@ -5827,14 +6145,14 @@ export class ReviewController {
         if (!noCoverage && (reason === "presentation_window_exhausted" ||
             reason === "continuation_recovery") &&
             this.inspectPlayerAvailability(player, this.clock.absoluteTime).containing &&
-            (this.clock.running || this._playRequested)) {
+            (this.clock.running)) {
           const attempts = (player.continuationRecovery?.attempts ?? 0) + 1;
           player.continuationRecovery = {
             attempts,
             exhausted: attempts >= REVIEW_CONTINUATION_MAX_ATTEMPTS,
             nextEligibleAtMs: this._now() + REVIEW_CONTINUATION_RETRY_MS * attempts
           };
-          this.pauseClockForStrandedCameras();
+          // Recovery owns only this camera; transport keeps advancing.
         }
         this.syncUnavailable(player.diagnosticReport, generation, player, failureReason);
         this.recordCameraBoundary(player, "join-failed", {
@@ -5866,9 +6184,31 @@ export class ReviewController {
     const transition = player.transition;
     try {
       this.assertCurrentCameraTransition(player, transition);
+      const currentTarget = this.clock.absoluteTime;
+      if (currentTarget !== transition.targetEpoch) {
+        await this.ensureCameraAvailability(player, currentTarget, {
+          transition, reason: "initial_current_time"
+        });
+        this.assertCurrentCameraTransition(player, transition);
+        let mapped;
+        try { mapped = epochToMedia(player.timing, this.clock.absoluteTime); }
+        catch {
+          return await this.prepareCameraAtEpoch(player, this.clock.absoluteTime, {
+            reason: "initial_current_time", followReviewClock: true,
+            autoplay: false, availabilityKnown: true, report
+          });
+        }
+        player.seek = mapped.mediaTime;
+        player.resolvedEpoch = mapped.resolvedEpoch;
+        transition.targetEpoch = this.clock.absoluteTime;
+      }
+      const heldDuringSeek = this._playbackPreparation !== null;
       await this.seekHistoricalPlayer(player, generation, report, transition,
         { observeLanding: true });
       this.assertCurrentCameraTransition(player, transition);
+      if (heldDuringSeek && this.clock.running && this.clock.absoluteTime !== transition.targetEpoch) {
+        return await this.completeInitialPlacement(player, report);
+      }
       player.video.defaultPlaybackRate = this._playbackSpeed;
       player.video.playbackRate = this._playbackSpeed;
       transition.outcome = "participating";
@@ -5908,6 +6248,9 @@ export class ReviewController {
   async waitForInitialPhase(players, action, reason) {
     if (players.length === 0) return;
     const settled = new Set();
+    const ownership = new Map(players.map(player => [player, {
+      requestId: player.requestId, generation: player.generation
+    }]));
     const work = Promise.allSettled(players.map(async player => {
       try { await action(player); }
       finally { settled.add(player); }
@@ -5929,13 +6272,20 @@ export class ReviewController {
     clearDeadline?.();
     if (outcome !== "deadline") return;
     for (const player of players) {
-      if (settled.has(player) || !this.isCurrentCameraWork(player)) continue;
+      const owner = ownership.get(player);
+      if (settled.has(player) || !this.isCurrentCameraWork(player, owner.generation) ||
+          player.requestId !== owner.requestId || this._reviewRequestId !== owner.requestId) continue;
       const stages = player.diagnosticReport?.cameras?.[player.camera.name]?.stages;
-      const failureReason = reason === "initial_landing_deadline" &&
+      const phaseReason = reason === "initial_acquisition_deadline"
+        ? player.reviewStage === "availability" ? "initial_availability_deadline"
+          : ["seek", "landing", "seekable"].includes(player.reviewStage)
+            ? "initial_landing_deadline" : "initial_preparation_deadline"
+        : reason;
+      const failureReason = phaseReason === "initial_landing_deadline" &&
         stages?.targetToleranceMs != null && stages?.readyStateThresholdMs == null
-        ? "post_seek_playability_failure" : reason;
+        ? "post_seek_playability_failure" : phaseReason;
       player.initialTimedOut = true;
-      const ledgerReason = reason === "initial_landing_deadline" &&
+      const ledgerReason = phaseReason === "initial_landing_deadline" &&
         player.reviewStage === "seekable" ? "post_seek_playability_failure" : failureReason;
       this.recordReviewFailure(player, { reason: ledgerReason,
         stage: player.reviewStage, targetEpoch: player.lastTargetEpoch });
@@ -6001,14 +6351,6 @@ export class ReviewController {
       nextCoverageStart: inspected.nextStart,
       outcome: state
     });
-    const anyParticipating = [...this._historicalPlayers.values()]
-      .some(candidate => candidate.lifecycleState === "participating");
-    if (!anyParticipating && [...this._historicalPlayers.values()].some(candidate =>
-      candidate.continuationRecovery)) this.pauseClockForStrandedCameras();
-    if (!anyParticipating && !this.clock.running) {
-      this.clock.pause();
-      this.clearHistoricalBoundaryTimer();
-    }
     this.updateHistoricalAvailabilityStatus();
     this.updateTransport();
     this.updateDiagnostics();
@@ -6024,8 +6366,9 @@ export class ReviewController {
     if (player.lifecycleState === "preparing") return "preparing";
     const recovery = player.continuationRecovery;
     if (player.lifecycleState === "failed" && !explicit &&
+        player.boundaryReason !== "availability_api_failure" &&
         (!recovery || recovery.exhausted ||
-          (!this.clock.running && !this._playRequested) ||
+          !this.clock.running ||
           this._now() < recovery.nextEligibleAtMs)) return "failed";
     if (!explicit && this._historicalPlaybackRange &&
         targetEpoch >= this._historicalPlaybackRange.to) return "at_playback_end";
@@ -6035,7 +6378,12 @@ export class ReviewController {
       await this.ensureCameraAvailability(player, targetEpoch, { reason });
     } catch (error) {
       if (requestId !== this._reviewRequestId || !this.isCurrentCameraWork(player)) return "stale";
+      if (player.lifecycleRevision !== lifecycleRevision) return "superseded";
       if (player.lifecycleState === "participating") {
+        if (explicit) {
+          this.leaveHistoricalCamera(player, "availability_api_failure", targetEpoch, null, "failed");
+          return "availability_failure";
+        }
         this.recordReviewFailure(player, { reason: "availability_api_failure",
           outcome: "retained_after_failure", stage: "availability", targetEpoch,
           occurrence: player.availabilityRequestToken });
@@ -6055,8 +6403,8 @@ export class ReviewController {
     }
     if (requestId !== this._reviewRequestId || !this.isCurrentCameraWork(player, player.generation)) return "stale";
     if (player.lifecycleRevision !== lifecycleRevision) return "superseded";
-    if (recovery && !explicit && !this.clock.running && !this._playRequested) return "paused";
-    if (!explicit && player.lifecycleState !== "participating") {
+    if (recovery && !explicit && !this.clock.running) return "paused";
+    if (explicit || player.lifecycleState !== "participating") {
       targetEpoch = this.clock.absoluteTime;
       if (this.availabilityNeedsRefresh(player, targetEpoch)) {
         try { await this.ensureCameraAvailability(player, targetEpoch, { reason }); }
@@ -6067,6 +6415,7 @@ export class ReviewController {
     }
     const inspected = this.inspectPlayerAvailability(player, targetEpoch);
     player.nextCoverageStart = inspected.nextStart;
+    if (!inspected.insideWindow) return "availability_unknown";
     if (!inspected.containing) {
       if (player.lifecycleState === "participating") {
         this.leaveHistoricalCamera(
@@ -6094,7 +6443,31 @@ export class ReviewController {
         if (!explicit) return "participating";
         player.seek = mapped.mediaTime;
         player.resolvedEpoch = mapped.resolvedEpoch;
-        await this.seekHistoricalPlayer(player, player.generation, player.diagnosticReport);
+        const transition = this.beginCameraTransition(player, "explicit_seek", targetEpoch,
+          { preservePlacement: true });
+        transition.hls = player.hls;
+        const heldDuringSeek = this._playbackPreparation !== null;
+        await this.seekHistoricalPlayer(player, player.generation, player.diagnosticReport, transition,
+          { observeLanding: true });
+        this.assertCurrentCameraTransition(player, transition);
+        if (heldDuringSeek && this.clock.running && this.clock.absoluteTime !== targetEpoch) {
+          const currentTarget = this.clock.absoluteTime;
+          let current;
+          try { current = epochToMedia(player.timing, currentTarget); }
+          catch {
+            return await this.prepareCameraAtEpoch(player, currentTarget, {
+              reason: "explicit_seek_current_time", followReviewClock: true
+            }) ? "prepared" : "prepare_failed";
+          }
+          player.seek = current.mediaTime;
+          player.resolvedEpoch = current.resolvedEpoch;
+          transition.targetEpoch = currentTarget;
+          await this.seekHistoricalPlayer(player, player.generation, player.diagnosticReport, transition,
+            { observeLanding: true });
+          this.assertCurrentCameraTransition(player, transition);
+          targetEpoch = currentTarget;
+        }
+        player.transition = null;
         if (requestId !== this._reviewRequestId || !this.isCurrentCameraWork(player)) return "stale";
         this.setCameraLifecycle(player, "participating", {
           boundaryReason: "explicit_seek_reused_presentation",
@@ -6124,11 +6497,9 @@ export class ReviewController {
         recovery ? "continuation_recovery" :
           reason === "presentation_window_exhausted" ? reason : "availability_entry",
       autoplay,
-      followReviewClock: !explicit,
+      followReviewClock: true,
       availabilityKnown: true
     });
-    if (joined && !explicit && !this.clock.running && this._playRequested &&
-        this.isCurrentCameraWork(player, player.generation)) this.resumePlayback();
     return joined ? "prepared" : "prepare_failed";
   }
 
@@ -6138,8 +6509,7 @@ export class ReviewController {
     autoplay = this.clock.running,
     awaitRejoins = true
   } = {}) {
-    if (this._presentationMode !== "historical" || !this._active || this._suspended ||
-        (this._historicalPreparing && !explicit)) return [];
+    if (this._presentationMode !== "historical" || !this._active || this._suspended) return [];
     const sharedTarget = Number.isFinite(targetEpoch)
       ? Number(targetEpoch)
       : this.clock.absoluteTime;
@@ -6150,14 +6520,21 @@ export class ReviewController {
         const achieved = this.cameraEpochFromMedia(player);
         if (Number.isFinite(achieved)) cameraTarget = achieved;
       }
+      const requestId = player.requestId;
       const operation = this.reconcileHistoricalCamera(player, cameraTarget, {
         explicit, reason, autoplay
       });
-      if (!awaitRejoins && !explicit && player.lifecycleState !== "participating") {
+      if (!awaitRejoins && !explicit) {
         void operation.catch(() => {});
         return { camera: player.camera.name, result: player.lifecycleState };
       }
-      return { camera: player.camera.name, result: await operation };
+      const result = await operation;
+      if (requestId === this._reviewRequestId) this.settlePlaybackReadiness(player);
+      if (explicit && this.isCurrentCameraWork(player) && this.clock.running &&
+          player.lifecycleState === "participating" && player.video?.paused && player.hls) {
+        await this.startOwnedPlayback(player);
+      }
+      return { camera: player.camera.name, result };
     }));
     this.updateHistoricalAvailabilityStatus();
     this.updateTransport();
@@ -6197,8 +6574,11 @@ export class ReviewController {
     this._autoSnapArmed = false;
     const generation = ++this._generation;
     const requestId = ++this._reviewRequestId;
-    this._playRequested = false;
     this.cleanupHistorical();
+    const assertOwned = () => {
+      this.assertCurrentGeneration(generation);
+      if (requestId !== this._reviewRequestId) throw new Error("Historical acquisition was superseded.");
+    };
     try {
       const targetEpoch = parseReviewTimestamp(value);
       if (updateDisplayedRange) this.includeReviewTarget(targetEpoch);
@@ -6243,6 +6623,21 @@ export class ReviewController {
       this._historicalPreparing = true;
       this._historicalStatus = "Preparing playback…";
       this._presentationMode = "historical";
+      const preparation = autoplay
+        ? this.beginPlaybackPreparation([...this._historicalPlayers.values()]) : null;
+      const initialStarts = preparation?.starts ?? [];
+      const view = this._root?.ownerDocument?.defaultView ?? globalThis;
+      this._diagnosticTimer = view.setInterval(() => {
+        if (this.enforceAutoSnapBoundary()) return;
+        if (this.enforceHistoricalPlaybackBoundary()) return;
+        if (this.evaluateRecordingGapSkip()) return;
+        this.enforceHistoricalPresentationBoundary(generation);
+        this.queueHistoricalAvailabilityEvaluation("shared_interval");
+        this.updateClockDisplay();
+        this.updateDiagnostics();
+        this.syncTick(this._syncSession, generation);
+        if (this._sceneExperiment) this.recordSceneEvent(null, "ti-sample");
+      }, 500);
       for (const player of this._historicalPlayers.values()) {
         this.recordIdentityEvent(report, player, "camera-work-created");
       }
@@ -6263,20 +6658,33 @@ export class ReviewController {
       const candidates = players.filter(player => player.frigateCamera);
       await this.waitForInitialPhase(candidates, async player => {
         try {
+          player.reviewStage = "availability";
           await this.ensureCameraAvailability(player, targetEpoch, { reason: "initial_selection" });
-          if (player.initialTimedOut) return;
-          const inspected = this.inspectPlayerAvailability(player, targetEpoch);
+          if (requestId !== this._reviewRequestId || player.initialTimedOut || !this.isCurrentCameraWork(player)) return;
+          const inspected = this.inspectPlayerAvailability(player, this.clock.absoluteTime);
           player.nextCoverageStart = inspected.nextStart;
           if (!inspected.containing) {
-            this.recordReviewFailure(player, { reason: "authoritative_recording_gap",
-              outcome: "no_coverage", stage: "availability", targetEpoch });
             this.setCameraLifecycle(player, "unavailable", {
-              boundaryReason: "authoritative_recording_gap", targetEpoch
+              boundaryReason: inspected.insideWindow ? "authoritative_recording_gap" : "availability_unknown",
+              targetEpoch
             });
-            this.syncUnavailable(report, generation, player, "authoritative_recording_gap");
+            this.syncUnavailable(report, generation, player, player.boundaryReason);
+            return;
+          }
+          await this.prepareCameraAtEpoch(player, this.clock.absoluteTime, {
+            reason: "initial_selection", autoplay: false, followReviewClock: false,
+            report, availabilityKnown: true, deferInitialPlacement: true
+          });
+          assertOwned();
+          if (this.isCurrentCameraTransition(player, player.transition) && player.hls && player.video) {
+            await this.completeInitialPlacement(player, report);
+            if (requestId === this._reviewRequestId && this.clock.running &&
+                player.lifecycleState === "participating" && player.video?.paused) {
+              initialStarts.push(this.startOwnedPlayback(player));
+            }
           }
         } catch (error) {
-          if (player.initialTimedOut) return;
+          if (requestId !== this._reviewRequestId || player.initialTimedOut || !this.isCurrentCameraWork(player)) return;
           this.recordReviewFailure(player, { reason: "availability_api_failure",
             stage: "availability", targetEpoch });
           this.setCameraLifecycle(player, "failed", {
@@ -6284,49 +6692,21 @@ export class ReviewController {
             boundaryReason: "availability_api_failure", targetEpoch
           });
           this.syncUnavailable(report, generation, player, "availability_api_failure");
+        } finally {
+          if (requestId === this._reviewRequestId) this.settlePlaybackReadiness(player);
         }
-      }, "initial_availability_deadline");
-      this.assertCurrentGeneration(generation);
-      const covered = candidates.filter(player =>
-        player.lifecycleState === "preparing" &&
-        this.inspectPlayerAvailability(player, targetEpoch).containing);
-      const Hls = covered.length > 0 ? await this.loadInitialHls() : null;
-      this.assertCurrentGeneration(generation);
-      if (Hls && !Hls.isSupported()) {
-        throw new Error("This browser does not support historical HLS playback.");
-      }
-      await this.waitForInitialPhase(covered, player => this.prepareCameraAtEpoch(
-        player, targetEpoch, {
-          reason: "initial_selection", autoplay: false, followReviewClock: false,
-          report, Hls, availabilityKnown: true, deferInitialPlacement: true
-        }
-      ), "initial_preparation_deadline");
-      this.assertCurrentGeneration(generation);
-      const prepared = covered.filter(player =>
-        this.isCurrentCameraTransition(player, player.transition) && player.hls && player.video);
-      await this.waitForInitialPhase(prepared,
-        player => this.completeInitialPlacement(player, report),
-        "initial_landing_deadline");
-      if (generation !== this._generation || !this._active) return;
+      }, "initial_acquisition_deadline");
+      assertOwned();
+      if (generation !== this._generation || requestId !== this._reviewRequestId || !this._active) return;
       const playable = players.filter(player =>
         player.lifecycleState === "participating" && player.hls && player.video);
-      if (generation !== this._generation || !this._active || this._suspended) return;
+      if (generation !== this._generation || requestId !== this._reviewRequestId || !this._active || this._suspended) return;
       playable.forEach(player => {
         player.video.playbackRate = this._playbackSpeed;
         const diagnostic = this.syncCamera(report, generation, player);
         if (diagnostic) diagnostic.appliedPlaybackRate = player.video.playbackRate;
       });
-      const resolvedEpochs = playable
-        .map(player => Number(player.resolvedEpoch))
-        .filter(Number.isFinite);
-      const resolvedEpoch = manualPlacement ? targetEpoch :
-        resolvedEpochs.length > 0 ? Math.max(...resolvedEpochs) : targetEpoch;
-      this.clock.setAbsolute(resolvedEpoch);
-      const shouldPlay = playable.length > 0 &&
-        (autoplay || this._playRequested) && !this._autoSnapStartPending;
-      if (shouldPlay) {
-        this.clock.start();
-      }
+      const shouldPlay = this.clock.running;
       if (report) {
         const atMs = this._now();
         report.barrier = {
@@ -6338,14 +6718,11 @@ export class ReviewController {
       };
       }
       const starts = shouldPlay
-        ? playable.map(player => this.startOwnedPlayback(player))
+        ? playable.filter(player => player.video.paused).map(player => this.startOwnedPlayback(player))
         : [];
       if (!shouldPlay) playable.forEach(player => this.observeHistoricalFrames(player));
       // The barrier is complete. Per-camera Play waits must not gate availability.
       this._historicalPreparing = false;
-      const pendingAutoSnap = this._autoSnapStartPending && this._autoSnapArmed;
-      this._autoSnapStartPending = false;
-      this._playRequested = false;
       const availableCount = players.filter(player => player.lifecycleState === "participating").length;
       if (report) {
         playable.filter(player => player.lifecycleState === "participating").forEach(player => {
@@ -6359,29 +6736,10 @@ export class ReviewController {
       this.updateHistoricalAvailabilityStatus();
       this.updateTransport();
       this.updateDiagnostics();
-      const view = this._root?.ownerDocument?.defaultView ?? globalThis;
-      if (players.length > 0) {
-        this.scheduleHistoricalBoundaryTimer(generation);
-        this._diagnosticTimer = view.setInterval(() => {
-          if (this.enforceAutoSnapBoundary()) return;
-          if (this.enforceHistoricalPlaybackBoundary()) return;
-          this.enforceHistoricalPresentationBoundary(generation);
-          this.queueHistoricalAvailabilityEvaluation("shared_interval");
-          this.updateClockDisplay();
-          this.updateDiagnostics();
-          this.syncTick(this._syncSession, generation);
-          if (this._sceneExperiment && players.some(player =>
-            player.sceneExperimentSerial === this._sceneExperiment.serial)) {
-            this.recordSceneEvent(null, "ti-sample");
-          }
-        }, 500);
-      }
-      if (pendingAutoSnap) void this.startAutoSnapProgression();
-      await Promise.allSettled(starts);
+      this.scheduleHistoricalBoundaryTimer(generation);
+      await Promise.allSettled([...initialStarts, ...starts]);
       if (generation !== this._generation || requestId !== this._reviewRequestId ||
           !this._active || this._suspended) return;
-      if ([...this._historicalPlayers.values()].every(player =>
-          player.lifecycleState !== "participating" && player.lifecycleState !== "preparing")) this.clock.pause();
       if (report && this._syncSession === report) {
         const count = [...this._historicalPlayers.values()].filter(player =>
           player.lifecycleState === "participating").length;
@@ -6391,17 +6749,15 @@ export class ReviewController {
       }
       this.updateTransport();
     } catch (error) {
-      if (generation !== this._generation) return;
+      if (generation !== this._generation || requestId !== this._reviewRequestId ||
+          !this._active || this._suspended) return;
       if (this._syncSession?.generation === generation) {
         this._syncSession.disposition = "error";
         this._syncSession.terminationReason = "preparation_or_release_error";
         this.updateSyncSummary(this._syncSession);
         this._syncSession = null;
       }
-      this.clock.pause();
-      this._playRequested = false;
       this._historicalPreparing = false;
-      this.invalidateAutoSnapDecision();
       for (const player of this._historicalPlayers.values()) {
         if (!player.unavailable) {
           this.recordReviewFailure(player, { reason: "shared_initialization_failure",
@@ -6519,6 +6875,7 @@ export class ReviewController {
   }
 
   cleanupHistorical() {
+    this.cancelPlaybackPreparation();
     this.invalidateAutoSnapDecision();
     this._initialDeadlineCancel?.();
     this._initialDeadlineCancel = null;

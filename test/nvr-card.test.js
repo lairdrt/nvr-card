@@ -2736,6 +2736,40 @@ test("Review Views render in the Review rail after Layouts and stay separate fro
   assert.equal(card.querySelectorAll(".review-saved-views-body .saved-view-row").length, 0);
 });
 
+test("Review playback options show the renamed labels in one aligned column", t => {
+  const harness = setup(t);
+  const card = harness.createCard();
+  card.setApplicationMode("review");
+  card.querySelector(".review-options-section .sidebar-section-header").click();
+  const controller = card._reviewController;
+  const options = card.querySelector(".review-options-controls");
+  const labels = [...options.querySelectorAll(":scope > label")];
+  assert.deepEqual(labels.map(label => label.textContent.trim()), [
+    "Snap to Event", "Skip Deadspace"
+  ]);
+  assert.equal(harness.window.getComputedStyle(options).display, "grid");
+  assert.equal(harness.window.getComputedStyle(options).gridTemplateColumns, "minmax(0, 1fr)");
+  for (const label of labels) {
+    const style = harness.window.getComputedStyle(label);
+    assert.equal(style.display, "flex");
+    assert.equal(style.alignItems, "center");
+    const input = label.querySelector("input");
+    assert.equal(input.type, "checkbox");
+    assert.equal(input.checked, false);
+    assert.equal(harness.window.getComputedStyle(input).flexShrink, "0");
+  }
+  const eventInput = labels[0].querySelector("input");
+  const gapInput = labels[1].querySelector("input");
+  assert.equal(eventInput.className, "review-auto-snap-to");
+  assert.equal(gapInput.className, "review-snap-past-crap");
+  eventInput.checked = true;
+  eventInput.dispatchEvent(new harness.window.Event("change"));
+  gapInput.checked = true;
+  gapInput.dispatchEvent(new harness.window.Event("change"));
+  assert.equal(JSON.stringify(controller.getReviewOptions()), '{"autoSnapTo":true,"snapPastCrap":true}');
+  assert.equal(JSON.stringify(controller.captureReviewViewState().options), '{"autoSnapTo":true,"snapPastCrap":true}');
+});
+
 test("Review Save Current View uses the Review capture contract and persists once", t => {
   const harness = setup(t);
   const card = harness.createCard();
@@ -2760,8 +2794,8 @@ test("Review Save Current View uses the Review capture contract and persists onc
   assert.deepEqual(savedWhen, { from: 100, to: 200 });
   assert.equal(Object.hasOwn(card._reviewSavedViews[0].state, "timelineViewport"), false);
   assert.equal(Object.hasOwn(card._reviewSavedViews[0].state, "zoomSpanSeconds"), false);
-  assert.equal(JSON.stringify(card._reviewSavedViews[0].state.options), '{"autoSnapTo":false}');
-  assert.equal(JSON.stringify(storedWorkspace(harness, card).reviewSavedViews.views[0].state.options), '{"autoSnapTo":false}');
+  assert.equal(JSON.stringify(card._reviewSavedViews[0].state.options), '{"autoSnapTo":false,"snapPastCrap":false}');
+  assert.equal(JSON.stringify(storedWorkspace(harness, card).reviewSavedViews.views[0].state.options), '{"autoSnapTo":false,"snapPastCrap":false}');
   assert.equal(card._savedViews.length, 0);
 });
 
@@ -2772,18 +2806,40 @@ test("Review Auto Snap option persists in the existing Review Views workspace fi
   const controller = card._reviewController;
   controller.setAutoSnapTo(true);
   const saved = card.saveReviewViewAs("With Auto Snap", controller.captureReviewViewState());
-  assert.equal(JSON.stringify(saved.state.options), '{"autoSnapTo":true}');
+  assert.equal(JSON.stringify(saved.state.options), '{"autoSnapTo":true,"snapPastCrap":false}');
   assert.equal(JSON.stringify(storedWorkspace(harness, card).reviewSavedViews.views[0].state.options),
-    '{"autoSnapTo":true}');
+    '{"autoSnapTo":true,"snapPastCrap":false}');
   assert.equal(card._savedViews.length, 0);
   controller.setAutoSnapTo(false);
   const beforeTi = controller.reviewPosition;
   const beforeMode = controller.state.presentationMode;
   card.querySelector(".review-saved-views-body .saved-view-load").click();
-  assert.equal(JSON.stringify(controller.getReviewOptions()), '{"autoSnapTo":true}');
+  assert.equal(JSON.stringify(controller.getReviewOptions()), '{"autoSnapTo":true,"snapPastCrap":false}');
   assert.equal(controller._autoSnapArmed, false);
   assert.equal(controller.reviewPosition, beforeTi);
   assert.equal(controller.state.presentationMode, beforeMode);
+});
+
+test("Snap Past Crap: Review Saved Views persist both independent options without changing Live Views", t => {
+  const harness = setup(t);
+  const card = harness.createCard();
+  const liveBefore = JSON.stringify(card.captureSavedViewsCollection("live"));
+  card.setApplicationMode("review");
+  const controller = card._reviewController;
+  for (const autoSnapTo of [false, true]) for (const snapPastCrap of [false, true]) {
+    controller.setAutoSnapTo(autoSnapTo);
+    controller.setSnapPastCrap(snapPastCrap);
+    const saved = card.saveReviewViewAs(`Options ${autoSnapTo} ${snapPastCrap}`, controller.captureReviewViewState());
+    const expected = JSON.stringify({ autoSnapTo, snapPastCrap });
+    assert.equal(JSON.stringify(saved.state.options), expected);
+    const persisted = storedWorkspace(harness, card).reviewSavedViews.views.find(view => view.id === saved.id);
+    assert.equal(JSON.stringify(persisted.state.options), expected);
+    controller.setSnapPastCrap(!snapPastCrap);
+    card.querySelector(`.review-saved-views-body [data-saved-view-id="${saved.id}"][data-saved-view-action="load"]`).click();
+    assert.equal(JSON.stringify(controller.getReviewOptions()), expected);
+    assert.equal(card.querySelector(".review-snap-past-crap").checked, snapPastCrap);
+  }
+  assert.equal(JSON.stringify(card.captureSavedViewsCollection("live")), liveBefore);
 });
 
 test("Review Save refuses an invalid desired When range without changing saved Views", t => {
@@ -2821,7 +2877,7 @@ test("Review load uses transactional restore once and does not overwrite the sna
   assert.equal(JSON.stringify(controller.state.desiredReviewRange),
     JSON.stringify({ from: saved.state.when.from, to: saved.state.when.to }));
   assert.equal(JSON.stringify(card._reviewSavedViews[0].state), originalState);
-  assert.equal(JSON.stringify(controller.state.reviewOptions), '{"autoSnapTo":false}');
+  assert.equal(JSON.stringify(controller.state.reviewOptions), '{"autoSnapTo":false,"snapPastCrap":false}');
   assert.equal(card._savedViews.length, 0);
 });
 
@@ -2838,7 +2894,7 @@ test("Review Update, Rename, and Delete affect only the selected Review View", t
   card.querySelector(".review-saved-views-body [data-saved-view-action=overwrite]").click();
   assert.equal(card._reviewSavedViews[0].id, review.id);
   assert.equal(card._reviewSavedViews[0].state.layout, "2x2");
-  assert.equal(JSON.stringify(card._reviewSavedViews[0].state.options), '{"autoSnapTo":false}');
+  assert.equal(JSON.stringify(card._reviewSavedViews[0].state.options), '{"autoSnapTo":false,"snapPastCrap":false}');
   harness.window.prompt = () => "Renamed Review";
   card.querySelector(".review-saved-views-body [data-saved-view-action=rename]").click();
   assert.equal(card._reviewSavedViews[0].name, "Renamed Review");
@@ -2869,7 +2925,7 @@ test("Review View load reports partial and failed restores without changing save
   card.querySelector('.review-saved-views-body [data-saved-view-id="view-1"][data-saved-view-action="load"]').click();
   assert.match(card._reviewSavedViewsMessage, /skipped/);
   assert.equal(controller._reviewAssignments[1], "Front");
-  assert.equal(JSON.stringify(controller.state.reviewOptions), '{"autoSnapTo":false}');
+  assert.equal(JSON.stringify(controller.state.reviewOptions), '{"autoSnapTo":false,"snapPastCrap":false}');
   assert.equal(JSON.stringify(partial.state.options), '{"futurePolicy":true}');
   const savedPartial = JSON.stringify(partial.state);
   controller._reviewLayout = "2x2";

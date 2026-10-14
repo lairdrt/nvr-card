@@ -211,6 +211,7 @@ unknown fields inside `live` are rejected.
 | `camera_aspect_ratio` | Optional string, `"16:9"` | Exactly one colon; both sides must be positive finite numbers. Controls fitting. |
 | `time.format` | Optional string, `24-hour` | `12-hour` or `24-hour` for NVR-generated Review clock displays. Omit `time` to retain 24-hour When and Timeline presentation. |
 | `video_state_badge_position` | Optional string, `bottom-left` | Places the Review camera video-state badge in `top-left`, `top-right`, `bottom-left`, or `bottom-right`. Applies to its Live and Historical presentations; invalid values use `bottom-left`. |
+| `review_preparation_timeout_ms` | Optional number, `1500` milliseconds | Clamped to 0-5000. Navigation holds literal Review time until expected cameras are ready or this timeout expires. `0` releases immediately. Invalid values use 1500. Applies to initial playback, manual playback navigation, and Auto Snap; excluded from Saved Views. Changes apply to the next preparation window. |
 | `live_status.position` | Optional string, `bottom-left` | Valid values are `bottom-left`, `bottom-right`, `top-left`, and `top-right`. Invalid values use `bottom-left`. |
 
 ### Live recovery options
@@ -496,6 +497,22 @@ NVR <short-commit>-<content/manifest-hash>
 
 This identifies deployed source/content state. It is not a semantic release
 version.
+
+### Review Skip Deadspace
+
+Skip Deadspace defaults OFF and independently uses the existing `snapPastCrap`
+Review Saved View option. It skips only confirmed recording gaps within the
+event-associated WHITE intervals shown on the timeline. Leading, interior, and
+trailing white portions use the full event interval and authoritative coverage,
+not the visible recorded portion or minimum-pixel marker size. Point markers do
+not authorize a duration skip. Recording on any selected camera prevents a skip;
+unknown or failed availability also prevents a skip.
+
+With Snap to Event OFF, BLACK time plays continuously, even without recording.
+A trailing white portion stops at the associated interval's end and resumes
+nominal playback there; it does not seek to another event. With both options ON,
+Snap to Event owns event completion and next-event selection. Deliberate seeks
+retain the existing bounded preparation hold.
 
 ## Development method
 
