@@ -3668,6 +3668,10 @@ class NVRCard extends HTMLElement {
         pointer-events: none;
       }
 
+      .review-camera-presentation-kind.unavailable {
+        color: #ef7770;
+      }
+
       .review-camera-close {
         display: grid;
         width: 36px;
@@ -3734,34 +3738,7 @@ class NVRCard extends HTMLElement {
       }
 
       .review-camera-status {
-        position: absolute;
-        inset: 0;
-        z-index: 3;
-        display: grid;
-        min-width: 0;
-        min-height: 0;
-        place-items: center;
-        padding: 8px;
-        background: rgba(0, 0, 0, 0.72);
-        color: #dce6ec;
-        text-align: center;
-        font: 11px/1.3 monospace;
-        pointer-events: none;
-        box-sizing: border-box;
-      }
-
-      .review-camera-status[hidden] {
         display: none !important;
-      }
-
-      .review-camera-status.unavailable {
-        color: #ef7770;
-      }
-
-      .review-camera-status.held {
-        inset: auto 8px 8px auto;
-        padding: 4px 6px;
-        background: rgba(0, 0, 0, 0.75);
       }
 
       .review-empty-state {

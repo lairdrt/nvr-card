@@ -3757,6 +3757,7 @@ export class ReviewController {
         const status = this._document.createElement("div");
         status.className = "review-camera-status";
         status.hidden = true;
+        status.setAttribute("aria-hidden", "true");
         media.appendChild(status);
       } else {
         const video = this._document.createElement("video");
@@ -3778,7 +3779,8 @@ export class ReviewController {
       const status = this._document.createElement("div");
       status.className = "review-camera-status";
       status.textContent = player.message ?? "";
-      status.hidden = !status.textContent || this.isTransientPreparationMessage(status.textContent);
+      status.hidden = true;
+      status.setAttribute("aria-hidden", "true");
       player.statusElement = status;
       media.appendChild(status);
       const diagnostic = player.diagnosticReport?.cameras?.[camera.name];
@@ -3795,9 +3797,11 @@ export class ReviewController {
     name.textContent = camera.name;
     const presentationKind = this._document.createElement("span");
     presentationKind.className = "review-camera-presentation-kind";
-    presentationKind.textContent = this._presentationMode === "live"
-      ? "Live" : this.historicalVideoStateBadge(this._historicalPlayers.get(camera.name));
-    presentationKind.hidden = !presentationKind.textContent;
+    presentationKind.setAttribute("role", "status");
+    presentationKind.setAttribute("aria-live", "polite");
+    presentationKind.setAttribute("aria-atomic", "true");
+    this.renderReviewCameraStatusIndicator(presentationKind, camera,
+      this._historicalPlayers.get(camera.name));
     this.positionVideoStateBadge(presentationKind);
     const close = this._document.createElement("button");
     close.type = "button";
@@ -3857,21 +3861,31 @@ export class ReviewController {
     return panel;
   }
 
-  historicalVideoStateBadge(player) {
-    if (player?.message === "No recording at this time." &&
-        player.statusElement?.hidden === false) return "";
-    return player?.holdStartedAtMs != null &&
-      Number.isFinite(player.heldFrameEpoch) && player.heldCanvas?.hidden === false
-      ? "Ended" : "Historical";
+  reviewCameraStatusIndicator(player) {
+    if (this._presentationMode === "live") return "Live";
+    if (player?.lifecycleState === "failed") return "Unavailable";
+    if (player?.lifecycleState === "unavailable" &&
+        player.boundaryReason === "authoritative_recording_gap") {
+      const coverage = this.inspectPlayerAvailability(player, this.clock.absoluteTime);
+      if (coverage.insideWindow && !coverage.containing) return "No recording";
+    }
+    return "";
+  }
+
+  renderReviewCameraStatusIndicator(badge, camera, player) {
+    const text = this.reviewCameraStatusIndicator(player);
+    if (badge.textContent !== text) badge.textContent = text;
+    badge.hidden = !text;
+    badge.classList.toggle("unavailable", text === "No recording" || text === "Unavailable");
+    const label = text ? `${camera.name}: ${text}` : "";
+    if (badge.getAttribute("aria-label") !== label) badge.setAttribute("aria-label", label);
   }
 
   updateHistoricalVideoStateBadge(player) {
+    if (!player?.camera) return;
     const badge = this._mediaPanels.get(player.camera.name)
       ?.querySelector(".review-camera-presentation-kind");
-    if (badge) {
-      badge.textContent = this.historicalVideoStateBadge(player);
-      badge.hidden = !badge.textContent;
-    }
+    if (badge) this.renderReviewCameraStatusIndicator(badge, player.camera, player);
   }
 
   reconcileHistoricalAssignments() {
@@ -4018,6 +4032,7 @@ export class ReviewController {
   }
 
   updateClockDisplay() {
+    for (const player of this._historicalPlayers.values()) this.updateHistoricalVideoStateBadge(player);
     const output = this._root?.querySelector(".review-time-truth .review-clock-display");
     if (!output) return;
     const absolute = this.reviewPosition;
@@ -4392,16 +4407,9 @@ export class ReviewController {
     player.unavailable = unavailable;
     if (player.statusElement) {
       player.statusElement.textContent = message;
-      player.statusElement.hidden = !message || this.isTransientPreparationMessage(message) ||
-        player.holdStartedAtMs != null;
-      player.statusElement.classList.toggle("unavailable", unavailable);
-      player.statusElement.classList.toggle("held", player.holdStartedAtMs != null);
+      player.statusElement.hidden = true;
     }
     this.updateHistoricalVideoStateBadge(player);
-  }
-
-  isTransientPreparationMessage(message) {
-    return /^(?:Loading(?:\.\.\.|\u2026)|Preparing(?:\.\.\.|\u2026)|Preparing playback\u2026)$/.test(message ?? "");
   }
 
   recordCameraBoundary(player, kind, details = {}) {

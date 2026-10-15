@@ -194,7 +194,7 @@ test("Review toolbar groups and every cell use one non-flow media geometry contr
   assert.match(source, /\.review-camera-panel\s*{[\s\S]*?position:\s*absolute;[\s\S]*?inset:\s*0;[\s\S]*?min-height:\s*0/);
   assert.match(source, /\.review-camera-media\s*{[\s\S]*?position:\s*absolute;[\s\S]*?inset:\s*0;[\s\S]*?min-height:\s*0/);
   assert.match(source, /\.review-historical-video\s*{[\s\S]*?pointer-events:\s*none/);
-  assert.match(source, /\.review-camera-status\s*{[\s\S]*?position:\s*absolute;[\s\S]*?inset:\s*0;[\s\S]*?pointer-events:\s*none/);
+  assert.match(source, /\.review-camera-status\s*{\s*display:\s*none\s*!important;\s*}/);
   assert.doesNotMatch(controller, /setPlayerStatus\([^\n]*["']Ready["']/);
   assert.doesNotMatch(controller, /review-camera-heading/);
 });
@@ -4258,10 +4258,10 @@ test("Gate 1 historical ownership never renders a Review-live image", async t =>
   assert.ok(historicalPanels.every(panel =>
     panel.dataset.presentationMode === "historical" &&
     panel.querySelector("hui-image.review-live-camera") === null &&
-    panel.querySelector(".review-camera-presentation-kind").textContent === "Historical"));
+    panel.querySelector(".review-camera-presentation-kind").textContent === ""));
 });
 
-test("Review Historical badges retain the configured corner and active presentation label", async t => {
+test("normal Review playback hides the indicator and preserves its configured corner", async t => {
   const harness = createHistoricalHarness();
   t.after(() => harness.close());
   harness.controller.setVideoStateBadgePosition("top-right");
@@ -4271,7 +4271,8 @@ test("Review Historical badges retain the configured corner and active presentat
   assert.equal(liveBadge.style.right, "6px");
   await harness.controller.playHistorical(1800000000);
   const badge = harness.root.querySelector(".review-camera-presentation-kind");
-  assert.equal(badge.textContent, "Historical");
+  assert.equal(badge.textContent, "");
+  assert.equal(badge.hidden, true);
   assert.equal(badge.style.top, "6px");
   assert.equal(badge.style.right, "6px");
   assert.equal(badge.style.bottom, "auto");
@@ -4279,7 +4280,7 @@ test("Review Historical badges retain the configured corner and active presentat
   assert.equal(harness.controller.clock.running, true);
 });
 
-test("Review hides the video badge only while no recording is actually displayed", async t => {
+test("Review uses lifecycle and current coverage for exceptions, independently of retained frames", async t => {
   const target = 1800000000;
   const harness = createHistoricalHarness({
     availabilityResponder: message => Promise.resolve({
@@ -4301,23 +4302,215 @@ test("Review hides the video badge only while no recording is actually displayed
   await harness.controller.playHistorical(target, { autoplay: false });
   const missing = harness.controller._historicalPlayers.get("Drive Down");
   assert.equal(missing.statusElement.textContent, "No recording at this time.");
-  assert.equal(missing.statusElement.hidden, false);
-  assert.equal(badge("Drive Down").textContent, "");
-  assert.equal(badge("Drive Down").hidden, true);
-  assert.equal(badge("Drive Up").textContent, "Historical");
-  assert.equal(badge("Drive Up").hidden, false);
+  assert.equal(missing.statusElement.hidden, true);
+  assert.equal(badge("Drive Down").textContent, "No recording");
+  assert.equal(badge("Drive Down").hidden, false);
+  assert.equal(badge("Drive Up").textContent, "");
+  assert.equal(badge("Drive Up").hidden, true);
 
   const up = harness.controller._historicalPlayers.get("Drive Up");
   harness.mediaControls.find(control => control.camera === "Drive Up").emitFrame();
   harness.controller.leaveHistoricalCamera(up, "authoritative_recording_gap", target + 10);
   assert.equal(up.statusElement.hidden, true);
-  assert.equal(badge("Drive Up").textContent, "Ended");
-  assert.equal(badge("Drive Up").hidden, false);
+  assert.equal(badge("Drive Up").textContent, "");
+  assert.equal(badge("Drive Up").hidden, true, "a camera boundary cannot override covered investigation time");
 
   harness.controller.returnToLive();
   assert.equal(badge("Drive Up").textContent, "Live");
   assert.equal(badge("Drive Up").hidden, false);
 });
+
+for (const exception of ["gap", "failure"]) {
+  for (const retainedFrame of [false, true]) {
+    test(`Review ${exception} uses one accessible corner indicator (retained frame=${retainedFrame})`, async t => {
+      const target = 1800000000;
+      let gap = false;
+      const harness = createHistoricalHarness({ availabilityResponder: message => Promise.resolve({
+        camera: message.camera, requested_start: message.start, requested_end: message.end,
+        coverage: gap ? [] : [{ start: message.start, end: message.end }]
+      }) });
+      t.after(() => harness.close());
+      harness.window.HTMLCanvasElement.prototype.getContext = () => ({ drawImage() {} });
+      await harness.controller.playHistorical(target, { autoplay: false });
+      const controller = harness.controller;
+      const player = controller._historicalPlayers.get("Drive Up");
+      if (retainedFrame) harness.mediaControls.find(control => control.camera === "Drive Up").emitFrame();
+      const frameEpoch = player.heldFrameEpoch;
+      const assignments = [...controller.state.reviewAssignments];
+      if (exception === "gap") {
+        gap = true;
+        await controller.ensureCameraAvailability(player, target, { force: true });
+      }
+      controller.leaveHistoricalCamera(player,
+        exception === "gap" ? "authoritative_recording_gap" : "play_rejected",
+        target, target, exception === "gap" ? "unavailable" : "failed");
+      const panel = harness.root.querySelector('.review-camera-panel[data-camera="Drive Up"]');
+      const indicator = panel.querySelector(".review-camera-presentation-kind");
+      const text = exception === "gap" ? "No recording" : "Unavailable";
+      assert.equal(indicator.textContent, text);
+      assert.equal(indicator.hidden, false);
+      assert.equal(indicator.getAttribute("role"), "status");
+      assert.equal(indicator.getAttribute("aria-live"), "polite");
+      assert.equal(indicator.getAttribute("aria-atomic"), "true");
+      assert.equal(indicator.getAttribute("aria-label"), `Drive Up: ${text}`);
+      assert.equal(panel.querySelectorAll('.review-camera-presentation-kind:not([hidden])').length, 1);
+      assert.equal(panel.querySelectorAll('.review-camera-status:not([hidden])').length, 0);
+      assert.equal(player.statusElement.getAttribute("aria-hidden"), "true");
+      assert.equal(player.heldCanvas?.hidden === false, retainedFrame);
+      assert.equal(player.heldFrameEpoch, frameEpoch);
+      assert.deepEqual(controller.state.reviewAssignments, assignments);
+      assert.equal(controller.clock.absoluteTime, target);
+      assert.equal(controller.clock.running, false);
+      assert.equal(player.lifecycleState, exception === "gap" ? "unavailable" : "failed");
+    });
+  }
+}
+
+test("Review indicators ignore messages, held canvases and non-authoritative gap reasons", async t => {
+  const target = 1800000000;
+  const harness = createHistoricalHarness();
+  t.after(() => harness.close());
+  await harness.controller.playHistorical(target, { autoplay: false });
+  const controller = harness.controller;
+  const player = controller._historicalPlayers.get("Drive Up");
+  const indicator = harness.root.querySelector('.review-camera-panel[data-camera="Drive Up"] .review-camera-presentation-kind');
+  const coverage = player.availability;
+  const hls = player.hls;
+  const video = player.video;
+  const callCount = harness.calls.length;
+  const playCount = harness.playCalls.length;
+  const mediaTime = video.currentTime;
+  const assignments = [...controller.state.reviewAssignments];
+  for (const [state, reason, availability] of [
+    ["participating", "initial_selection", coverage],
+    ["preparing", "explicit_seek", { ...coverage, coverage: [] }],
+    ["unavailable", "superseded_by_explicit_seek", { ...coverage, coverage: [] }],
+    ["unavailable", "continuous_presentation_exhausted", { ...coverage, coverage: [] }],
+    ["unavailable", "availability_unknown", null],
+    ["unavailable", "authoritative_recording_gap", null],
+    ["unavailable", "authoritative_recording_gap", coverage],
+    ["unavailable", "prepare_reported_no_recording_suppressed", coverage]
+  ]) {
+    player.availability = availability;
+    controller.setCameraLifecycle(player, state, { boundaryReason: reason, targetEpoch: target });
+    controller.setPlayerStatus(player, "No recording at this time.", true);
+    assert.equal(indicator.textContent, "", `${state}/${reason}`);
+    assert.equal(indicator.hidden, true);
+    assert.equal(player.statusElement.hidden, true);
+  }
+  player.availability = null;
+  controller.setCameraLifecycle(player, "failed", { boundaryReason: "availability_api_failure" });
+  assert.equal(indicator.textContent, "Unavailable", "unknown coverage must not disguise a failed state as a gap");
+  assert.equal(indicator.hidden, false);
+  assert.strictEqual(player.video, video);
+  assert.strictEqual(player.hls, hls);
+  assert.equal(video.currentTime, mediaTime);
+  assert.equal(harness.calls.length, callCount);
+  assert.equal(harness.playCalls.length, playCount);
+  assert.equal(controller.clock.absoluteTime, target);
+  assert.equal(controller.clock.running, false);
+  assert.deepEqual(controller.state.reviewAssignments, assignments);
+});
+
+test("Review gap indication follows investigation time without waiting for camera acquisition", async t => {
+  const target = 1800000000;
+  const harness = createHistoricalHarness();
+  t.after(() => harness.close());
+  await harness.controller.playHistorical(target, { autoplay: false });
+  const controller = harness.controller;
+  const player = controller._historicalPlayers.get("Drive Up");
+  player.availability = { camera: player.frigateCamera,
+    requested_start: target - 10, requested_end: target + 20,
+    coverage: [{ start: target + 5, end: target + 20 }] };
+  controller.setCameraLifecycle(player, "unavailable", { boundaryReason: "authoritative_recording_gap" });
+  const indicator = harness.root.querySelector('.review-camera-panel[data-camera="Drive Up"] .review-camera-presentation-kind');
+  assert.equal(indicator.textContent, "No recording");
+  for (const epoch of [target + 5, target + 25]) {
+    setReviewTi(controller, epoch);
+    controller.updateClockDisplay();
+    assert.equal(indicator.textContent, "", "covered or unanswered TI cannot retain a stale gap indication");
+    assert.equal(indicator.hidden, true);
+    assert.equal(player.lifecycleState, "unavailable");
+    assert.equal(player.boundaryReason, "authoritative_recording_gap");
+    assert.equal(controller.clock.absoluteTime, epoch);
+  }
+});
+
+test("Live, No recording and Unavailable share all configured corners and one renderer", async t => {
+  const target = 1800000000;
+  const harness = createHistoricalHarness();
+  t.after(() => harness.close());
+  const controller = harness.controller;
+  const assertIndicator = (indicator, text, corner) => {
+    const [vertical, horizontal] = corner.split("-");
+    assert.equal(indicator.textContent, text);
+    assert.equal(indicator.hidden, false);
+    assert.equal(indicator.getAttribute("role"), "status");
+    for (const side of ["top", "right", "bottom", "left"]) {
+      assert.equal(indicator.style[side], side === vertical || side === horizontal ? "6px" : "auto");
+    }
+  };
+  for (const corner of ["top-left", "top-right", "bottom-left", "bottom-right"]) {
+    controller.setVideoStateBadgePosition(corner);
+    assertIndicator(harness.root.querySelector(".review-camera-presentation-kind"), "Live", corner);
+  }
+  await controller.playHistorical(target, { autoplay: false });
+  const player = controller._historicalPlayers.get("Drive Up");
+  player.availability = { ...player.availability, coverage: [] };
+  const indicator = harness.root.querySelector('.review-camera-panel[data-camera="Drive Up"] .review-camera-presentation-kind');
+  const hls = player.hls;
+  const video = player.video;
+  for (const corner of ["top-left", "top-right", "bottom-left", "bottom-right"]) {
+    controller.setVideoStateBadgePosition(corner);
+    controller.setCameraLifecycle(player, "unavailable", { boundaryReason: "authoritative_recording_gap" });
+    assertIndicator(indicator, "No recording", corner);
+    controller.setCameraLifecycle(player, "failed", { boundaryReason: "play_rejected" });
+    assertIndicator(indicator, "Unavailable", corner);
+  }
+  assert.strictEqual(player.video, video);
+  assert.strictEqual(player.hls, hls);
+  assert.equal(controller.clock.absoluteTime, target);
+});
+
+for (const rate of [4, 8]) {
+  test(`covered short Snap scenes remain silent through navigation at ${rate}x`, async t => {
+    const base = 1800000000;
+    const when = { from: base - 100, to: base + 200 };
+    let now = 1000;
+    const harness = createHistoricalHarness({ now: () => now,
+      wallClockMs: when.to * 1000, initialReviewRange: when, reviewEvents: [
+        { camera_id: "drive_up", start_time: base, end_time: base + 2 },
+        { camera_id: "drive_up", start_time: base + 100, end_time: base + 102 }
+      ] });
+    t.after(() => harness.close());
+    const controller = await enterEventAutoSnap(harness, base + 0.25, when);
+    controller.setPlaybackSpeed(rate);
+    const player = controller._historicalPlayers.get("Drive Up");
+    const video = player.video;
+    const hls = player.hls;
+    const assignments = [...controller.state.reviewAssignments];
+    const assertSilent = () => {
+      assert.ok([...harness.root.querySelectorAll(".review-camera-presentation-kind")]
+        .every(indicator => indicator.hidden && indicator.textContent === ""));
+      assert.equal(harness.root.querySelectorAll('.review-camera-status:not([hidden])').length, 0);
+    };
+    assertSilent();
+    assert.equal(controller.resumePlayback(), true);
+    await waitForCondition(() => player.lifecycleState === "participating");
+    now += (2 - 0.25) * 1000 / rate;
+    assert.equal(controller.enforceAutoSnapBoundary(), true);
+    assert.equal(controller.clock.absoluteTime, base + 100);
+    assertSilent();
+    await waitForCondition(() => !controller._historicalPreparing &&
+      player.lifecycleState === "participating");
+    assertSilent();
+    assert.equal(controller.clock.running, true);
+    assert.equal(controller.clock.rate, rate);
+    assert.strictEqual(player.video, video);
+    assert.strictEqual(player.hls, hls);
+    assert.deepEqual(controller.state.reviewAssignments, assignments);
+  });
+}
 
 test("Gate 1 identity diagnostics are bounded to sanitized stable identifiers", async t => {
   const harness = createHistoricalHarness();
@@ -4943,12 +5136,12 @@ test("ordinary Review holds a presented frame through a recording gap and clears
   assert.equal(player.heldCanvas, undefined);
   harness.mediaControls.find(control => control.camera === "Drive Up").emitFrame();
   assert.ok(player.heldCanvas);
-  assert.equal(badge.textContent, "Historical");
+  assert.equal(badge.textContent, "");
   const representedEpoch = player.heldFrameEpoch;
   assert.equal(player.heldCanvas.hidden, true);
   harness.controller.leaveHistoricalCamera(player, "authoritative_recording_gap", target + 10);
   assert.equal(player.heldCanvas.hidden, false);
-  assert.equal(badge.textContent, "Ended");
+  assert.equal(badge.textContent, "");
   assert.equal(player.heldFrameEpoch, representedEpoch);
   assert.equal(player.statusElement.hidden, true);
   assert.equal(player.message, "No recording at this time.");
@@ -4964,10 +5157,10 @@ test("ordinary Review holds a presented frame through a recording gap and clears
   assert.equal(await harness.controller.reconcileHistoricalCamera(player, target + 25,
     { explicit: true, autoplay: false }), "prepared");
   assert.equal(player.heldCanvas.hidden, true, "fresh owned rejoin RVFC replaces the held frame");
-  assert.equal(badge.textContent, "Historical");
+  assert.equal(badge.textContent, "");
   harness.mediaControls.filter(control => control.camera === "Drive Up").at(-1).emitFrame();
   assert.equal(player.heldCanvas.hidden, true);
-  assert.equal(badge.textContent, "Historical");
+  assert.equal(badge.textContent, "");
   assert.equal(player.holdStartedAtMs, null);
   assert.equal(player.statusElement.hidden, true);
   assert.deepEqual(harness.controller.state.reviewAssignments.slice(0, 2), selected);
@@ -4997,7 +5190,7 @@ test("ending event annotations do not remove recorded Review video or selected c
     .every(player => player.lifecycleState === "participating" &&
       player.statusElement.hidden && (player.heldCanvas == null || player.heldCanvas.hidden)));
   assert.ok([...harness.root.querySelectorAll(".review-camera-presentation-kind")]
-    .every(badge => badge.textContent === "Historical"));
+    .every(badge => badge.textContent === ""));
   assert.equal(harness.controller.clock.running, false);
 });
 
@@ -5033,7 +5226,7 @@ test("explicit Play continues through an all-camera recording gap and resumes se
     player.heldCanvas.hidden === false && player.statusElement.hidden));
   assert.ok(players.every(player => player.lifecycleState === "unavailable"));
   assert.ok([...harness.root.querySelectorAll(".review-camera-presentation-kind")]
-    .every(badge => badge.textContent === "Ended"));
+    .every(badge => badge.textContent === "No recording" && !badge.hidden));
   assert.deepEqual(harness.controller.state.reviewAssignments, selected);
   assert.equal(harness.controller.reviewPosition, target + 10);
   assert.equal(harness.controller.pausePlayback(), true);
@@ -5047,12 +5240,12 @@ test("explicit Play continues through an all-camera recording gap and resumes se
   assert.equal(harness.controller.clock.running, true);
   assert.equal(harness.starts.length, 4);
   assert.ok([...harness.root.querySelectorAll(".review-camera-presentation-kind")]
-    .every(badge => badge.textContent === "Historical"));
+    .every(badge => badge.textContent === ""));
   for (const control of harness.mediaControls.slice(2)) control.emitFrame();
   assert.ok(players.every(player => player.heldCanvas.hidden &&
     player.holdStartedAtMs == null && player.statusElement.hidden));
   assert.ok([...harness.root.querySelectorAll(".review-camera-presentation-kind")]
-    .every(badge => badge.textContent === "Historical"));
+    .every(badge => badge.textContent === ""));
   assert.deepEqual(harness.controller.state.reviewAssignments, selected);
   assert.equal(harness.controller.getSceneExperimentReport(), null);
 });
@@ -5383,7 +5576,7 @@ test("historical Pause and Play preserve and resume the shared ReviewClock", asy
   assert.ok(players.every(player => player.lifecycleState === "participating" &&
     player.heldCanvas.hidden && player.holdStartedAtMs == null));
   assert.ok([...harness.root.querySelectorAll(".review-camera-presentation-kind")]
-    .every(badge => badge.textContent === "Historical"));
+    .every(badge => badge.textContent === ""));
   assert.equal(pause.disabled, true);
   assert.equal(play.disabled, false);
   play.click();
@@ -5494,7 +5687,7 @@ test("one unavailable recording does not guess or block another camera", async t
   const down = harness.controller._historicalPlayers.get("Drive Down");
   assert.equal(up.unavailable, true);
   assert.equal(up.message, "No recording at this time.");
-  assert.equal(up.statusElement.hidden, false);
+  assert.equal(up.statusElement.hidden, true);
   assert.match(up.statusElement.textContent, /No recording/);
   assert.equal(down.unavailable, false);
   assert.equal(harness.starts.length, 1);
@@ -5567,7 +5760,7 @@ test("historical loading and VCR states are compact and keep event controls disa
   assert.equal(harness.root.querySelector(".review-speed-select").disabled, false);
   assert.equal(harness.root.querySelector(".review-historical-state"), null);
   assert.ok([...harness.root.querySelectorAll(".review-camera-presentation-kind")]
-    .every(badge => badge.textContent === "Historical"));
+    .every(badge => badge.textContent === ""));
   assert.equal(harness.root.querySelector(".review-pause").disabled, true);
   release();
   await run;
@@ -7655,7 +7848,7 @@ test("logical V2 exhaustion preserves a genuine recording gap", async t => {
   assert.equal(gapPlayer.heldCanvas.hidden, false);
   assert.equal(gapHarness.root.querySelector(
     '.review-camera-panel[data-camera="Drive Down"] .review-camera-presentation-kind'
-  ).textContent, "Ended");
+  ).textContent, "");
   assert.equal(gapHarness.controller._historicalPlayers.get("Drive Up").lifecycleState, "participating");
   assert.equal(gapHarness.controller.clock.running, true);
 
@@ -7708,7 +7901,7 @@ test("a finite end without a presented frame never claims a held last frame", as
   setReviewTi(harness.controller, target + 120);
   await harness.controller.resolveHistoricalVideoEnd(player, player.generation);
   assert.equal(player.holdStartedAtMs, undefined);
-  assert.equal(badge.textContent, "Historical");
+  assert.equal(badge.textContent, "");
   await waitForCondition(() => player.lifecycleState === "participating" &&
     player.timing.selected_epoch === target + 120);
 });
@@ -8542,7 +8735,7 @@ async function createContinuationFailureExperiment(t, {
       recoveryAttempts: player.continuationRecovery?.attempts ?? 0,
       recoveryExhausted: player.continuationRecovery?.exhausted ?? false,
       heldFrameVisible: player.heldCanvas?.hidden === false,
-      badge: controller.historicalVideoStateBadge(player),
+      badge: controller.reviewCameraStatusIndicator(player),
       failureReason: failureRecord?.reason ?? null
     };
     trace.push(state);
@@ -8580,7 +8773,7 @@ test("experiment: covered finite presentation continues when successor preparati
     "initial_paused", "playing_initial", "exhausted_preparing_successor", "successor_playing"
   ]);
   assert.equal(trace[2].heldFrameVisible, true);
-  assert.equal(trace[2].badge, "Ended");
+  assert.equal(trace[2].badge, "");
   assert.equal(trace[3].cameraState, "participating");
   assert.equal(trace[3].participatingCount, 1);
   assert.equal(trace[3].heldFrameVisible, false);
@@ -8598,7 +8791,7 @@ for (const rate of [1, 8]) {
     assert.equal(trace[3].cameraState, "failed");
     assert.equal(trace[3].participatingCount, 0);
     assert.equal(trace[3].heldFrameVisible, true);
-    assert.equal(trace[3].badge, "Ended");
+    assert.equal(trace[3].badge, "Unavailable");
     assert.equal(trace[3].clockRunning, true);
     assert.equal(trace[3].playRequested, false);
     assert.equal(trace[3].recoveryAttempts, 1);
@@ -9410,8 +9603,11 @@ for (const failedCamera of ["both", "drive_up"]) {
     }
     assert.equal(controller._historicalPlayers.get("Drive Up").lifecycleState, "failed");
     const failed = controller._historicalPlayers.get("Drive Up");
-    assert.equal(failed.statusElement.hidden, false);
+    assert.equal(failed.statusElement.hidden, true);
     assert.match(failed.statusElement.textContent, /Historical playback unavailable/);
+    const indicator = harness.root.querySelector('.review-camera-panel[data-camera="Drive Up"] .review-camera-presentation-kind');
+    assert.equal(indicator.textContent, "Unavailable");
+    assert.equal(indicator.hidden, false);
   });
 }
 
@@ -10763,6 +10959,9 @@ test("Snap Past Crap: deliberate skip retains bounded preparation, hidden status
   await waitForCondition(() => h.mediaControls.some(control => control.camera === "Drive Up"));
   const up = c._historicalPlayers.get("Drive Up");
   assert.equal(up.statusElement.hidden, true);
+  const indicator = h.root.querySelector('.review-camera-panel[data-camera="Drive Up"] .review-camera-presentation-kind');
+  assert.equal(indicator.textContent, "");
+  assert.equal(indicator.hidden, true);
   h.tick.value += 600;
   h.mediaControls.findLast(control => control.camera === "Drive Up").emitFrame();
   await waitForCondition(() => !c._historicalPreparing);
@@ -10770,6 +10969,8 @@ test("Snap Past Crap: deliberate skip retains bounded preparation, hidden status
   assert.equal(c.clock.running, true);
   assert.equal(c.clock.rate, 4);
   assert.equal(c._playbackPreparation, null);
+  assert.equal(indicator.textContent, "");
+  assert.equal(indicator.hidden, true);
   h.tick.value += 1000;
   assert.equal(c.clock.absoluteTime, SKIP_BASE + 24);
 });
