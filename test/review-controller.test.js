@@ -208,7 +208,9 @@ function createHistoricalHarness({
   scheduleInitialDeadline = null,
   mediaReadyTimeoutMs = 15000, preparationTimeoutMs = 0, now = () => performance.now(),
   wallClockMs = Date.parse("2026-09-10T12:00:00-07:00"), initialReviewRange = null,
-  recordingCoverage = true
+  recordingCoverage = true,
+  // Production defaults to diagnostics OFF; only tests of diagnostic output opt in.
+  debug = false
 } = {}) {
   const window = new Window({ url: "http://localhost/" });
   const starts = [];
@@ -538,7 +540,7 @@ function createHistoricalHarness({
   });
   controller.configure(cameras());
   controller.setSelectedCameraNames(["Drive Up", "Drive Down"]);
-  controller.setDebug(true);
+  controller.setDebug(debug);
   controller.setHass(hass);
   if (initialReviewRange) {
     controller._reviewRange = { ...initialReviewRange };
@@ -1757,7 +1759,7 @@ test("timeline ticks, clipped markers, pointer, and TI share the viewport", asyn
     end_time: wall - 3300, type: "person" };
   const outside = { camera_id: "drive_up", start_time: wall - 6000,
     end_time: wall - 5900, type: "person" };
-  const harness = createHistoricalHarness({
+  const harness = createHistoricalHarness({ debug: true,
     wallClockMs: wall * 1000, initialReviewRange: when, reviewEvents: [event, outside]
   });
   t.after(() => harness.close());
@@ -2331,7 +2333,7 @@ test("compact text mode controls retain correct active semantics", t => {
 });
 
 test("historical players use independent origins and start as one orchestration", async t => {
-  const harness = createHistoricalHarness({ now: () => 1000 });
+  const harness = createHistoricalHarness({ debug: true, now: () => 1000 });
   t.after(() => harness.close());
   const target = 1800000000;
   await harness.controller.playHistorical(target);
@@ -2517,7 +2519,7 @@ test("an early physical ended event is treated as a historical failure", async t
 
 test("gated historical sync report records origins, barrier, advancement and bounded samples", async t => {
   let tick = 1000;
-  const harness = createHistoricalHarness({ now: () => tick });
+  const harness = createHistoricalHarness({ debug: true, now: () => tick });
   t.after(() => harness.close());
   await harness.controller.playHistorical(1800000000, { source: "timeline click" });
   let report = harness.controller.getLatestHistoricalSyncReport();
@@ -2553,7 +2555,7 @@ test("gated historical sync report records origins, barrier, advancement and bou
 
 test("sync reports distinguish preparation failure from post-seek readiness failure and stop on Now", async t => {
   const deadlines = manualInitialDeadlines();
-  const harness = createHistoricalHarness({
+  const harness = createHistoricalHarness({ debug: true,
     unavailable: new Set(["drive_up"]), deferredPlayable: new Set(["Drive Down"]),
     deferredFrame: new Set(["Drive Down"]),
     scheduleInitialDeadline: deadlines.schedule.bind(deadlines)
@@ -2592,7 +2594,7 @@ test("sync diagnostics are disabled by default and history is bounded", async t 
 test("historical startup waits through seeked and post-seek playability for one common release", async t => {
   const deferredSeek = new Set(["Drive Down"]);
   const deferredPlayable = new Set(["Drive Up", "Drive Down"]);
-  const harness = createHistoricalHarness({
+  const harness = createHistoricalHarness({ debug: true,
     deferredSeek,
     deferredPlayable,
     deferredFrame: new Set(["Drive Up", "Drive Down"]),
@@ -3829,7 +3831,7 @@ test("06:53 selection does not intersect later activity or gain synthetic marker
 test("duration markers retain proportional height with a 1px display floor and clipped boundaries", t => {
   const wall = 1800000000;
   const range = { from: wall - 86400, to: wall };
-  const harness = createHistoricalHarness({ wallClockMs: wall * 1000, initialReviewRange: range });
+  const harness = createHistoricalHarness({ debug: true, wallClockMs: wall * 1000, initialReviewRange: range });
   t.after(() => harness.close());
   const controller = harness.controller;
   const events = {
@@ -4019,7 +4021,7 @@ test("Review metadata clamps only the query end while preserving full active Tim
 });
 
 test("a rendered Timeline marker click uses only the active range and starts one historical transition", async t => {
-  const harness = createHistoricalHarness({ reviewEvents: [{
+  const harness = createHistoricalHarness({ debug: true, reviewEvents: [{
     camera_id: "drive_up", start_time: Date.parse("2026-09-10T10:20:00-07:00") / 1000,
     end_time: Date.parse("2026-09-10T10:40:00-07:00") / 1000,
     type: "person", labels: ["person"]
@@ -5734,7 +5736,7 @@ test("relative seek isolation: supersession preserves the newer request despite 
 });
 
 test("minus and plus ten derive coordinated player positions from ReviewClock", async t => {
-  const harness = createHistoricalHarness({ now: () => 1000 });
+  const harness = createHistoricalHarness({ debug: true, now: () => 1000 });
   t.after(() => harness.close());
   await harness.controller.playHistorical(1800000000);
   harness.controller.pausePlayback();
@@ -7196,7 +7198,7 @@ test("unchecked Auto Snap retains continuous playback across event boundaries", 
 });
 test("an initially unavailable camera joins at Review TI without disturbing its peer", async t => {
   const target = 1800000000;
-  const harness = createHistoricalHarness({
+  const harness = createHistoricalHarness({ debug: true,
     now: () => 0,
     availabilityResponder: message => Promise.resolve({
       camera: message.camera,
@@ -9762,7 +9764,7 @@ test("recording coverage cache bounds requests, concurrency, and failure retries
 test("Review timeline recolors only the unrecorded part of a partly recorded event", async t => {
   const event = { camera_id: "drive_up", start_time: GAP_BASE + 1000,
     end_time: GAP_BASE + 3000, type: "person" };
-  const harness = createGapHarness({
+  const harness = createGapHarness({ debug: true,
     reviewEvents: [event],
     availabilityResponder: recordingCoverageResponder({
       drive_up: [{ start: GAP_BASE - 7200, end: GAP_BASE + 1500 },
@@ -9808,7 +9810,7 @@ test("Review timeline leaves a fully recorded event in its original colour", asy
 test("Review timeline recolors an entirely unrecorded event and never empty regions", async t => {
   const event = { camera_id: "drive_up", start_time: GAP_BASE + 1000,
     end_time: GAP_BASE + 3000, type: "person" };
-  const harness = createGapHarness({
+  const harness = createGapHarness({ debug: true,
     reviewEvents: [event],
     availabilityResponder: recordingCoverageResponder({ drive_up: [], drive_down: [] })
   });
@@ -9842,7 +9844,7 @@ test("Review timeline draws nothing for a gap outside every event", async t => {
 
 test("Review timeline recolors a point event inside a gap", async t => {
   const event = { camera_id: "drive_up", start_time: GAP_BASE + 1000, type: "person" };
-  const harness = createGapHarness({
+  const harness = createGapHarness({ debug: true,
     reviewEvents: [event],
     availabilityResponder: recordingCoverageResponder({ drive_up: [], drive_down: [] })
   });
@@ -9857,7 +9859,7 @@ test("Review timeline keeps events unchanged while coverage is pending or failed
   const held = [];
   const event = { camera_id: "drive_up", start_time: GAP_BASE - 1000,
     end_time: GAP_BASE + 1000, type: "person" };
-  const harness = createGapHarness({
+  const harness = createGapHarness({ debug: true,
     reviewEvents: [event],
     availabilityResponder: recordingCoverageResponder({ drive_up: [], drive_down: [] },
       message => new Promise((resolve, reject) => held.push({ message, resolve, reject })))
@@ -9895,7 +9897,7 @@ test("Review timeline event gaps follow camera changes and pan/zoom", async t =>
     { camera_id: "drive_up", start_time: GAP_BASE + 1000, end_time: GAP_BASE + 3000, type: "person" },
     { camera_id: "drive_down", start_time: GAP_BASE + 1000, end_time: GAP_BASE + 3000, type: "car" }
   ];
-  const harness = createGapHarness({
+  const harness = createGapHarness({ debug: true,
     reviewEvents: events,
     availabilityResponder: recordingCoverageResponder({
       drive_up: [{ start: GAP_BASE - 7200, end: GAP_BASE + 1800 },
@@ -10938,7 +10940,7 @@ test("Skip Deadspace white contract: hours of empty BLACK between events never j
 });
 
 test("Skip Deadspace white contract: WHITE PURPLE WHITE skips both whites and resumes BLACK", async t => {
-  const h = await createRecordingSkipHarness(t, { events: [
+  const h = await createRecordingSkipHarness(t, { debug: true, events: [
     { camera_id: "drive_up", start_time: SKIP_BASE + 10, end_time: SKIP_BASE + 100 },
     { camera_id: "drive_up", start_time: SKIP_BASE + 150, end_time: SKIP_BASE + 170 }
   ], coverage: { drive_up: [{ start: SKIP_BASE + 30, end: SKIP_BASE + 70 },
@@ -11112,7 +11114,7 @@ test("Skip Deadspace diagnosis: sparse events never skip continuous recording ac
 for (const eventOverlapsGap of [false, true]) {
   test(`Skip Deadspace diagnosis: actual gap skips only with event overlap=${eventOverlapsGap}`, async t => {
     const when = { from: SKIP_BASE, to: SKIP_BASE + 14400 };
-    const h = await createRecordingSkipHarness(t, { when, coverage: {
+    const h = await createRecordingSkipHarness(t, { debug: true, when, coverage: {
       drive_up: [{ start: when.from, end: SKIP_BASE + 3600 },
         { start: SKIP_BASE + 3900, end: when.to }], drive_down: []
     }, events: [
