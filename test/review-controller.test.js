@@ -7545,6 +7545,315 @@ test("queued availability lets a second camera rejoin while the first prepares",
   assert.equal(down.initialPlacement.requestedEpoch, target + 11);
 });
 
+// The availability queue is driven explicitly here: the real 500 ms heartbeat is
+// stopped so that no unrelated evaluation can satisfy or perturb these contracts.
+async function createAvailabilityQueueHarness(t) {
+  const harness = createHistoricalHarness({ now: () => 1000 });
+  t.after(() => harness.close());
+  const controller = harness.controller;
+  await controller.playHistorical(1800000000, { autoplay: false });
+  harness.window.clearInterval(controller._diagnosticTimer);
+  controller._diagnosticTimer = null;
+  await controller._availabilityEvaluationPromise;
+  assert.equal(controller._availabilityEvaluationPromise, null);
+  let sequence = 0;
+  const evaluations = [];
+  const evaluate = controller.evaluateHistoricalAvailability.bind(controller);
+  const recorder = { next: () => ++sequence, evaluations, controller, gate: null };
+  controller.evaluateHistoricalAvailability = (target, options = {}) => {
+    const entry = { start: ++sequence, end: null, reason: options.reason };
+    evaluations.push(entry);
+    const gate = recorder.gate;
+    const result = (gate ? gate.then(() => evaluate(target, options)) : evaluate(target, options))
+      .finally(() => { entry.end = ++sequence; });
+    recorder.onEvaluation?.(result);
+    return result;
+  };
+  return recorder;
+}
+
+for (const offset of [0, 1, 2, 3, 4, 5, 6]) {
+  test(`availability queue: a request ${offset} microtasks after an evaluation settles is never lost`, async t => {
+    const queue = await createAvailabilityQueueHarness(t);
+    const { controller, evaluations } = queue;
+    let late = null;
+    queue.onEvaluation = result => {
+      queue.onEvaluation = null;
+      late = (async () => {
+        await result.catch(() => {});
+        for (let index = 0; index < offset; index += 1) await Promise.resolve();
+        const requestedAt = queue.next();
+        await controller.queueHistoricalAvailabilityEvaluation("late_request");
+        return requestedAt;
+      })();
+    };
+    await controller.queueHistoricalAvailabilityEvaluation("first_request");
+    const requestedAt = await late;
+    const answering = evaluations.filter(entry => entry.start > requestedAt);
+    assert.ok(answering.length >= 1, "the late request must cause a later evaluation");
+    assert.ok(answering.every(entry => entry.end !== null),
+      "the requester's promise settles only after its evaluation completes");
+    assert.ok(evaluations.length <= 2, "one request causes at most one extra evaluation");
+    assert.equal(controller._availabilityEvaluationPending, false);
+    assert.equal(controller._availabilityEvaluationPromise, null);
+  });
+}
+
+test("availability queue: requests during an evaluation coalesce into one follow-up", async t => {
+  const queue = await createAvailabilityQueueHarness(t);
+  const { controller, evaluations } = queue;
+  let release;
+  queue.gate = new Promise(resolve => { release = resolve; });
+  const first = controller.queueHistoricalAvailabilityEvaluation("first_request");
+  const joined = [1, 2, 3].map(() => controller.queueHistoricalAvailabilityEvaluation("joined"));
+  assert.ok(joined.every(promise => promise === first), "in-flight requests join the owner");
+  assert.equal(controller._availabilityEvaluationPending, true);
+  queue.gate = null;
+  release();
+  await first;
+  assert.equal(evaluations.length, 2);
+  assert.ok(evaluations.every(entry => entry.end !== null));
+  assert.equal(controller._availabilityEvaluationPending, false);
+  assert.equal(controller._availabilityEvaluationPromise, null);
+});
+
+for (const failure of ["rejected", "synchronous throw"]) {
+  test(`availability queue: ownership is released after a ${failure} evaluation`, async t => {
+    const queue = await createAvailabilityQueueHarness(t);
+    const { controller } = queue;
+    const recorded = controller.evaluateHistoricalAvailability;
+    let calls = 0;
+    controller.evaluateHistoricalAvailability = (...args) => {
+      calls += 1;
+      if (calls > 1) return recorded(...args);
+      if (failure === "rejected") return Promise.reject(new Error("evaluation failed"));
+      throw new Error("evaluation threw");
+    };
+    await controller.queueHistoricalAvailabilityEvaluation("failing_request");
+    assert.equal(controller._availabilityEvaluationPromise, null);
+    await controller.queueHistoricalAvailabilityEvaluation("next_request");
+    assert.equal(calls, 2, "a later request must run a new evaluation");
+    assert.equal(controller._availabilityEvaluationPromise, null);
+    assert.equal(controller._availabilityEvaluationPending, false);
+  });
+}
+
+// Availability requests are answered by hand; the shared coverage cache and the real
+// 500 ms heartbeat are disabled so only the operations under test can touch a camera.
+async function createAvailabilityOwnershipHarness(t, { debug = false, autoplay = true } = {}) {
+  const base = 1800000000;
+  const outage = new Set(["drive_up"]);
+  const requests = [];
+  const harness = createHistoricalHarness({ debug, now: () => 1000, recordingCoverage: false,
+    availabilityResponder: message => {
+      if (outage.has(message.camera)) return Promise.reject(new Error("availability outage"));
+      if (message.camera !== "drive_up" && !requests.manual?.has(message.camera)) {
+        return Promise.resolve({ camera: message.camera, requested_start: message.start,
+          requested_end: message.end, coverage: [{ start: message.start, end: message.end }] });
+      }
+      let settle;
+      const promise = new Promise((resolve, reject) => { settle = { resolve, reject }; });
+      requests.push({ camera: message.camera, message,
+        succeed: () => settle.resolve({ camera: message.camera, requested_start: message.start,
+          requested_end: message.end, coverage: [{ start: message.start, end: message.end }] }),
+        fail: () => settle.reject(new Error("availability outage response")) });
+      return promise;
+    } });
+  t.after(() => harness.close());
+  const controller = harness.controller;
+  await controller.playHistorical(base, { autoplay });
+  harness.window.clearInterval(controller._diagnosticTimer);
+  controller._diagnosticTimer = null;
+  await controller._availabilityEvaluationPromise;
+  for (let index = 0; index < 20; index += 1) await Promise.resolve();
+  const up = controller._historicalPlayers.get("Drive Up");
+  const down = controller._historicalPlayers.get("Drive Down");
+  assert.equal(up.lifecycleState, "failed");
+  assert.equal(up.boundaryReason, "availability_api_failure");
+  assert.equal(down.lifecycleState, "participating");
+  const lifecycles = [];
+  const setLifecycle = controller.setCameraLifecycle.bind(controller);
+  controller.setCameraLifecycle = (player, state, options = {}) => {
+    lifecycles.push({ camera: player.camera.name, state, reason: options.boundaryReason ?? null });
+    return setLifecycle(player, state, options);
+  };
+  // Counted at the call site: the ledger itself deduplicates and is only diagnostic.
+  const failureRecords = [];
+  const recordFailure = controller.recordReviewFailure.bind(controller);
+  controller.recordReviewFailure = (player, details = {}) => {
+    failureRecords.push({ camera: player?.camera?.name, reason: details.reason,
+      outcome: details.outcome ?? "failure" });
+    return recordFailure(player, details);
+  };
+  return { harness, controller, base, outage, requests, up, down, lifecycles, failureRecords,
+    downBefore: { hls: down.hls, paused: down.video.paused, pauses: down.video.pauseCount,
+      plays: harness.playCalls.filter(call => call.camera === "Drive Down").length } };
+}
+
+function track(promise) {
+  const tracked = { settled: false, value: undefined };
+  tracked.promise = promise.then(value => {
+    Object.assign(tracked, { settled: true, value });
+    return value;
+  });
+  return tracked;
+}
+
+async function flushMicrotasksUntil(predicate, message) {
+  for (let index = 0; index < 50 && !predicate(); index += 1) await Promise.resolve();
+  assert.ok(predicate(), message);
+}
+
+// Runs action synchronously in the first microtask where predicate holds; returning
+// from an async helper first would let other queued work run past that ordering.
+async function atFirstMicrotask(predicate, action, message) {
+  for (let index = 0; index < 50; index += 1) {
+    if (predicate()) return action();
+    await Promise.resolve();
+  }
+  assert.fail(message);
+}
+
+function assertPeerUndisturbed(scene) {
+  const { down, downBefore, harness } = scene;
+  assert.equal(down.lifecycleState, "participating");
+  assert.strictEqual(down.hls, downBefore.hls);
+  assert.equal(down.video.paused, downBefore.paused);
+  assert.equal(down.video.pauseCount, downBefore.pauses);
+  assert.equal(harness.playCalls.filter(call => call.camera === "Drive Down").length, downBefore.plays);
+}
+
+for (const debug of [false, true]) {
+  test(`availability ownership: an older failure cannot supersede a newer successful recovery (debug=${debug})`, async t => {
+    const scene = await createAvailabilityOwnershipHarness(t, { debug });
+    const { controller, base, outage, requests, up, lifecycles, failureRecords, harness } = scene;
+    outage.delete("drive_up");
+    setReviewTi(controller, base + 7);
+    const older = track(controller.reconcileHistoricalCamera(up, base + 7, { reason: "older" }));
+    assert.equal(requests.length, 1);
+    const revisionBeforeFailure = up.lifecycleRevision;
+    requests[0].fail();
+    // The exact race: the older request has released its promise, but its failure
+    // has not yet been applied, when the newer recovery issues its own request.
+    const newer = await atFirstMicrotask(() => up.availabilityPromise === null, () => {
+      assert.equal(up.lifecycleRevision, revisionBeforeFailure,
+        "the older failure must still be pending application");
+      return track(controller.reconcileHistoricalCamera(up, base + 7, { reason: "newer" }));
+    }, "the older request must release its in-flight promise");
+    assert.equal(requests.length, 2, "the newer recovery issues its own request");
+    await older.promise;
+    assert.equal(older.value, "superseded");
+    assert.equal(up.lifecycleRevision, revisionBeforeFailure, "a stale failure cannot change the revision");
+    assert.deepEqual(failureRecords, [], "a stale failure is not recorded");
+    requests[1].succeed();
+    assert.equal(await newer.promise, "prepared");
+    assert.equal(up.lifecycleState, "participating");
+    assert.equal(lifecycles.some(entry => entry.camera === "Drive Up" && entry.state === "failed"), false);
+    const prepare = harness.calls.filter(call =>
+      call.type === "frigate_max/v2/vod/prepare" && call.camera === "drive_up").at(-1);
+    assert.equal(prepare.target, base + 7, "recovery acquires at the current Review TI");
+    assert.equal(up.resolvedEpoch, base + 7);
+    assert.equal(up.initialPlacement.landedEpoch, base + 7);
+    assert.equal(up.video.paused, false, "the recovered camera follows Play intent");
+    assert.equal(controller.clock.running, true);
+    assertPeerUndisturbed(scene);
+    assert.equal(controller._availabilityEvaluationPromise, null);
+    assert.equal(controller._availabilityEvaluationPending, false);
+  });
+}
+
+test("availability ownership: a current failure still fails the camera", async t => {
+  const scene = await createAvailabilityOwnershipHarness(t);
+  const { controller, base, outage, requests, up, lifecycles, failureRecords } = scene;
+  outage.delete("drive_up");
+  const revision = up.lifecycleRevision;
+  const attempt = track(controller.reconcileHistoricalCamera(up, base, { reason: "current" }));
+  requests[0].fail();
+  assert.equal(await attempt.promise, "availability_failure");
+  assert.equal(up.lifecycleState, "failed");
+  assert.equal(up.boundaryReason, "availability_api_failure");
+  assert.equal(up.lifecycleRevision, revision + 1);
+  assert.deepEqual(lifecycles.filter(entry => entry.camera === "Drive Up"),
+    [{ camera: "Drive Up", state: "failed", reason: "availability_api_failure" }]);
+  assert.deepEqual(failureRecords,
+    [{ camera: "Drive Up", reason: "availability_api_failure", outcome: "failure" }]);
+  assertPeerUndisturbed(scene);
+});
+
+test("availability ownership: a newer attempt joining an in-flight request shares its genuine failure", async t => {
+  const scene = await createAvailabilityOwnershipHarness(t);
+  const { controller, base, outage, requests, up, lifecycles } = scene;
+  outage.delete("drive_up");
+  const older = track(controller.reconcileHistoricalCamera(up, base, { reason: "older" }));
+  const newer = track(controller.reconcileHistoricalCamera(up, base, { reason: "newer" }));
+  assert.equal(requests.length, 1, "the newer attempt joins the in-flight request");
+  requests[0].fail();
+  await Promise.all([older.promise, newer.promise]);
+  assert.deepEqual([older.value, newer.value], ["availability_failure", "superseded"]);
+  assert.equal(up.lifecycleState, "failed");
+  assert.equal(lifecycles.filter(entry => entry.camera === "Drive Up" && entry.state === "failed").length, 1);
+  assertPeerUndisturbed(scene);
+});
+
+test("availability ownership: a stale success cannot overwrite a newer request's failure", async t => {
+  const scene = await createAvailabilityOwnershipHarness(t, { autoplay: false });
+  const { controller, base, outage, requests, up } = scene;
+  outage.delete("drive_up");
+  const older = track(controller.reconcileHistoricalCamera(up, base, { reason: "older" }));
+  assert.equal(requests.length, 1);
+  const seek = controller.seekHistoricalToEpoch(base + 5, { autoplay: false });
+  await flushMicrotasksUntil(() => requests.length === 2, "the explicit seek issues a newer request");
+  requests[1].fail();
+  await seek;
+  assert.equal(up.lifecycleState, "failed");
+  assert.equal(up.boundaryReason, "availability_api_failure");
+  const revision = up.lifecycleRevision;
+  requests[0].succeed();
+  assert.equal(await older.promise, "stale");
+  assert.equal(up.availability, null, "a stale success cannot install availability");
+  assert.equal(up.lifecycleState, "failed");
+  assert.equal(up.lifecycleRevision, revision);
+  // The explicit seek legitimately pauses the peer; it must keep its presentation.
+  assert.equal(scene.down.lifecycleState, "participating");
+  assert.strictEqual(scene.down.hls, scene.downBefore.hls);
+});
+
+test("availability ownership: leaving historical playback rejects a pending failure", async t => {
+  const scene = await createAvailabilityOwnershipHarness(t);
+  const { controller, base, outage, requests, up, lifecycles } = scene;
+  outage.delete("drive_up");
+  const older = track(controller.reconcileHistoricalCamera(up, base, { reason: "older" }));
+  controller.returnToLive();
+  const count = lifecycles.length;
+  requests[0].fail();
+  assert.equal(await older.promise, "stale");
+  assert.equal(lifecycles.length, count);
+  assert.equal(controller._historicalPlayers.size, 0);
+});
+
+test("availability ownership: cameras recover independently of another camera's pending failure", async t => {
+  const scene = await createAvailabilityOwnershipHarness(t);
+  const { controller, base, outage, requests, up, down, harness } = scene;
+  outage.delete("drive_up");
+  requests.manual = new Set(["drive_down"]);
+  down.availability = null;
+  const downAttempt = track(controller.reconcileHistoricalCamera(down, base, { reason: "peer_refresh" }));
+  const upAttempt = track(controller.reconcileHistoricalCamera(up, base, { reason: "recovery" }));
+  const downRequest = requests.find(request => request.camera === "drive_down");
+  const upRequest = requests.find(request => request.camera === "drive_up");
+  upRequest.succeed();
+  assert.equal(await upAttempt.promise, "prepared");
+  assert.equal(up.lifecycleState, "participating");
+  assert.equal(downAttempt.settled, false, "the peer's request is still pending");
+  downRequest.fail();
+  assert.equal(await downAttempt.promise, "retained_after_availability_failure");
+  assert.equal(down.lifecycleState, "participating");
+  assert.strictEqual(down.hls, scene.downBefore.hls);
+  assert.equal(up.lifecycleState, "participating");
+  assert.equal(harness.playCalls.filter(call => call.camera === "Drive Down").length,
+    scene.downBefore.plays);
+});
+
 test("a superseded rejoin Play settlement cannot change current camera state", async t => {
   const target = 1800000000;
   let resolveOldPlay;
@@ -10300,11 +10609,34 @@ test("clock ownership: failed availability camera rejoins at current TI when que
         requested_end: message.end, coverage: [{ start: message.start, end: message.end }] }) });
   t.after(() => harness.close());
   const controller = harness.controller;
+  // Rejoin work is fire-and-forget from the queue, so observe each reconcile's own settlement.
+  const reconciles = [];
+  const reconcile = controller.reconcileHistoricalCamera.bind(controller);
+  controller.reconcileHistoricalCamera = (...args) => {
+    const operation = reconcile(...args);
+    reconciles.push(operation);
+    return operation;
+  };
   await controller.playHistorical(base);
+  // Recovery here is driven explicitly, not by a later heartbeat.
+  harness.window.clearInterval(controller._diagnosticTimer);
+  controller._diagnosticTimer = null;
+  // Outage-era requests must finish their failure path before connectivity returns;
+  // otherwise recovery would legitimately join an in-flight failing request.
+  await controller._availabilityEvaluationPromise;
+  await Promise.allSettled(reconciles);
+  const players = [...controller._historicalPlayers.values()];
+  assert.equal(controller._availabilityEvaluationPromise, null);
+  assert.ok(players.every(player => player.availabilityPromise === null &&
+    player.lifecycleState === "failed" && player.boundaryReason === "availability_api_failure"));
   now += 12000;
   fail = false;
+  const recoveryStart = reconciles.length;
   await controller.queueHistoricalAvailabilityEvaluation("queries_recovered");
-  await waitForCondition(() => [...controller._historicalPlayers.values()].every(player =>
+  const recovery = reconciles.slice(recoveryStart);
+  assert.equal(recovery.length, players.length, "recovery reconciles every failed camera");
+  assert.deepEqual(await Promise.all(recovery), players.map(() => "prepared"));
+  assert.ok([...controller._historicalPlayers.values()].every(player =>
     player.lifecycleState === "participating"));
   assert.equal(controller.clock.absoluteTime, base + 12);
   assert.ok([...controller._historicalPlayers.values()].every(player =>

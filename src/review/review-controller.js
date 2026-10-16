@@ -4382,7 +4382,8 @@ export class ReviewController {
         });
       } catch (error) {
         if (requestId !== this._reviewRequestId || !this.isCurrentCameraWork(player, generation) ||
-            player.timing !== timing || player.hls !== hls) return;
+            player.timing !== timing || player.hls !== hls ||
+            this.isStaleAvailabilityFailure(player, error)) return;
         this.recordReviewFailure(player, { reason: "availability_api_failure",
           outcome: "retained_after_failure", stage: "availability",
           targetEpoch: logicalWallEnd, occurrence: player.availabilityRequestToken });
@@ -4870,6 +4871,14 @@ export class ReviewController {
         nextCoverageStart: inspected.nextStart
       });
       return availability;
+    }).catch(error => {
+      // A failure belongs to the request that produced it; consumers use this to
+      // ignore it once a newer request owns the camera's availability.
+      const failure = error !== null && typeof error === "object" ? error : new Error(String(error));
+      Object.defineProperty(failure, "availabilityRequestToken", {
+        value: requestToken, configurable: true
+      });
+      throw failure;
     });
     player.availabilityPromise = request;
     try {
@@ -4877,6 +4886,11 @@ export class ReviewController {
     } finally {
       if (player.availabilityPromise === request) player.availabilityPromise = null;
     }
+  }
+
+  isStaleAvailabilityFailure(player, error) {
+    return Number.isSafeInteger(error?.availabilityRequestToken) &&
+      error.availabilityRequestToken !== player.availabilityRequestToken;
   }
 
   beginCameraTransition(player, reason, targetEpoch, { preservePlacement = false } = {}) {
@@ -5973,7 +5987,8 @@ export class ReviewController {
         player.reviewStage = "availability";
         await this.ensureCameraAvailability(player, targetEpoch, { reason });
       } catch (error) {
-        if (requestId !== this._reviewRequestId || !this.isCurrentCameraWork(player, generation)) return false;
+        if (requestId !== this._reviewRequestId || !this.isCurrentCameraWork(player, generation) ||
+            this.isStaleAvailabilityFailure(player, error)) return false;
         if (player.lifecycleState === "participating") {
           this.recordReviewFailure(player, { reason: "availability_api_failure",
             outcome: "retained_after_failure", stage: "availability", targetEpoch,
@@ -6417,7 +6432,8 @@ export class ReviewController {
       await this.ensureCameraAvailability(player, targetEpoch, { reason });
     } catch (error) {
       if (requestId !== this._reviewRequestId || !this.isCurrentCameraWork(player)) return "stale";
-      if (player.lifecycleRevision !== lifecycleRevision) return "superseded";
+      if (player.lifecycleRevision !== lifecycleRevision ||
+          this.isStaleAvailabilityFailure(player, error)) return "superseded";
       if (player.lifecycleState === "participating") {
         if (explicit) {
           this.leaveHistoricalCamera(player, "availability_api_failure", targetEpoch, null, "failed");
@@ -6585,19 +6601,26 @@ export class ReviewController {
       this._availabilityEvaluationPending = true;
       return this._availabilityEvaluationPromise;
     }
+    let promise = null;
+    let finished = false;
     const run = async () => {
-      do {
-        this._availabilityEvaluationPending = false;
-        await this.evaluateHistoricalAvailability(null, { reason, awaitRejoins: false });
-      } while (this._availabilityEvaluationPending &&
-        this._presentationMode === "historical" && this._active && !this._suspended);
-    };
-    const promise = run().catch(() => {}).finally(() => {
-      if (this._availabilityEvaluationPromise === promise) {
-        this._availabilityEvaluationPromise = null;
+      try {
+        do {
+          this._availabilityEvaluationPending = false;
+          await this.evaluateHistoricalAvailability(null, { reason, awaitRejoins: false });
+        } while (this._availabilityEvaluationPending &&
+          this._presentationMode === "historical" && this._active && !this._suspended);
+      } finally {
+        // Release ownership in the same turn as the final pending check; a later
+        // request must start a new evaluation rather than join one that has finished.
+        finished = true;
+        if (this._availabilityEvaluationPromise === promise) {
+          this._availabilityEvaluationPromise = null;
+        }
       }
-    });
-    this._availabilityEvaluationPromise = promise;
+    };
+    promise = run().catch(() => {});
+    if (!finished) this._availabilityEvaluationPromise = promise;
     return promise;
   }
 
