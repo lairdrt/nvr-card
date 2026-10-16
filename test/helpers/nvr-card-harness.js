@@ -14,6 +14,38 @@ const baseHistoricalPresentationSource = readFileSync(
   "utf8"
 ).replaceAll("export ", "");
 
+// happy-dom exposes Node's global performance object as window.performance, so a
+// harness fake clock is process-wide. Open harnesses stack; the newest one's clock
+// is active, and the real implementation returns once the last harness closes.
+const fakePerformanceClocks = [];
+let realPerformanceNow = null;
+
+function installFakePerformanceNow(performance, clock) {
+  if (fakePerformanceClocks.length === 0) {
+    realPerformanceNow = { descriptor: Object.getOwnPropertyDescriptor(performance, "now") };
+  }
+  fakePerformanceClocks.push(clock);
+  Object.defineProperty(performance, "now", { configurable: true, value: clock });
+}
+
+function removeFakePerformanceNow(performance, clock) {
+  const index = fakePerformanceClocks.lastIndexOf(clock);
+  if (index < 0) return;
+  fakePerformanceClocks.splice(index, 1);
+  if (fakePerformanceClocks.length > 0) {
+    Object.defineProperty(performance, "now", {
+      configurable: true, value: fakePerformanceClocks.at(-1)
+    });
+    return;
+  }
+  if (realPerformanceNow.descriptor) {
+    Object.defineProperty(performance, "now", realPerformanceNow.descriptor);
+  } else {
+    delete performance.now;
+  }
+  realPerformanceNow = null;
+}
+
 export const defaultCameras = [
   { name: "Front", entity: "camera.front", active: true },
   { name: "Garage", entity: "camera.garage", active: true,
@@ -230,10 +262,8 @@ export function createTestHarness({
     }
   });
 
-  Object.defineProperty(window.performance, "now", {
-    configurable: true,
-    value: () => currentTime
-  });
+  const fakePerformanceNow = () => currentTime;
+  installFakePerformanceNow(window.performance, fakePerformanceNow);
 
   Object.defineProperty(window, "setInterval", {
     configurable: true,
@@ -510,6 +540,7 @@ export function createTestHarness({
   }
 
   function close() {
+    removeFakePerformanceNow(window.performance, fakePerformanceNow);
     window.close();
   }
 

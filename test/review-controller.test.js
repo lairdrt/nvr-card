@@ -2435,7 +2435,7 @@ test("ordinary initial v2 preparation retains full Review When bounds", async t 
 });
 
 test("mediaToEpoch is authoritative and provider look-ahead cannot advance the clock", async t => {
-  const harness = createHistoricalHarness();
+  const harness = createHistoricalHarness({ now: () => 1000 });
   t.after(() => harness.close());
   await harness.controller.playHistorical(1800000000);
   const player = harness.controller._historicalPlayers.get("Drive Up");
@@ -4075,7 +4075,7 @@ test("pending metadata keeps old Timeline geometry but cannot authorize stale pl
   const oldItem = {
     camera_id: "drive_up", start_time: 1789065000, type: "person", labels: ["person"]
   };
-  const harness = createHistoricalHarness({
+  const harness = createHistoricalHarness({ now: () => 1000,
     reviewResponder: () => ++metadataCall === 1 ? Promise.resolve([oldItem]) : gate.then(() => [])
   });
   t.after(() => harness.close());
@@ -4145,7 +4145,7 @@ test("Gate 1 rejects a wrong-camera v2 response before HLS attachment", async t 
 
 test("Gate 1 stale camera work cleans itself without mutating the newer request", async t => {
   const pending = [];
-  const harness = createHistoricalHarness({
+  const harness = createHistoricalHarness({ now: () => 1000,
     presentationResponder: message => new Promise(resolve => pending.push({ message, resolve }))
   });
   t.after(() => harness.close());
