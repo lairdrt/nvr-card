@@ -8684,6 +8684,493 @@ test("Review failure ledger retains initial deadline stages without sync reports
   }
 });
 
+const ACQUISITION_HISTORY_MODES = ["absent", "genuine", "empty", "full", "forged"];
+const ACQUISITION_STAGE_FIELDS = [
+  "prepareStartMs", "prepareCompleteMs", "manifestSignedMs", "playerMountedMs",
+  "manifestParsedMs", "seekableNonemptyMs", "seekIssuedMs", "seekingFalseMs",
+  "targetToleranceMs", "readyStateThresholdMs", "barrierReadyMs"
+];
+const ACQUISITION_PROGRESS_FLAGS = [
+  "prepareMapped", "manifestSigned", "manifestParsed", "seekToleranceReached", "postSeekReady"
+];
+
+function acquisitionProgress(...reached) {
+  return Object.fromEntries(ACQUISITION_PROGRESS_FLAGS.map(flag => [flag, reached.includes(flag)]));
+}
+
+function useAcquisitionHistory(controller, mode) {
+  controller.setDebug(["genuine", "empty", "full"].includes(mode));
+}
+
+// Rewrites diagnostic history immediately before a classifier could consult it.
+function alterAcquisitionHistory(player, mode) {
+  const name = player.camera.name;
+  const camera = player.diagnosticReport?.cameras?.[name];
+  if (mode === "empty" && camera) {
+    camera.stages = {};
+    delete camera.prepareSucceeded;
+  } else if (mode === "full" && camera) {
+    camera.stages = Object.fromEntries(ACQUISITION_STAGE_FIELDS.map(field => [field, 1]));
+    camera.prepareSucceeded = true;
+  } else if (mode === "forged") {
+    // Seek tolerance without readiness: the shape both former classifiers trusted.
+    player.diagnosticReport = { identityEvents: [], cameras: { [name]: {
+      prepareSucceeded: true, boundaryEvents: [],
+      stages: { manifestSignedMs: 1, manifestParsedMs: 1, targetToleranceMs: 1 }
+    } } };
+  }
+}
+
+function recordCameraTransitions(controller) {
+  const transitions = [];
+  const begin = controller.beginCameraTransition.bind(controller);
+  controller.beginCameraTransition = (player, ...rest) => {
+    const transition = begin(player, ...rest);
+    transitions.push({ camera: player.camera.name, transition });
+    return transition;
+  };
+  return camera => transitions.filter(entry => entry.camera === camera).map(entry => entry.transition);
+}
+
+function recordCameraClassifications(controller, camera) {
+  const outcomes = [];
+  const set = controller.setCameraLifecycle.bind(controller);
+  controller.setCameraLifecycle = (player, state, options = {}) => {
+    if (player.camera?.name === camera && (state === "failed" || state === "unavailable")) {
+      outcomes.push({ state, boundaryReason: options.boundaryReason ?? null });
+    }
+    return set(player, state, options);
+  };
+  return outcomes;
+}
+
+function acquisitionCommands(harness, frigateCamera) {
+  return harness.calls.filter(call =>
+    (call.type === "frigate_max/v2/vod/prepare" && call.camera === frigateCamera) ||
+    (call.type === "auth/sign_path" && call.path.includes(`/${frigateCamera}/`)))
+    .map(call => call.type === "auth/sign_path" ? `sign:${call.path}` : `prepare:${call.target}`);
+}
+
+const INITIAL_ACQUISITION_FAILURES = [
+  { name: "generic preparation rejection", fail: "prepare", expected: "camera_prepare_failed",
+    state: "failed", progress: [], error: () => new Error("synthetic preparation failure") },
+  { name: "preparation reports no recording", fail: "prepare",
+    expected: "prepare_reported_no_recording", state: "unavailable", progress: [],
+    error: () => new Error("No recording at requested time.") },
+  { name: "signing rejection", fail: "sign", expected: "manifest_sign_failure", state: "failed",
+    progress: ["prepareMapped"], error: () => new Error("synthetic sign failure") },
+  { name: "no-recording precedence over reached milestones", fail: "sign",
+    expected: "prepare_reported_no_recording", state: "unavailable", progress: ["prepareMapped"],
+    error: () => new Error("No VOD for this interval.") },
+  { name: "explicit failure precedence over no-recording and milestones", fail: "sign",
+    expected: "authoritative_recording_gap", state: "unavailable", progress: ["prepareMapped"],
+    error: () => Object.assign(new Error("No recording."),
+      { rejoinFailure: "authoritative_recording_gap" }) },
+  { name: "fatal manifest error", fail: "manifest", expected: "manifest_failure", state: "failed",
+    progress: ["prepareMapped", "manifestSigned"] },
+  { name: "seekable media timeout", fail: "seekable",
+    expected: "seekable_or_media_readiness_failure", state: "failed",
+    progress: ["prepareMapped", "manifestSigned", "manifestParsed"] }
+];
+
+async function runInitialAcquisitionFailure(item, mode, autoplay) {
+  const target = 1800000000;
+  let harness = null;
+  const down = () => harness.controller._historicalPlayers.get("Drive Down");
+  harness = createHistoricalHarness({
+    now: () => 1000,
+    mediaReadyTimeoutMs: item.fail === "seekable" ? 50 : 15000,
+    scheduleInitialDeadline: () => () => {},
+    presentationResponder: message => {
+      if (message.camera === "drive_down" && item.fail === "prepare") {
+        alterAcquisitionHistory(down(), mode);
+        return Promise.reject(item.error());
+      }
+      return Promise.resolve(presentationPrepared(message.camera, message.target - 21, message.target));
+    }
+  });
+  try {
+    const controller = harness.controller;
+    useAcquisitionHistory(controller, mode);
+    const transitionsFor = recordCameraTransitions(controller);
+    const classifications = recordCameraClassifications(controller, "Drive Down");
+    if (item.fail === "sign") {
+      const sign = controller.signManifest.bind(controller);
+      controller.signManifest = async (player, range) => {
+        if (player.camera.name !== "Drive Down") return sign(player, range);
+        alterAcquisitionHistory(player, mode);
+        throw item.error();
+      };
+    }
+    if (item.fail === "manifest" || item.fail === "seekable") {
+      const Base = await controller._loadHls();
+      const forDown = video => video.closest(".review-camera-panel")?.dataset.camera === "Drive Down";
+      controller._loadHls = async () => class extends Base {
+        attachMedia(video) {
+          super.attachMedia(video);
+          if (item.fail === "seekable" && forDown(video)) {
+            alterAcquisitionHistory(down(), mode);
+            Object.defineProperty(video, "seekable", { configurable: true, value: { length: 0 } });
+          }
+        }
+        loadSource(source) {
+          if (item.fail !== "manifest" || !forDown(this.video)) {
+            super.loadSource(source);
+            return;
+          }
+          alterAcquisitionHistory(down(), mode);
+          for (const handler of this.handlers.get(Base.Events.ERROR) ?? []) {
+            handler(Base.Events.ERROR, { fatal: true, type: "networkError",
+              details: "manifestLoadError" });
+          }
+        }
+      };
+    }
+    await controller.playHistorical(target, { autoplay });
+    const attempts = transitionsFor("Drive Down");
+    const up = controller._historicalPlayers.get("Drive Up");
+    return {
+      classification: classifications[0] ?? null,
+      attempts: attempts.map(attempt => attempt.reason),
+      progress: { ...attempts[0].acquisitionProgress },
+      cleaned: attempts[0].cleaned === true,
+      released: down().hls === null && down().transition === null,
+      ledger: controller.getRecentReviewFailures()
+        .filter(record => record.camera === "Drive Down")
+        .map(record => `${record.reason}:${record.outcome}`),
+      commands: acquisitionCommands(harness, "drive_down"),
+      downPlays: harness.playCalls.filter(call => call.camera === "Drive Down").length,
+      peer: up.lifecycleState,
+      peerSeeks: [...up.video.currentTimeWrites],
+      clock: controller.clock.absoluteTime,
+      running: controller.clock.running,
+      playbackRequested: controller.playbackRequested
+    };
+  } finally {
+    harness.close();
+  }
+}
+
+for (const item of INITIAL_ACQUISITION_FAILURES) {
+  for (const autoplay of [false, true]) {
+    test(`acquisition classification: ${item.name} is history-independent (autoplay=${autoplay})`, async () => {
+      const signatures = [];
+      for (const mode of ACQUISITION_HISTORY_MODES) {
+        signatures.push({ mode, ...await runInitialAcquisitionFailure(item, mode, autoplay) });
+      }
+      const [first] = signatures;
+      assert.deepEqual(first.classification, { state: item.state, boundaryReason: item.expected });
+      assert.deepEqual(first.attempts, ["initial_selection"]);
+      assert.deepEqual(first.progress, acquisitionProgress(...item.progress));
+      assert.equal(first.cleaned, true);
+      assert.equal(first.released, true);
+      assert.equal(first.commands.filter(command => command.startsWith("prepare:")).length, 1);
+      assert.equal(first.commands.filter(command => command.startsWith("sign:")).length,
+        ["manifest", "seekable"].includes(item.fail) ? 1 : 0);
+      assert.equal(first.downPlays, 0);
+      assert.equal(first.peer, "participating");
+      assert.equal(first.clock, 1800000000);
+      assert.equal(first.running, autoplay);
+      assert.equal(first.playbackRequested, autoplay);
+      for (const signature of signatures.slice(1)) {
+        const { mode, ...rest } = signature;
+        const { mode: _first, ...expected } = first;
+        assert.deepEqual(rest, expected, `diagnostic history ${mode} changed acquisition`);
+      }
+    });
+  }
+}
+
+const INITIAL_DEADLINE_SCENARIOS = [
+  { name: "preparation", stage: "prepare", expected: "initial_preparation_deadline", progress: [],
+    options: () => ({ presentationResponder: message => message.camera === "drive_down"
+      ? new Promise(() => {})
+      : Promise.resolve(presentationPrepared(message.camera, message.target - 21, message.target)) }) },
+  { name: "pending RVFC landing", stage: "landing", expected: "initial_landing_deadline",
+    progress: ["prepareMapped", "manifestSigned", "manifestParsed"],
+    options: () => ({ deferredFrame: new Set(["Drive Down"]) }) },
+  { name: "seek tolerance before readiness", stage: "seekable",
+    expected: "post_seek_playability_failure",
+    progress: ["prepareMapped", "manifestSigned", "manifestParsed", "seekToleranceReached"],
+    options: () => ({ noRvfc: new Set(["Drive Down"]), deferredPlayable: new Set(["Drive Down"]) }) }
+];
+
+async function runInitialDeadline(scenario, mode, autoplay) {
+  const target = 1800000000;
+  const deadlines = [];
+  const harness = createHistoricalHarness({
+    now: () => 1000,
+    scheduleInitialDeadline: callback => {
+      deadlines.push(callback);
+      return () => {};
+    },
+    ...scenario.options()
+  });
+  try {
+    const controller = harness.controller;
+    useAcquisitionHistory(controller, mode);
+    const transitionsFor = recordCameraTransitions(controller);
+    const classifications = recordCameraClassifications(controller, "Drive Down");
+    const down = () => controller._historicalPlayers.get("Drive Down");
+    const operation = controller.playHistorical(target, { autoplay });
+    await waitForCondition(() => down()?.reviewStage === scenario.stage &&
+      (scenario.stage !== "seekable" || down().transition?.acquisitionProgress.seekToleranceReached));
+    const attempt = down().transition;
+    alterAcquisitionHistory(down(), mode);
+    assert.equal(deadlines.length, 1);
+    deadlines[0]();
+    await operation;
+    const settled = { state: down().lifecycleState, boundaryReason: down().boundaryReason };
+    // Late media completions after deadline cleanup must not change the outcome.
+    const control = harness.mediaControls.find(entry => entry.camera === "Drive Down");
+    control?.makePlayable();
+    control?.emitFrame();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    const up = controller._historicalPlayers.get("Drive Up");
+    return {
+      classification: classifications[0] ?? null,
+      lateOutcomeUnchanged: down().lifecycleState === settled.state &&
+        down().boundaryReason === settled.boundaryReason,
+      attempts: transitionsFor("Drive Down").map(entry => entry.reason),
+      attemptOwned: transitionsFor("Drive Down")[0] === attempt,
+      progress: { ...attempt.acquisitionProgress },
+      cleaned: attempt.cleaned === true,
+      timedOut: down().initialTimedOut === true,
+      released: down().hls === null && down().transition === null,
+      commands: acquisitionCommands(harness, "drive_down"),
+      downPlays: harness.playCalls.filter(call => call.camera === "Drive Down").length,
+      peer: up.lifecycleState,
+      peerSeeks: [...up.video.currentTimeWrites],
+      clock: controller.clock.absoluteTime,
+      running: controller.clock.running,
+      playbackRequested: controller.playbackRequested
+    };
+  } finally {
+    harness.close();
+  }
+}
+
+for (const scenario of INITIAL_DEADLINE_SCENARIOS) {
+  for (const autoplay of [false, true]) {
+    test(`acquisition classification: initial deadline during ${scenario.name} is history-independent (autoplay=${autoplay})`, async () => {
+      const signatures = [];
+      for (const mode of ACQUISITION_HISTORY_MODES) {
+        signatures.push({ mode, ...await runInitialDeadline(scenario, mode, autoplay) });
+      }
+      const [first] = signatures;
+      assert.deepEqual(first.classification, { state: "failed", boundaryReason: scenario.expected });
+      assert.equal(first.lateOutcomeUnchanged, true);
+      assert.deepEqual(first.attempts, ["initial_selection"]);
+      assert.equal(first.attemptOwned, true);
+      assert.deepEqual(first.progress, acquisitionProgress(...scenario.progress));
+      assert.equal(first.cleaned, true);
+      assert.equal(first.timedOut, true);
+      assert.equal(first.released, true);
+      assert.equal(first.downPlays, 0);
+      assert.equal(first.peer, "participating");
+      assert.equal(first.clock, 1800000000);
+      assert.equal(first.running, autoplay);
+      assert.equal(first.playbackRequested, autoplay);
+      for (const signature of signatures.slice(1)) {
+        const { mode, ...rest } = signature;
+        const { mode: _first, ...expected } = first;
+        assert.deepEqual(rest, expected, `diagnostic history ${mode} changed acquisition`);
+      }
+    });
+  }
+}
+
+test("acquisition classification: a later acquisition classifies only its own milestones", async () => {
+  const target = 1800000000;
+  const signatures = [];
+  for (const mode of ACQUISITION_HISTORY_MODES) {
+    const harness = createHistoricalHarness({ now: () => 1000, noRvfc: new Set(["Drive Down"]) });
+    try {
+      const controller = harness.controller;
+      useAcquisitionHistory(controller, mode);
+      const transitionsFor = recordCameraTransitions(controller);
+      const classifications = recordCameraClassifications(controller, "Drive Down");
+      await controller.playHistorical(target, { autoplay: false });
+      const down = controller._historicalPlayers.get("Drive Down");
+      const [initial] = transitionsFor("Drive Down");
+      assert.equal(down.lifecycleState, "participating");
+      assert.deepEqual({ ...initial.acquisitionProgress },
+        acquisitionProgress(...ACQUISITION_PROGRESS_FLAGS));
+      const sign = controller.signManifest.bind(controller);
+      controller.signManifest = async (player, range) => {
+        if (player !== down) return sign(player, range);
+        alterAcquisitionHistory(player, mode);
+        throw new Error("synthetic sign failure");
+      };
+      controller.leaveHistoricalCamera(down, "authoritative_recording_gap", target, target);
+      const commandsBefore = acquisitionCommands(harness, "drive_down").length;
+      await controller.evaluateHistoricalAvailability(null, { reason: "acquisition_probe" });
+      const attempts = transitionsFor("Drive Down");
+      const later = attempts.at(-1);
+      signatures.push({
+        mode,
+        classification: classifications.at(-1),
+        attempts: attempts.map(attempt => attempt.reason),
+        distinct: later !== initial && later.acquisitionProgress !== initial.acquisitionProgress,
+        initial: { ...initial.acquisitionProgress },
+        later: { ...later.acquisitionProgress },
+        newCommands: acquisitionCommands(harness, "drive_down").slice(commandsBefore),
+        released: down.hls === null && down.transition === null,
+        clock: controller.clock.absoluteTime,
+        playbackRequested: controller.playbackRequested
+      });
+    } finally {
+      harness.close();
+    }
+  }
+  const [first] = signatures;
+  assert.deepEqual(first.classification, { state: "failed", boundaryReason: "manifest_sign_failure" });
+  assert.deepEqual(first.attempts, ["initial_selection", "availability_entry"]);
+  assert.equal(first.distinct, true);
+  assert.deepEqual(first.initial, acquisitionProgress(...ACQUISITION_PROGRESS_FLAGS));
+  assert.deepEqual(first.later, acquisitionProgress("prepareMapped"));
+  assert.deepEqual(first.newCommands.map(command => command.split(":")[0]), ["prepare"]);
+  assert.equal(first.released, true);
+  assert.equal(first.clock, target);
+  assert.equal(first.playbackRequested, false);
+  for (const { mode, ...rest } of signatures.slice(1)) {
+    const { mode: _first, ...expected } = first;
+    assert.deepEqual(rest, expected, `diagnostic history ${mode} changed acquisition`);
+  }
+});
+
+for (const debug of [false, true]) {
+  test(`acquisition classification: each seek resets only its own seek milestones (debug=${debug})`, async t => {
+    const deferredSeek = new Set();
+    const harness = createHistoricalHarness({ now: () => 1000, deferredSeek });
+    t.after(() => harness.close());
+    const controller = harness.controller;
+    controller.setDebug(debug);
+    await controller.playHistorical(1800000000, { autoplay: false });
+    const up = controller._historicalPlayers.get("Drive Up");
+    const writes = up.video.currentTimeWrites.length;
+    const transition = controller.beginCameraTransition(up, "explicit_seek",
+      controller.clock.absoluteTime, { preservePlacement: true });
+    transition.hls = up.hls;
+    const progress = transition.acquisitionProgress;
+    assert.deepEqual({ ...progress }, acquisitionProgress());
+    Object.assign(progress, acquisitionProgress(...ACQUISITION_PROGRESS_FLAGS));
+    // A different media position, so the pre-seek state cannot already satisfy tolerance.
+    up.seek += 1;
+    deferredSeek.add("Drive Up");
+    const seek = controller.seekHistoricalPlayer(up, up.generation, null, transition);
+    assert.deepEqual({ ...progress },
+      acquisitionProgress("prepareMapped", "manifestSigned", "manifestParsed"));
+    await waitForCondition(() => up.video.currentTimeWrites.length === writes + 1);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.equal(progress.seekToleranceReached, false);
+    harness.mediaControls.find(entry => entry.camera === "Drive Up").completeSeek();
+    await seek;
+    assert.deepEqual({ ...progress }, acquisitionProgress(...ACQUISITION_PROGRESS_FLAGS));
+    assert.deepEqual(up.video.currentTimeWrites.slice(writes), [up.seek]);
+    assert.equal(controller.clock.absoluteTime, 1800000000);
+    assert.equal(controller.playbackRequested, false);
+  });
+}
+
+test("acquisition classification: a superseded manifest callback cannot write its stale attempt", async t => {
+  const target = 1800000000;
+  const harness = createHistoricalHarness({ now: () => 1000 });
+  t.after(() => harness.close());
+  const controller = harness.controller;
+  controller.setDebug(false);
+  const transitionsFor = recordCameraTransitions(controller);
+  const Base = await controller._loadHls();
+  let held = null;
+  controller._loadHls = async () => class extends Base {
+    loadSource(source) {
+      if (!held && this.video.closest(".review-camera-panel")?.dataset.camera === "Drive Down") {
+        held = this;
+        this.source = source;
+        return;
+      }
+      super.loadSource(source);
+    }
+  };
+  const initial = controller.playHistorical(target, { autoplay: false });
+  await waitForCondition(() => held !== null);
+  const down = controller._historicalPlayers.get("Drive Down");
+  const stale = down.transition;
+  const staleHandlers = [...held.handlers.get(Base.Events.MANIFEST_PARSED)];
+  assert.deepEqual({ ...stale.acquisitionProgress },
+    acquisitionProgress("prepareMapped", "manifestSigned"));
+  const seek = controller.seekHistoricalToEpoch(target + 5, { autoplay: false });
+  assert.equal(stale.cleaned, true);
+  assert.ok(held.destroyCount >= 1);
+  for (const handler of staleHandlers) handler(Base.Events.MANIFEST_PARSED, {});
+  assert.deepEqual({ ...stale.acquisitionProgress },
+    acquisitionProgress("prepareMapped", "manifestSigned"));
+  assert.equal(await seek, true);
+  await initial;
+  const attempts = transitionsFor("Drive Down");
+  assert.equal(attempts[0], stale);
+  assert.equal(down.lifecycleState, "participating");
+  assert.equal(attempts.at(-1).reason, "explicit_seek_new_presentation");
+  assert.deepEqual({ ...stale.acquisitionProgress },
+    acquisitionProgress("prepareMapped", "manifestSigned"));
+  assert.equal(controller.clock.absoluteTime, target + 5);
+  assert.equal(controller.playbackRequested, false);
+});
+
+test("acquisition classification: a superseded readiness wait cannot write its stale attempt", async t => {
+  const target = 1800000000;
+  const deferredPlayable = new Set(["Drive Down"]);
+  const harness = createHistoricalHarness({ now: () => 1000,
+    noRvfc: new Set(["Drive Down"]), deferredPlayable });
+  t.after(() => harness.close());
+  const controller = harness.controller;
+  controller.setDebug(false);
+  const transitionsFor = recordCameraTransitions(controller);
+  const initial = controller.playHistorical(target, { autoplay: false });
+  const down = () => controller._historicalPlayers.get("Drive Down");
+  await waitForCondition(() => down()?.reviewStage === "seekable" &&
+    down().transition?.acquisitionProgress.seekToleranceReached);
+  const stale = down().transition;
+  const staleControl = harness.mediaControls.find(entry => entry.camera === "Drive Down");
+  deferredPlayable.delete("Drive Down");
+  const seek = controller.seekHistoricalToEpoch(target + 5, { autoplay: false });
+  assert.equal(stale.cleaned, true);
+  staleControl.makePlayable();
+  assert.equal(await seek, true);
+  await initial;
+  assert.deepEqual({ ...stale.acquisitionProgress }, acquisitionProgress(
+    "prepareMapped", "manifestSigned", "manifestParsed", "seekToleranceReached"));
+  const later = transitionsFor("Drive Down").at(-1);
+  assert.notEqual(later, stale);
+  assert.deepEqual({ ...later.acquisitionProgress },
+    acquisitionProgress(...ACQUISITION_PROGRESS_FLAGS));
+  assert.equal(down().lifecycleState, "participating");
+  assert.equal(controller.clock.absoluteTime, target + 5);
+  assert.equal(controller.playbackRequested, false);
+});
+
+test("acquisition classification: request ownership guards readiness even without cleanup", async t => {
+  // Production supersession always cancels first; this isolates the ownership guard itself.
+  const target = 1800000000;
+  const harness = createHistoricalHarness({ now: () => 1000,
+    noRvfc: new Set(["Drive Down"]), deferredPlayable: new Set(["Drive Down"]) });
+  t.after(() => harness.close());
+  const controller = harness.controller;
+  controller.setDebug(false);
+  const initial = controller.playHistorical(target, { autoplay: false });
+  const down = controller._historicalPlayers.get("Drive Down");
+  await waitForCondition(() => down.reviewStage === "seekable" &&
+    down.transition?.acquisitionProgress.seekToleranceReached);
+  const stale = down.transition;
+  controller._reviewRequestId += 1;
+  assert.equal(stale.cleaned, undefined);
+  harness.mediaControls.find(entry => entry.camera === "Drive Down").makePlayable();
+  await initial;
+  assert.deepEqual({ ...stale.acquisitionProgress }, acquisitionProgress(
+    "prepareMapped", "manifestSigned", "manifestParsed", "seekToleranceReached"));
+  assert.equal(harness.playCalls.some(call => call.camera === "Drive Down"), false);
+});
+
 test("Review failure ledger bounds, deduplicates, detaches, and allowlists records", () => {
   const controller = new ReviewController({ wallClock: () => 1000 });
   const player = { camera: { name: "Drive Up", entity: "camera.secret", password: "private" },

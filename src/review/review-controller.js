@@ -4892,6 +4892,10 @@ export class ReviewController {
       assignmentRevision: this._assignmentRevision,
       slot: this.assignedSlotForCamera(player.camera.name),
       hls: null,
+      acquisitionProgress: {
+        prepareMapped: false, manifestSigned: false, manifestParsed: false,
+        seekToleranceReached: false, postSeekReady: false
+      },
       cancellations: []
     };
     player.transitionToken = transition.token;
@@ -5426,6 +5430,7 @@ export class ReviewController {
   }
 
   async attachHistoricalPlayer(player, range, Hls, generation, report = null, transition = null) {
+    const progress = transition?.acquisitionProgress;
     const diagnostic = this.syncCamera(report, generation, player);
     this.syncStage(report, generation, player, "prepareStartMs");
     player.reviewStage = "prepare";
@@ -5452,6 +5457,7 @@ export class ReviewController {
     const selected = epochToMedia(player.timing, range.targetEpoch);
     player.seek = selected.mediaTime;
     player.resolvedEpoch = selected.resolvedEpoch;
+    if (progress) progress.prepareMapped = true;
     if (diagnostic) {
       diagnostic.prepareSucceeded = true;
       diagnostic.effectiveOriginEpoch = player.timing.effective_absolute_origin;
@@ -5469,6 +5475,7 @@ export class ReviewController {
       end: player.timing.requested_wall_end
     });
     this.assertCurrentCameraBoundary(player, generation, transition);
+    if (progress) progress.manifestSigned = true;
     this.syncStage(report, generation, player, "manifestSignedMs");
     player.reviewStage = "manifest";
     const hls = new Hls({ enableWorker: true, maxBufferLength: 20 });
@@ -5502,6 +5509,9 @@ export class ReviewController {
         else resolve();
       };
       const onManifest = () => {
+        if (progress && this.isCurrentCameraTransition(player, transition)) {
+          progress.manifestParsed = true;
+        }
         this.syncStage(report, generation, player, "manifestParsedMs");
         finish();
       };
@@ -5622,12 +5632,17 @@ export class ReviewController {
 
   async seekHistoricalPlayer(player, generation = null, report = null, transition = null,
     { observeLanding = false, landingAfterSeek = false } = {}) {
+    const progress = transition?.acquisitionProgress;
     const requestId = player.requestId;
     const assertOwned = () => {
       if (requestId !== this._reviewRequestId) throw new Error("Historical seek was superseded.");
       if (generation !== null) this.assertCurrentCameraBoundary(player, generation, transition);
     };
     assertOwned();
+    if (progress) {
+      progress.seekToleranceReached = false;
+      progress.postSeekReady = false;
+    }
     player.reviewStage = "seek";
     const diagnostic = this.syncCamera(report, generation, player);
     if (diagnostic) {
@@ -5676,6 +5691,7 @@ export class ReviewController {
       }
       await wait;
       assertOwned();
+      if (progress) progress.seekToleranceReached = true;
       this.syncStage(report, generation, player, "seekingFalseMs");
       this.syncStage(report, generation, player, "targetToleranceMs");
       if (diagnostic) {
@@ -5691,6 +5707,7 @@ export class ReviewController {
         transition?.cancellations ?? player.waitCancellations
       );
       assertOwned();
+      if (progress) progress.postSeekReady = true;
       this.syncStage(report, generation, player, "readyStateThresholdMs");
       this.syncStage(report, generation, player, "barrierReadyMs");
       if (diagnostic) {
@@ -6112,16 +6129,16 @@ export class ReviewController {
     } catch (error) {
       const current = this.isCurrentCameraTransition(player, transition);
       const noRecording = /no recording|no vod/i.test(sanitizeReviewError(error));
-      const diagnostic = player.diagnosticReport?.cameras?.[player.camera.name];
+      const progress = transition.acquisitionProgress;
       const failureReason = error.rejoinFailure ?? (noRecording
         ? "prepare_reported_no_recording"
-        : diagnostic?.stages?.targetToleranceMs != null
+        : progress.seekToleranceReached
           ? "post_seek_playability_failure"
-          : diagnostic?.stages?.manifestParsedMs != null
+          : progress.manifestParsed
             ? "seekable_or_media_readiness_failure"
-            : diagnostic?.stages?.manifestSignedMs != null
+            : progress.manifestSigned
               ? "manifest_failure"
-              : diagnostic?.prepareSucceeded
+              : progress.prepareMapped
                 ? "manifest_sign_failure"
                 : "camera_prepare_failed");
       const ledgerReason = error.rejoinFailure ?? (noRecording
@@ -6295,14 +6312,16 @@ export class ReviewController {
       const owner = ownership.get(player);
       if (settled.has(player) || !this.isCurrentCameraWork(player, owner.generation) ||
           player.requestId !== owner.requestId || this._reviewRequestId !== owner.requestId) continue;
-      const stages = player.diagnosticReport?.cameras?.[player.camera.name]?.stages;
+      const transition = player.transition;
+      const progress = this.isCurrentCameraTransition(player, transition)
+        ? transition.acquisitionProgress : null;
       const phaseReason = reason === "initial_acquisition_deadline"
         ? player.reviewStage === "availability" ? "initial_availability_deadline"
           : ["seek", "landing", "seekable"].includes(player.reviewStage)
             ? "initial_landing_deadline" : "initial_preparation_deadline"
         : reason;
       const failureReason = phaseReason === "initial_landing_deadline" &&
-        stages?.targetToleranceMs != null && stages?.readyStateThresholdMs == null
+        progress?.seekToleranceReached === true && progress.postSeekReady === false
         ? "post_seek_playability_failure" : phaseReason;
       player.initialTimedOut = true;
       const ledgerReason = phaseReason === "initial_landing_deadline" &&
