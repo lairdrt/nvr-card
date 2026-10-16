@@ -5585,8 +5585,156 @@ test("historical Pause and Play preserve and resume the shared ReviewClock", asy
   assert.equal(play.disabled, true);
 });
 
+for (const enabled of [false, true]) {
+  for (const history of ["missing", "empty", "full", "modified"]) {
+    test(`relative seek isolation: diagnostics=${enabled}, history=${history}`, async t => {
+      const base = 1800000000;
+      const h = createHistoricalHarness({ now: () => 1000 });
+      t.after(() => h.close());
+      const c = h.controller;
+      c.setHistoricalSyncDiagnostics(enabled);
+      await c.playHistorical(base, { autoplay: false });
+      const players = [...c._historicalPlayers.values()];
+      const videos = players.map(p => p.video);
+      const request = c._reviewRequestId;
+      c._navigationDiagnostics = history === "missing" ? undefined : history === "empty" ? [] :
+        Array.from({ length: history === "full" ? 32 : 1 }, () => ({
+          requestedEpoch: base - 1000, selectedEpoch: base + 1000, outcome: "completed"
+        }));
+      const operation = c.seekHistoricalRelative("10");
+      assert.equal(c.clock.absoluteTime, base + 10, "navigation commits before awaiting acquisition");
+      assert.equal(c._reviewRequestId, request + 1);
+      assert.equal(await operation, true);
+      assert.equal(c.clock.absoluteTime, base + 10);
+      assert.equal(c.playbackRequested, false);
+      assert.deepEqual(players.map(p => p.video), videos);
+      assert.deepEqual(videos.map(v => v.currentTime), [31, 32]);
+    });
+  }
+}
+
+for (const playing of [false, true]) {
+  test(`relative seek isolation: throwing recorder preserves real seek and Pause (playing=${playing})`, async t => {
+    const base = 1800000000;
+    const h = createHistoricalHarness({ now: () => 1000 });
+    t.after(() => h.close());
+    const c = h.controller;
+    await c.playHistorical(base, { autoplay: playing });
+    const request = c._reviewRequestId;
+    const starts = h.starts.length;
+    const trace = [];
+    const seek = c.seekHistoricalToEpoch.bind(c);
+    c.seekHistoricalToEpoch = (target, options) => {
+      trace.push(["seek", target, options.autoplay, options.source]);
+      return seek(target, options);
+    };
+    c.recordReviewNavigation = (diagnostic, completed) => {
+      trace.push(["record", diagnostic.ownerRequestId, completed]);
+      throw new Error("optional recorder failed");
+    };
+    const operation = c.seekHistoricalRelative(10);
+    assert.deepEqual(trace, [["seek", base + 10, playing, "VCR seek"]]);
+    assert.equal(c.clock.absoluteTime, base + 10);
+    assert.equal(c._reviewRequestId, request + 1);
+    if (playing) assert.equal(c.pausePlayback(), true);
+    const result = await operation;
+    assert.equal(result, true);
+    assert.equal(trace.length, 2);
+    assert.equal(trace[1][0], "record");
+    assert.equal(trace[1][1], request + 1);
+    assert.equal(trace[1][2], result);
+    assert.equal(c.clock.absoluteTime, base + 10);
+    assert.equal(c.clock.running, false);
+    assert.equal(c.playbackRequested, false);
+    assert.equal(c._playbackPreparation, null);
+    assert.equal(h.starts.length, starts);
+  });
+}
+
+for (const synchronous of [false, true]) {
+  test(`relative seek isolation: recorder cannot replace original rejection (sync=${synchronous})`, async t => {
+    const h = createHistoricalHarness({ now: () => 1000 });
+    t.after(() => h.close());
+    const c = h.controller;
+    await c.playHistorical(1800000000, { autoplay: false });
+    const original = new Error("original seek failure");
+    let calls = 0;
+    let cleaned = false;
+    c.seekHistoricalToEpoch = () => {
+      calls += 1;
+      if (synchronous) { cleaned = true; throw original; }
+      return Promise.reject(original).finally(() => { cleaned = true; });
+    };
+    c.recordReviewNavigation = () => { throw new Error("recorder failure"); };
+    await assert.rejects(c.seekHistoricalRelative(10), error => error === original);
+    assert.equal(calls, 1);
+    assert.equal(cleaned, true);
+    assert.equal(c.clock.absoluteTime, 1800000000);
+    assert.equal(c.playbackRequested, false);
+  });
+}
+
+test("relative seek isolation: diagnostic construction failure cannot prevent navigation", async t => {
+  const h = createHistoricalHarness({ now: () => 1000 });
+  t.after(() => h.close());
+  const c = h.controller;
+  await c.playHistorical(1800000000, { autoplay: false });
+  Object.defineProperty(c, "_navigationDiagnosticSequence", {
+    get() { throw new Error("diagnostic construction failed"); }
+  });
+  assert.equal(await c.seekHistoricalRelative(-10), true);
+  assert.equal(c.clock.absoluteTime, 1799999990);
+  assert.equal(c.playbackRequested, false);
+});
+
+for (const scenario of [
+  { name: "lower clamp", from: -20, to: 20, delta: -100, expected: -20 },
+  { name: "upper clamp", from: -20, to: 20, delta: 100, expected: 20 },
+  { name: "future range before now", from: -20, to: 60, delta: 5, expected: 5 },
+  { name: "live edge", from: -20, to: 60, delta: 10, live: true }
+]) {
+  test(`relative seek isolation: ${scenario.name} survives recorder failure`, async t => {
+    const base = 1800000000;
+    const h = createHistoricalHarness({ now: () => 1000,
+      wallClockMs: (base + (scenario.to <= 20 ? 100 : 10)) * 1000 });
+    t.after(() => h.close());
+    const c = h.controller;
+    await c.playHistorical(base, { autoplay: false, playbackRange: {
+      from: base + scenario.from, to: base + scenario.to
+    } });
+    c.recordReviewNavigation = () => { throw new Error("recorder failure"); };
+    assert.equal(await c.seekHistoricalRelative(scenario.delta), true);
+    assert.equal(c._presentationMode, scenario.live ? "live" : "historical");
+    if (!scenario.live) assert.equal(c.clock.absoluteTime, base + scenario.expected);
+    assert.equal(c.playbackRequested, false);
+  });
+}
+
+test("relative seek isolation: supersession preserves the newer request despite recorder failure", async t => {
+  const base = 1800000000;
+  const h = createHistoricalHarness({ now: () => 1000 });
+  t.after(() => h.close());
+  const c = h.controller;
+  await c.playHistorical(base, { autoplay: false });
+  const request = c._reviewRequestId;
+  const recordedOwners = [];
+  c.recordReviewNavigation = diagnostic => {
+    recordedOwners.push(diagnostic.ownerRequestId);
+    throw new Error("recorder failure");
+  };
+  const first = c.seekHistoricalRelative(10);
+  const second = c.seekHistoricalRelative(20);
+  assert.equal(c._reviewRequestId, request + 2);
+  assert.equal(c.clock.absoluteTime, base + 30);
+  assert.deepEqual(await Promise.all([first, second]), [false, true]);
+  assert.deepEqual(recordedOwners.sort((a, b) => a - b), [request + 1, request + 2]);
+  assert.equal(c.clock.absoluteTime, base + 30);
+  assert.equal(c.playbackRequested, false);
+  assert.ok([...c._historicalPlayers.values()].every(p => p.requestId === request + 2));
+});
+
 test("minus and plus ten derive coordinated player positions from ReviewClock", async t => {
-  const harness = createHistoricalHarness();
+  const harness = createHistoricalHarness({ now: () => 1000 });
   t.after(() => harness.close());
   await harness.controller.playHistorical(1800000000);
   harness.controller.pausePlayback();

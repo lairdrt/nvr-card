@@ -4104,47 +4104,59 @@ export class ReviewController {
   async seekHistoricalRelative(deltaSeconds) {
     if (this._presentationMode !== "historical" ||
         !Number.isFinite(this.clock.absoluteTime)) return false;
-    const diagnostic = {
-      id: ++this._navigationDiagnosticSequence,
-      atMs: this._now(),
-      type: "relative",
-      deltaSeconds: Number(deltaSeconds),
-      direction: Math.sign(Number(deltaSeconds)),
-      requestedEpoch: this.clock.absoluteTime + Number(deltaSeconds),
-      selectedEpoch: null,
-      coverageDecision: "literal",
-      coverageBypassedDuringPreparation: false,
-      decisionToken: null,
-      requestIdAtStart: this._reviewRequestId,
-      ownerRequestId: null,
-      initialClockRunning: this.clock.running,
-      initialPlayRequested: this._playRequested,
-      initialHistoricalPreparing: this._historicalPreparing
-    };
+    const requestedEpoch = this.clock.absoluteTime + Number(deltaSeconds);
+    let diagnostic = null;
+    try {
+      diagnostic = {
+        id: ++this._navigationDiagnosticSequence,
+        atMs: this._now(),
+        type: "relative",
+        deltaSeconds: Number(deltaSeconds),
+        direction: Math.sign(Number(deltaSeconds)),
+        requestedEpoch,
+        selectedEpoch: null,
+        coverageDecision: "literal",
+        coverageBypassedDuringPreparation: false,
+        decisionToken: null,
+        requestIdAtStart: this._reviewRequestId,
+        ownerRequestId: null,
+        initialClockRunning: this.clock.running,
+        initialPlayRequested: this._playRequested,
+        initialHistoricalPreparing: this._historicalPreparing
+      };
+    } catch {}
+    let selectedEpoch = null;
+    let coverageDecision = "literal";
+    let ownerRequestId = null;
     let completed = false;
     try {
-      let target = diagnostic.requestedEpoch;
+      let target = requestedEpoch;
       if (this._historicalPlaybackRange) {
         const now = this._wallClock() / 1000;
         const upper = Math.min(this._historicalPlaybackRange.to, now);
         if (target >= upper && this._historicalPlaybackRange.to > now) {
-          diagnostic.coverageDecision = "live_now";
+          coverageDecision = "live_now";
           this.returnToLive();
           completed = true;
           return true;
         }
         target = Math.min(upper, Math.max(this._historicalPlaybackRange.from, target));
       }
-      diagnostic.selectedEpoch = target;
+      selectedEpoch = target;
       const operation = this.seekHistoricalToEpoch(target, {
         autoplay: this.playbackRequested,
         source: "VCR seek"
       });
-      diagnostic.ownerRequestId = this._reviewRequestId;
+      ownerRequestId = this._reviewRequestId;
       completed = await operation;
       return completed;
     } finally {
-      this.recordReviewNavigation(diagnostic, completed);
+      try {
+        if (diagnostic) {
+          Object.assign(diagnostic, { selectedEpoch, coverageDecision, ownerRequestId });
+          this.recordReviewNavigation(diagnostic, completed);
+        }
+      } catch {}
     }
   }
 
