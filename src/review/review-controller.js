@@ -5526,7 +5526,9 @@ export class ReviewController {
         if (progress && this.isCurrentCameraTransition(player, transition)) {
           progress.manifestParsed = true;
         }
-        this.syncStage(report, generation, player, "manifestParsedMs");
+        try {
+          this.syncStage(report, generation, player, "manifestParsedMs");
+        } catch {}
         finish();
       };
       const onError = (_event, data) => {

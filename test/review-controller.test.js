@@ -9384,6 +9384,349 @@ for (const debug of [false, true]) {
   });
 }
 
+async function flushManifestMicrotasksUntil(predicate) {
+  for (let index = 0; index < 200 && !predicate(); index += 1) await Promise.resolve();
+  assert.ok(predicate(), "controlled manifest work must reach the expected phase");
+}
+
+async function createManifestIsolationHarness(debug, throwDiagnostic) {
+  const harness = createHistoricalHarness({
+    debug, now: () => 1000, deferredFrame: new Set(["Drive Up"]),
+    scheduleInitialDeadline: () => () => {}
+  });
+  const controller = harness.controller;
+  controller.setSelectedCameraNames(["Drive Up"]);
+  const commands = [];
+  const lifecycles = [];
+  const manifests = [];
+  const transitionsFor = recordCameraTransitions(controller);
+  const setLifecycle = controller.setCameraLifecycle.bind(controller);
+  controller.setCameraLifecycle = (player, state, options) => {
+    lifecycles.push([state, options?.boundaryReason ?? null]);
+    return setLifecycle(player, state, options);
+  };
+  const seek = controller.seekHistoricalPlayer.bind(controller);
+  controller.seekHistoricalPlayer = (...args) => {
+    commands.push("seek");
+    return seek(...args);
+  };
+  const syncStage = controller.syncStage.bind(controller);
+  const manifestObservations = [];
+  let diagnosticFault = throwDiagnostic;
+  controller.syncStage = (report, generation, player, stage) => {
+    if (stage === "manifestParsedMs") {
+      manifestObservations.push({
+        current: controller.isCurrentCameraTransition(player, player.transition),
+        parsed: player.transition?.acquisitionProgress.manifestParsed
+      });
+      if (diagnosticFault) throw new Error("synthetic manifest diagnostic failure");
+    }
+    return syncStage(report, generation, player, stage);
+  };
+  const internalExceptions = [];
+  const Base = await controller._loadHls();
+  controller._loadHls = async () => class extends Base {
+    destroy() {
+      super.destroy();
+      // Match Hls.destroy(): listeners cannot remain active after destruction.
+      this.handlers.clear();
+    }
+    attachMedia(video) {
+      commands.push("attach");
+      super.attachMedia(video);
+      const play = video.play;
+      video.play = () => { commands.push("play"); return play(); };
+    }
+    // Mirrors vendored hls.js 1.7.2 Hls.trigger() (config.debug false): a listener
+    // exception stops that event's remaining listeners, is swallowed, and is re-emitted
+    // as ERROR/internalException, fatal only when the failing event was ERROR itself.
+    dispatch(event, data, listeners = [...(this.handlers.get(event) ?? [])]) {
+      try {
+        for (const listener of listeners) listener(event, data);
+      } catch (error) {
+        internalExceptions.push({ event, message: error.message });
+        if (this.triggeringException) return;
+        this.triggeringException = true;
+        this.dispatch(Base.Events.ERROR, { type: "otherError", details: "internalException",
+          fatal: event === Base.Events.ERROR, event, error });
+        this.triggeringException = false;
+      }
+    }
+    loadSource(source) {
+      commands.push("source");
+      this.source = source;
+      const hls = this;
+      manifests.push({
+        hls,
+        // Captured at load so a superseded attempt's in-flight callback can still be replayed.
+        parsed: [...this.handlers.get(Base.Events.MANIFEST_PARSED)],
+        emitParsed() {
+          commands.push("manifest");
+          hls.dispatch(Base.Events.MANIFEST_PARSED, {}, this.parsed);
+        },
+        emitFatal() {
+          hls.dispatch(Base.Events.ERROR, {
+            fatal: true, type: "networkError", details: "manifestLoadError"
+          });
+        }
+      });
+    }
+  };
+  return { ...harness, commands, lifecycles, manifests, transitionsFor,
+    manifestObservations, internalExceptions, events: Base.Events,
+    setDiagnosticFault(value) { diagnosticFault = value; } };
+}
+
+function assertManifestIsolationCleanup(harness, player) {
+  assert.equal(player.transition, null);
+  assert.deepEqual(player.waitCancellations, []);
+  assert.deepEqual(player.hlsListeners, []);
+  assert.deepEqual(player.lifecycleListeners, []);
+  assert.deepEqual(player.syncListeners, []);
+  assert.equal(player.hls, null);
+  assert.equal(harness.controller._diagnosticTimer, null);
+  for (const hls of harness.instances) {
+    assert.equal(hls.destroyCount, 1);
+    assert.ok([...hls.handlers.values()].every(handlers => handlers.length === 0));
+  }
+  for (const media of harness.mediaControls) {
+    assert.equal(media.pendingFrameCallbacks().length, 0);
+  }
+  for (const transition of harness.transitionsFor("Drive Up")) {
+    assert.deepEqual(transition.cancellations, []);
+  }
+}
+
+async function runManifestIsolationSuccess(debug, autoplay, throwDiagnostic) {
+  const harness = await createManifestIsolationHarness(debug, throwDiagnostic);
+  const controller = harness.controller;
+  const target = 1800000000;
+  let operation;
+  try {
+    operation = controller.playHistorical(target, { autoplay });
+    await flushManifestMicrotasksUntil(() => harness.manifests.length === 1);
+    const player = controller._historicalPlayers.get("Drive Up");
+    const transition = player.transition;
+    const manifest = harness.manifests[0];
+    assert.equal(transition.acquisitionProgress.manifestParsed, false);
+    manifest.emitParsed();
+    assert.equal(transition.acquisitionProgress.manifestParsed, true);
+    assert.equal(manifest.hls.handlers.get(harness.events.MANIFEST_PARSED).length, 0);
+    assert.equal(manifest.hls.handlers.get(harness.events.ERROR).length, 1);
+    assert.deepEqual(transition.cancellations, []);
+    // hls.js would swallow an escaped diagnostic exception and leave readiness pending,
+    // so reaching the mapped seek is the operational proof that the manifest settled.
+    await flushManifestMicrotasksUntil(() => player.video.currentTimeWrites.length === 1);
+    const media = harness.mediaControls[0];
+    assert.equal(media.pendingFrameCallbacks().length, 1);
+    media.emitFrame();
+    await operation;
+    assert.equal(controller._historicalPreparing, false);
+    assert.equal(player.lifecycleState, "participating");
+    assert.equal(player.initialPlacement.verifiedFrame, true);
+    assert.equal(player.initialPlacement.landedEpoch, target);
+    assert.equal(player.requestId, controller._reviewRequestId);
+    assert.equal(player.generation, controller._generation);
+    assert.equal(controller.isCurrentCameraWork(player), true);
+    assert.deepEqual(player.video.currentTimeWrites, [21]);
+    assert.equal(controller.clock.absoluteTime, target);
+    assert.equal(controller.clock.running, autoplay);
+    assert.equal(controller.playbackRequested, autoplay);
+    assert.equal(player.video.paused, !autoplay);
+    assert.deepEqual(controller.getRecentReviewFailures(), []);
+    assert.deepEqual(harness.internalExceptions, []);
+    assert.deepEqual(harness.manifestObservations, [{ current: true, parsed: true }]);
+    const report = controller.getLatestHistoricalSyncReport();
+    if (debug) {
+      assert.equal(report.cameras["Drive Up"].stages.manifestParsedMs,
+        throwDiagnostic ? undefined : 1000);
+    } else assert.equal(report, null);
+    const result = {
+      commands: harness.commands, lifecycles: harness.lifecycles,
+      acquisition: acquisitionCommands(harness, "drive_up"),
+      progress: { ...transition.acquisitionProgress },
+      placement: { ...player.initialPlacement },
+      clock: controller.clock.absoluteTime, requested: controller.playbackRequested,
+      reviewPlay: player.reviewPlay, requestId: player.requestId,
+      cameraWorkId: player.cameraWorkId, presentationId: player.presentationId
+    };
+    controller.returnToLive();
+    assertManifestIsolationCleanup(harness, player);
+    return result;
+  } finally {
+    harness.close();
+    await operation;
+  }
+}
+
+for (const debug of [false, true]) {
+  for (const autoplay of [false, true]) {
+    test(`manifest diagnostic isolation: acquisition matches control (debug=${debug}, autoplay=${autoplay})`, async () => {
+      const control = await runManifestIsolationSuccess(debug, autoplay, false);
+      const throwing = await runManifestIsolationSuccess(debug, autoplay, true);
+      assert.deepEqual(throwing, control);
+      assert.deepEqual(control.commands,
+        ["attach", "source", "manifest", "seek", ...(autoplay ? ["play"] : [])]);
+    });
+  }
+
+  test(`manifest diagnostic isolation: fatal manifest still fails and cleans up (debug=${debug})`, async () => {
+    const harness = await createManifestIsolationHarness(debug, true);
+    const controller = harness.controller;
+    let operation;
+    try {
+      operation = controller.playHistorical(1800000000, { autoplay: false });
+      await flushManifestMicrotasksUntil(() => harness.manifests.length === 1);
+      const player = controller._historicalPlayers.get("Drive Up");
+      const transition = player.transition;
+      harness.manifests[0].emitFatal();
+      await operation;
+      assert.equal(player.lifecycleState, "failed");
+      assert.equal(player.boundaryReason, "manifest_failure");
+      assert.deepEqual({ ...transition.acquisitionProgress },
+        acquisitionProgress("prepareMapped", "manifestSigned"));
+      assert.deepEqual(player.video.currentTimeWrites, []);
+      assert.deepEqual(harness.playCalls, []);
+      assert.deepEqual(harness.manifestObservations, []);
+      assert.deepEqual(harness.internalExceptions, []);
+      assert.equal(controller.getRecentReviewFailures()[0].reason, "manifest_failure");
+      controller.returnToLive();
+      assertManifestIsolationCleanup(harness, player);
+    } finally {
+      harness.close();
+      await operation;
+    }
+  });
+
+  test(`manifest diagnostic isolation: stale callback cannot settle a newer manifest (debug=${debug})`, async () => {
+    const harness = await createManifestIsolationHarness(debug, true);
+    const controller = harness.controller;
+    const target = 1800000000;
+    let initial, replacement;
+    try {
+      initial = controller.playHistorical(target, { autoplay: false });
+      await flushManifestMicrotasksUntil(() => harness.manifests.length === 1);
+      const player = controller._historicalPlayers.get("Drive Up");
+      const stale = player.transition;
+      replacement = controller.seekHistoricalToEpoch(target + 5, { autoplay: false });
+      await flushManifestMicrotasksUntil(() => harness.manifests.length === 2);
+      const current = player.transition;
+      assert.notEqual(current, stale);
+      assert.equal(stale.cleaned, true);
+      harness.manifests[0].emitParsed();
+      // The stale attempt is already settled, so an escaped throw would only be logged.
+      assert.deepEqual(harness.internalExceptions, []);
+      assert.deepEqual(stale.cancellations, []);
+      assert.deepEqual({ ...stale.acquisitionProgress },
+        acquisitionProgress("prepareMapped", "manifestSigned"));
+      assert.deepEqual({ ...current.acquisitionProgress },
+        acquisitionProgress("prepareMapped", "manifestSigned"));
+      assert.equal(player.transition, current);
+      assert.equal(controller.isCurrentCameraTransition(player, current), true);
+      assert.equal(current.cancellations.length, 1);
+      assert.deepEqual(player.video.currentTimeWrites, []);
+      assert.equal(harness.manifests[1].hls.handlers.get(harness.events.MANIFEST_PARSED).length, 1);
+      harness.manifests[1].emitParsed();
+      await flushManifestMicrotasksUntil(() => player.video.currentTimeWrites.length === 1);
+      harness.mediaControls.at(-1).emitFrame();
+      assert.equal(await replacement, true);
+      await initial;
+      assert.equal(player.lifecycleState, "participating");
+      assert.equal(player.initialPlacement.landedEpoch, target + 5);
+      assert.equal(controller.clock.absoluteTime, target + 5);
+      assert.equal(controller.playbackRequested, false);
+      assert.deepEqual(harness.internalExceptions, []);
+      controller.returnToLive();
+      assertManifestIsolationCleanup(harness, player);
+    } finally {
+      harness.close();
+      await Promise.allSettled([initial, replacement]);
+    }
+  });
+}
+
+// Rejoin and continuation acquire without the initial-acquisition deadline, so a
+// manifest that never settles would strand the camera in "preparing" indefinitely.
+async function runManifestIsolationRejoin(debug, autoplay, throwDiagnostic) {
+  const harness = await createManifestIsolationHarness(debug, false);
+  const controller = harness.controller;
+  const target = 1800000000;
+  let initial, join;
+  try {
+    initial = controller.playHistorical(target, { autoplay });
+    await flushManifestMicrotasksUntil(() => harness.manifests.length === 1);
+    harness.manifests[0].emitParsed();
+    const player = controller._historicalPlayers.get("Drive Up");
+    await flushManifestMicrotasksUntil(() => player.video.currentTimeWrites.length === 1);
+    harness.mediaControls[0].emitFrame();
+    await initial;
+    assert.equal(player.lifecycleState, "participating");
+    controller.leaveHistoricalCamera(player, "authoritative_recording_gap", target, target);
+    assert.equal(player.lifecycleState, "unavailable");
+    assert.equal(player.hls, null);
+    harness.setDiagnosticFault(throwDiagnostic);
+    join = controller.evaluateHistoricalAvailability(null, { reason: "manifest_rejoin" });
+    await flushManifestMicrotasksUntil(() => harness.manifests.length === 2);
+    const transition = player.transition;
+    assert.equal(transition.reason, "availability_entry");
+    assert.equal(controller._initialDeadlineCancel, null);
+    assert.equal(transition.acquisitionProgress.manifestParsed, false);
+    harness.manifests[1].emitParsed();
+    assert.equal(transition.acquisitionProgress.manifestParsed, true);
+    // Only manifest settlement can lead to the rejoin's mapped seek.
+    await flushManifestMicrotasksUntil(() => player.video.currentTimeWrites.length === 1);
+    const media = harness.mediaControls.at(-1);
+    await flushManifestMicrotasksUntil(() => media.pendingFrameCallbacks().length === 1);
+    media.emitFrame();
+    const [outcome] = await join;
+    assert.deepEqual(outcome, { camera: "Drive Up", result: "prepared" });
+    assert.equal(player.lifecycleState, "participating");
+    assert.equal(player.transition, null);
+    assert.equal(player.initialPlacement.verifiedFrame, true);
+    assert.equal(player.initialPlacement.landedEpoch, target);
+    assert.equal(controller.clock.absoluteTime, target);
+    assert.equal(controller.clock.running, autoplay);
+    assert.equal(controller.playbackRequested, autoplay);
+    assert.equal(player.video.paused, !autoplay);
+    assert.deepEqual(harness.internalExceptions, []);
+    assert.deepEqual(harness.manifestObservations.at(-1), { current: true, parsed: true });
+    const result = {
+      commands: harness.commands, lifecycles: harness.lifecycles,
+      acquisition: acquisitionCommands(harness, "drive_up"),
+      attempts: harness.transitionsFor("Drive Up").map(attempt => attempt.reason),
+      progress: { ...transition.acquisitionProgress },
+      placement: { ...player.initialPlacement },
+      seeks: [...player.video.currentTimeWrites],
+      ledger: controller.getRecentReviewFailures().map(record => `${record.reason}:${record.outcome}`),
+      clock: controller.clock.absoluteTime, requested: controller.playbackRequested,
+      reviewPlay: player.reviewPlay, requestId: player.requestId,
+      cameraWorkId: player.cameraWorkId, presentationId: player.presentationId
+    };
+    controller.returnToLive();
+    assertManifestIsolationCleanup(harness, player);
+    return result;
+  } finally {
+    harness.close();
+    await Promise.allSettled([initial, join]);
+  }
+}
+
+for (const debug of [false, true]) {
+  for (const autoplay of [false, true]) {
+    test(`manifest diagnostic isolation: deadline-free rejoin matches control (debug=${debug}, autoplay=${autoplay})`, async () => {
+      const control = await runManifestIsolationRejoin(debug, autoplay, false);
+      const throwing = await runManifestIsolationRejoin(debug, autoplay, true);
+      assert.deepEqual(throwing, control);
+      assert.deepEqual(control.attempts, ["initial_selection",
+        ...(autoplay ? ["play_release"] : []), "availability_entry"]);
+      assert.deepEqual(control.commands, ["attach", "source", "manifest", "seek",
+        ...(autoplay ? ["play"] : []), "attach", "source", "manifest", "seek",
+        ...(autoplay ? ["play"] : [])]);
+      assert.deepEqual(control.seeks, [21]);
+    });
+  }
+}
+
 test("acquisition classification: a superseded manifest callback cannot write its stale attempt", async t => {
   const target = 1800000000;
   const harness = createHistoricalHarness({ now: () => 1000 });
