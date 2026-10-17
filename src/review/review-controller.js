@@ -33,6 +33,11 @@ const REVIEW_COVERAGE_EPSILON_SECONDS = 0.001;
 // every automatic reacquisition: three failed acquisitions, retried 1 s x attempt apart.
 const REVIEW_CONTINUATION_MAX_ATTEMPTS = 3;
 const REVIEW_CONTINUATION_RETRY_MS = 1000;
+// A recovered camera keeps its failure history until it proves this much verified
+// playback progress, so an acquire-then-fail loop cannot renew its budget.
+const REVIEW_RECOVERY_HEALTHY_PROGRESS_MS = 60000;
+// MediaError codes that end a presentation: network, decode, source not supported.
+const REVIEW_FATAL_MEDIA_ERROR_CODES = new Set([2, 3, 4]);
 const REVIEW_AUTO_SNAP_FRAME_STALE_MS = 1000;
 const REVIEW_AUTO_SNAP_DECISION_LIMIT = 16;
 const REVIEW_NAVIGATION_DIAGNOSTIC_LIMIT = 32;
@@ -55,7 +60,7 @@ const REVIEW_FAILURE_REASONS = new Set([
   "post_seek_playability_failure", "play_rejected", "play_timeout",
   "play_not_running", "rejoin_play_rejected", "rejoin_play_timeout",
   "rejoin_play_not_running", "continuous_presentation_exhausted",
-  "unexpected_media_end", "hls_fatal", "media_error",
+  "unexpected_media_end", "hls_fatal", "media_error", "media_stalled",
   "missing_frigate_camera_mapping", "shared_initialization_failure",
   "rejoin_target_moved"
 ]);
@@ -4357,6 +4362,70 @@ export class ReviewController {
     return transitioned;
   }
 
+  // Runs in the existing heartbeat after presentation boundaries. A participating camera
+  // progresses while it presents frames or its mapped media position advances; it is
+  // stalled only when both stop for the media-readiness bound. Watching restarts (a
+  // fresh grace period) whenever Review or the camera is not in ordinary playback, so
+  // Pause, hidden documents, navigation, preparation, holds and presentation ends never
+  // count. The ReviewClock is never compared with the frozen media time.
+  enforceHistoricalPlaybackProgress(generation = this._generation) {
+    if (generation !== this._generation || this._presentationMode !== "historical") return false;
+    const document = this._root?.ownerDocument ?? this._document;
+    const watching = this.clock.running && document?.visibilityState !== "hidden" &&
+      !this._historicalPreparing && this._playbackPreparation === null &&
+      !this._continuousHandoffPrototypeRun;
+    const now = this._now();
+    let transitioned = false;
+    for (const player of this._historicalPlayers.values()) {
+      const mediaTime = Number(player.video?.currentTime);
+      const logicalMediaEnd = Number(player.timing?.logical_media_end_position);
+      const eligible = watching && player.lifecycleState === "participating" &&
+        !player.transition && player.hls && player.video && player.timing?.time_map &&
+        player.holdStartedAtMs == null && !player.endResolution &&
+        this.isCurrentCameraWork(player, generation) &&
+        !(Number.isFinite(mediaTime) && Number.isFinite(logicalMediaEnd) &&
+          mediaTime >= logicalMediaEnd - 0.05);
+      if (!eligible) {
+        player.playbackProgress = null;
+        continue;
+      }
+      const epoch = this.cameraEpochFromMedia(player);
+      const progress = player.playbackProgress;
+      if (!progress || progress.hls !== player.hls) {
+        player.playbackProgress = { hls: player.hls, epoch, frames: player.presentedFrameCount,
+          checkedAtMs: now, progressedAtMs: now };
+        continue;
+      }
+      const advanced = player.presentedFrameCount !== progress.frames ||
+        (Number.isFinite(epoch) && epoch !== progress.epoch);
+      const recovery = player.continuationRecovery;
+      if (advanced) {
+        progress.progressedAtMs = now;
+        if (recovery) {
+          recovery.healthyProgressMs += Math.max(0, now - progress.checkedAtMs);
+          if (recovery.healthyProgressMs >= REVIEW_RECOVERY_HEALTHY_PROGRESS_MS) {
+            player.continuationRecovery = null;
+          }
+        }
+      }
+      progress.epoch = epoch;
+      progress.frames = player.presentedFrameCount;
+      progress.checkedAtMs = now;
+      if (now - progress.progressedAtMs < this._mediaReadyTimeoutMs) continue;
+      const coverage = this.inspectPlayerAvailability(player, this.clock.absoluteTime);
+      if (coverage.insideWindow && !coverage.containing) {
+        // Recording truth: Review time has reached this camera's gap.
+        transitioned = this.leaveHistoricalCamera(player, "authoritative_recording_gap",
+          this.clock.absoluteTime, player.lastAchievedEpoch) || transitioned;
+      } else if (this.leaveHistoricalCamera(player, "media_stalled", this.clock.absoluteTime,
+        player.lastAchievedEpoch, "failed")) {
+        this.recordCameraAcquisitionFailure(player);
+        transitioned = true;
+      }
+    }
+    return transitioned;
+  }
+
   async resolveHistoricalVideoEnd(player, generation) {
     if (!this.isCurrentCameraWork(player, generation) ||
         player.lifecycleState !== "participating" || !player.timing?.time_map) return;
@@ -5370,6 +5439,11 @@ export class ReviewController {
       latestPresentedFrameEpoch: null,
       latestPresentedFrameAtMs: null,
       latestPresentedFramePresentationId: null,
+      // Operational progress evidence: frames presented while participating, and the
+      // heartbeat's watch over frames and mapped media position for this presentation.
+      presentedFrameCount: 0,
+      playbackProgress: null,
+      heldFrameHls: null,
       reviewHlsError: null,
       reviewTimingPrepared: false
     };
@@ -5512,9 +5586,10 @@ export class ReviewController {
     const onReviewHlsError = (_event, data) => {
       if (!this.isCurrentCameraWork(player, generation) || player.hls !== hls) return;
       player.reviewHlsError = safeReviewHlsError(data);
+      // hls.js has exhausted its own retries and stopped loading this presentation;
+      // leaving it records the failure once.
       if (data?.fatal === true && player.lifecycleState === "participating") {
-        this.recordReviewFailure(player, { reason: "hls_fatal", stage: "media",
-          occurrence: player.presentationId });
+        this.failPlayingPresentation(player, hls, "hls_fatal");
       }
     };
     hls.on(Hls.Events.ERROR, onReviewHlsError);
@@ -5892,64 +5967,58 @@ export class ReviewController {
     }
   }
 
+  // One observer per presentation. It stays armed through transitions of that same
+  // presentation (records frames only while participating) and stops once its
+  // presentation, video or camera work is replaced; a successor installs its own.
   observeHistoricalFrames(player) {
     player.cancelHistoricalFrameObserver?.();
     const video = player.video;
     if (typeof video?.requestVideoFrameCallback !== "function") return;
+    const generation = player.generation;
+    const hls = player.hls;
     let callbackId = null;
     let cancelled = false;
     const onFrame = (_now, metadata) => {
-      if (cancelled || !this.isCurrentCameraWork(player) || player.video !== video ||
-          player.lifecycleState !== "participating") return;
-      try {
-        const mapped = mediaToEpoch(player.timing, Number(metadata?.mediaTime));
-        if (!mapped.isBoundary) {
-          player.latestPresentedFrameEpoch = mapped.epoch;
-          player.latestPresentedFrameAtMs = this._now();
-          player.latestPresentedFramePresentationId = player.presentationId;
-          const playAttempt = player.lastPlayAttempt;
-          if (playAttempt?.presentationId === player.presentationId &&
-              playAttempt.firstPresentedAdvance === null &&
-              Number.isFinite(playAttempt.baselineEpoch) &&
-              mapped.epoch > playAttempt.baselineEpoch + 0.001) {
-            playAttempt.firstPresentedAdvance = {
-              atMs: player.latestPresentedFrameAtMs,
-              epoch: mapped.epoch,
-              delayMs: Math.max(0, player.latestPresentedFrameAtMs - playAttempt.issuedAtMs)
-            };
+      callbackId = null;
+      if (cancelled || !this.isCurrentCameraWork(player, generation) || player.video !== video ||
+          player.hls !== hls) return;
+      if (player.lifecycleState === "participating") {
+        try {
+          const mapped = mediaToEpoch(player.timing, Number(metadata?.mediaTime));
+          if (!mapped.isBoundary) {
+            player.latestPresentedFrameEpoch = mapped.epoch;
+            player.latestPresentedFrameAtMs = this._now();
+            player.latestPresentedFramePresentationId = player.presentationId;
+            player.presentedFrameCount += 1;
+            const playAttempt = player.lastPlayAttempt;
+            if (playAttempt?.presentationId === player.presentationId &&
+                playAttempt.firstPresentedAdvance === null &&
+                Number.isFinite(playAttempt.baselineEpoch) &&
+                mapped.epoch > playAttempt.baselineEpoch + 0.001) {
+              playAttempt.firstPresentedAdvance = {
+                atMs: player.latestPresentedFrameAtMs,
+                epoch: mapped.epoch,
+                delayMs: Math.max(0, player.latestPresentedFrameAtMs - playAttempt.issuedAtMs)
+              };
+            }
+            if (this.captureHistoricalFrame(player, video, mapped.epoch)) {
+              if (player.holdStartedAtMs != null) {
+                try {
+                  this.recordCameraBoundary(player, "held-frame-ended", {
+                    durationMs: this._now() - player.holdStartedAtMs,
+                    representedEpoch: player.heldFrameEpoch
+                  });
+                } catch {}
+                player.holdStartedAtMs = null;
+                this.setPlayerStatus(player, "", false);
+                this.updateHistoricalVideoStateBadge(player);
+              }
+              player.heldCanvas.hidden = true;
+            }
           }
-          const canvas = player.heldCanvas ?? this._document.createElement("canvas");
-          const context = canvas.getContext?.("2d", { alpha: false });
-          if (context) {
-            const width = Math.min(640, Number(video.videoWidth) || 640);
-            const height = Math.max(1, Math.round(width *
-              ((Number(video.videoHeight) || 360) / (Number(video.videoWidth) || 640))));
-            if (canvas.width !== width || canvas.height !== height) {
-              canvas.width = width;
-              canvas.height = height;
-            }
-            context.drawImage(video, 0, 0, width, height);
-            if (!player.heldCanvas) {
-              canvas.className = "review-held-frame";
-              canvas.hidden = true;
-              video.parentElement?.appendChild(canvas);
-              player.heldCanvas = canvas;
-            }
-            player.heldFrameEpoch = mapped.epoch;
-            if (player.holdStartedAtMs != null) {
-              this.recordCameraBoundary(player, "held-frame-ended", {
-                durationMs: this._now() - player.holdStartedAtMs,
-                representedEpoch: player.heldFrameEpoch
-              });
-              player.holdStartedAtMs = null;
-              this.setPlayerStatus(player, "", false);
-              this.updateHistoricalVideoStateBadge(player);
-            }
-            canvas.hidden = true;
-          }
+        } catch {
+          try { this.recordCameraBoundary(player, "held-frame-capture-unavailable"); } catch {}
         }
-      } catch {
-        this.recordCameraBoundary(player, "held-frame-capture-unavailable");
       }
       if (!cancelled) callbackId = video.requestVideoFrameCallback(onFrame);
     };
@@ -5960,8 +6029,33 @@ export class ReviewController {
     };
   }
 
+  // Draws the presented frame into the camera's held-frame canvas, owned by its presentation.
+  captureHistoricalFrame(player, video, epoch) {
+    const canvas = player.heldCanvas ?? this._document.createElement("canvas");
+    const context = canvas.getContext?.("2d", { alpha: false });
+    if (!context) return false;
+    const width = Math.min(640, Number(video.videoWidth) || 640);
+    const height = Math.max(1, Math.round(width *
+      ((Number(video.videoHeight) || 360) / (Number(video.videoWidth) || 640))));
+    if (canvas.width !== width || canvas.height !== height) {
+      canvas.width = width;
+      canvas.height = height;
+    }
+    context.drawImage(video, 0, 0, width, height);
+    if (!player.heldCanvas) {
+      canvas.className = "review-held-frame";
+      canvas.hidden = true;
+      video.parentElement?.appendChild(canvas);
+      player.heldCanvas = canvas;
+    }
+    player.heldFrameEpoch = epoch;
+    player.heldFrameHls = player.hls;
+    return true;
+  }
+
   holdHistoricalFrame(player, reason) {
-    if (!player.heldCanvas ||
+    // Hold only a frame that the presentation being left actually presented.
+    if (!player.heldCanvas || !player.hls || player.heldFrameHls !== player.hls ||
         !Number.isFinite(player.heldFrameEpoch) || player.holdStartedAtMs != null) return;
     player.heldCanvas.hidden = false;
     player.holdStartedAtMs = this._now();
@@ -5984,19 +6078,43 @@ export class ReviewController {
       this.queueHistoricalAvailabilityEvaluation("media_progress");
     };
     const onEnded = () => this.handleHistoricalVideoEnded(player, generation);
+    const hls = player.hls;
     const onError = () => {
-      if (this.isCurrentCameraWork(player, generation) &&
-          player.lifecycleState === "participating") {
+      if (!this.isCurrentCameraWork(player, generation) || player.hls !== hls ||
+          player.lifecycleState !== "participating") return;
+      if (REVIEW_FATAL_MEDIA_ERROR_CODES.has(player.video?.error?.code)) {
+        // Leaving the presentation records the failure once.
+        this.failPlayingPresentation(player, hls, "media_error");
+        return;
+      }
+      try {
         this.recordReviewFailure(player, { reason: "media_error", stage: "media",
           occurrence: player.presentationId });
-      }
+      } catch {}
     };
     player.video?.addEventListener("timeupdate", onTimeUpdate);
     player.video?.addEventListener("ended", onEnded);
     player.video?.addEventListener("error", onError);
     player.lifecycleListeners = [["timeupdate", onTimeUpdate], ["ended", onEnded],
       ["error", onError]];
-    if (!this._historicalPreparing) this.observeHistoricalFrames(player);
+    // Every participating presentation keeps a frame observer, including one joined
+    // while an explicit navigation still holds Review preparation.
+    this.observeHistoricalFrames(player);
+  }
+
+  // A confirmed fatal error ends the current presentation. Leaving is deferred out of
+  // the reporting dispatch and applies only if that presentation still plays; the
+  // camera then recovers through its bounded recovery record at current Review time.
+  failPlayingPresentation(player, hls, reason) {
+    const generation = player.generation;
+    queueMicrotask(() => {
+      if (!this.isCurrentCameraWork(player, generation) || player.hls !== hls ||
+          player.lifecycleState !== "participating" || player.transition) return;
+      if (this.leaveHistoricalCamera(player, reason, this.clock.absoluteTime,
+        player.lastAchievedEpoch, "failed")) {
+        this.recordCameraAcquisitionFailure(player);
+      }
+    });
   }
 
   async prepareCameraAtEpoch(player, targetEpoch, {
@@ -6158,7 +6276,9 @@ export class ReviewController {
         achievedEpoch: followReviewClock && player.initialPlacement?.verifiedFrame
           ? player.initialPlacement.landedEpoch : Number(player.resolvedEpoch)
       });
-      player.continuationRecovery = null;
+      // Acquisition alone does not prove recovery: the record and its attempts remain
+      // until the heartbeat credits sustained playback progress.
+      this.beginRecoveryProbation(player);
       this.installHistoricalLifecycleListeners(player, generation);
       if (this.clock.running && !followReviewClock) {
         if (!await this.startOwnedPlayback(player)) return false;
@@ -6232,7 +6352,13 @@ export class ReviewController {
         });
         // Recovery owns only this camera; transport keeps advancing. Recording truth,
         // not this attempt's reason or the transport state, decides whether it is owed.
-        if (!noCoverage) this.recordCameraAcquisitionFailure(player);
+        // A failed availability query proves only that coverage is unknown; it keeps
+        // the camera owed a recheck without consuming the acquisition budget.
+        if (!noCoverage) {
+          if (Number.isSafeInteger(error?.availabilityRequestToken)) {
+            this.recordCameraAvailabilityFailure(player);
+          } else this.recordCameraAcquisitionFailure(player);
+        }
         try {
           this.syncUnavailable(player.diagnosticReport, generation, player, failureReason);
           this.recordCameraBoundary(player, "join-failed", {
@@ -6428,12 +6554,15 @@ export class ReviewController {
         outcome: reason === "authoritative_recording_gap" ? "no_coverage" :
           reason === "continuous_presentation_exhausted" ? "normal_terminal" : "failure",
         stage: reason === "continuous_presentation_exhausted" ? "continuation" :
-          reason === "unexpected_media_end" ? "media" : player.reviewStage,
+          ["unexpected_media_end", "hls_fatal", "media_error", "media_stalled"].includes(reason)
+            ? "media" : player.reviewStage,
         targetEpoch });
     } catch {}
     this.cleanupHistoricalPlayer(player);
     player.lastTiming = player.timing ?? player.lastTiming ?? null;
     player.timing = null;
+    // Recording coverage ends a failure incident; later coverage is an ordinary join.
+    if (reason === "authoritative_recording_gap") player.continuationRecovery = null;
     this.setCameraLifecycle(player, state, {
       message: state === "failed"
         ? "Historical playback unavailable."
@@ -6459,16 +6588,19 @@ export class ReviewController {
   // automatic reacquisition. Eligibility reads only this record, Play intent, document
   // visibility and the controller clock; lifecycle labels and diagnostics never grant it.
   // A failed media acquisition (prepare, sign, manifest, readiness, seek, landing or
-  // Play) consumes one attempt. A failed availability query leaves coverage unknown
-  // and, as before, retries at the next evaluation without consuming that budget.
-  // Success clears the record; a new navigation request discards it.
+  // Play) or a failed playing presentation (fatal error, stall) consumes one attempt.
+  // A failed availability query leaves coverage unknown and retries at the next
+  // evaluation without consuming that budget; recovery attempts re-prove availability
+  // first, so presentations are not rebuilt while the provider cannot answer.
+  // Sustained verified playback clears the record; a new navigation request discards it.
   recordCameraAcquisitionFailure(player) {
     const attempts = (player.continuationRecovery?.attempts ?? 0) + 1;
     player.continuationRecovery = {
       attempts,
       exhausted: attempts >= REVIEW_CONTINUATION_MAX_ATTEMPTS,
       nextEligibleAtMs: this._now() + REVIEW_CONTINUATION_RETRY_MS * attempts,
-      availabilityFailed: false
+      availabilityFailed: false,
+      healthyProgressMs: 0
     };
   }
 
@@ -6478,8 +6610,17 @@ export class ReviewController {
       attempts: recovery?.attempts ?? 0,
       exhausted: recovery?.exhausted ?? false,
       nextEligibleAtMs: recovery?.nextEligibleAtMs ?? this._now(),
-      availabilityFailed: true
+      availabilityFailed: true,
+      healthyProgressMs: 0
     };
+  }
+
+  // A reacquired camera keeps its attempts; only credited playback progress clears them.
+  beginRecoveryProbation(player) {
+    const recovery = player.continuationRecovery;
+    if (!recovery) return;
+    recovery.availabilityFailed = false;
+    recovery.healthyProgressMs = 0;
   }
 
   cameraRecoveryDue(player) {
@@ -6503,10 +6644,15 @@ export class ReviewController {
         !this.cameraRecoveryDue(player)) return "failed";
     if (!explicit && this._historicalPlaybackRange &&
         targetEpoch >= this._historicalPlaybackRange.to) return "at_playback_end";
+    // A camera owed recovery (not a participating one on probation) re-proves
+    // availability before any rebuild: an unreachable provider fails this cheap query
+    // and keeps the camera eligible, instead of consuming its media budget.
+    const recovering = !explicit && Boolean(player.continuationRecovery) &&
+      player.lifecycleState !== "participating";
     const requestId = player.requestId;
     const lifecycleRevision = player.lifecycleRevision;
     try {
-      await this.ensureCameraAvailability(player, targetEpoch, { reason });
+      await this.ensureCameraAvailability(player, targetEpoch, { reason, force: recovering });
     } catch (error) {
       if (requestId !== this._reviewRequestId || !this.isCurrentCameraWork(player)) return "stale";
       if (player.lifecycleRevision !== lifecycleRevision ||
@@ -6544,8 +6690,12 @@ export class ReviewController {
       answered.availabilityFailed = false;
       if (answered.attempts === 0) player.continuationRecovery = null;
     }
-    const recovery = player.continuationRecovery;
-    if (recovery && !explicit && !this.clock.running) return "paused";
+    const recovery = recovering ? player.continuationRecovery : null;
+    // Availability answered; any owed rebuild still needs Play intent, a visible
+    // document and its backoff.
+    if (recovery && !this.cameraRecoveryDue(player)) {
+      return this.clock.running ? "deferred" : "paused";
+    }
     if (explicit || player.lifecycleState !== "participating") {
       targetEpoch = this.clock.absoluteTime;
       if (this.availabilityNeedsRefresh(player, targetEpoch)) {
@@ -6595,6 +6745,9 @@ export class ReviewController {
         if (!explicit) return "participating";
         player.seek = mapped.mediaTime;
         player.resolvedEpoch = mapped.resolvedEpoch;
+        // A frame captured before this navigation no longer represents the camera;
+        // only frames this presentation presents after the seek may be held.
+        player.heldFrameHls = null;
         const transition = this.beginCameraTransition(player, "explicit_seek", targetEpoch,
           { preservePlacement: true });
         transition.hls = player.hls;
@@ -6644,7 +6797,7 @@ export class ReviewController {
       }
     }
 
-    const recoveryAttempt = !explicit && Boolean(recovery);
+    const recoveryAttempt = Boolean(recovery);
     const joined = await this.prepareCameraAtEpoch(player, targetEpoch, {
       reason: explicit ? "explicit_seek_new_presentation" :
         recoveryAttempt ? "continuation_recovery" :
@@ -6793,6 +6946,7 @@ export class ReviewController {
         if (this.enforceHistoricalPlaybackBoundary()) return;
         if (this.evaluateRecordingGapSkip()) return;
         this.enforceHistoricalPresentationBoundary(generation);
+        this.enforceHistoricalPlaybackProgress(generation);
         this.queueHistoricalAvailabilityEvaluation("shared_interval");
         this.updateClockDisplay();
         this.updateDiagnostics();
