@@ -29,6 +29,8 @@ const REVIEW_COVERAGE_OPEN_TTL_SECONDS = 60;
 const REVIEW_COVERAGE_RETRY_SECONDS = 30;
 const REVIEW_COVERAGE_MAX_ENTRIES = 1024;
 const REVIEW_COVERAGE_EPSILON_SECONDS = 0.001;
+// The camera recovery budget, first proven on presentation continuation, now bounds
+// every automatic reacquisition: three failed acquisitions, retried 1 s x attempt apart.
 const REVIEW_CONTINUATION_MAX_ATTEMPTS = 3;
 const REVIEW_CONTINUATION_RETRY_MS = 1000;
 const REVIEW_AUTO_SNAP_FRAME_STALE_MS = 1000;
@@ -4057,7 +4059,8 @@ export class ReviewController {
     this.clock.pause();
     this.clearHistoricalBoundaryTimer();
     for (const player of this._historicalPlayers.values()) {
-      if (player.transition?.reason !== "continuation_recovery") continue;
+      // Automatic recovery runs only with Play intent; its record survives for Resume.
+      if (!player.transition?.recoveryAttempt) continue;
       this.cancelCameraTransition(player);
       this.cleanupHistoricalPlayer(player);
       this.setCameraLifecycle(player, "failed", {
@@ -4191,6 +4194,8 @@ export class ReviewController {
       player.availabilityRequestToken += 1;
       player.availabilityPromise = null;
       player.initialTimedOut = false;
+      // A new navigation request supersedes old recovery work with a fresh budget.
+      player.continuationRecovery = null;
       player.diagnosticReport = report;
       const diagnostic = report?.cameras?.[player.camera.name];
       if (diagnostic) Object.assign(diagnostic, {
@@ -4835,13 +4840,15 @@ export class ReviewController {
   async ensureCameraAvailability(player, targetEpoch, {
     force = false,
     transition = null,
-    reason = "availability_check"
+    reason = "availability_check",
+    // Initial-phase work is retired by its deadline; later recovery work is not.
+    initialPhase = false
   } = {}) {
     const requestId = player.requestId;
     const generation = player.generation;
     const assertOwned = () => {
       this.assertCurrentCameraWork(player, generation);
-      if (requestId !== this._reviewRequestId || player.initialTimedOut) {
+      if (requestId !== this._reviewRequestId || (initialPhase && player.initialTimedOut)) {
         throw new Error("Historical availability operation was superseded.");
       }
       if (transition) this.assertCurrentCameraTransition(player, transition);
@@ -4893,12 +4900,17 @@ export class ReviewController {
       error.availabilityRequestToken !== player.availabilityRequestToken;
   }
 
-  beginCameraTransition(player, reason, targetEpoch, { preservePlacement = false } = {}) {
+  beginCameraTransition(player, reason, targetEpoch, {
+    preservePlacement = false,
+    recoveryAttempt = false
+  } = {}) {
     this.cancelCameraTransition(player);
     if (!preservePlacement) player.initialPlacement = null;
     const transition = {
       token: ++this._cameraTransitionSequence,
       reason,
+      // Operational: an automatic retry owned by the camera's recovery record.
+      recoveryAttempt,
       targetEpoch,
       generation: player.generation,
       requestId: player.requestId,
@@ -4931,9 +4943,11 @@ export class ReviewController {
       slot: transition.slot,
       outcome: "pending"
     };
-    this.recordCameraBoundary(player, "transition-started", {
-      reason, targetEpoch, transitionToken: transition.token
-    });
+    try {
+      this.recordCameraBoundary(player, "transition-started", {
+        reason, targetEpoch, transitionToken: transition.token
+      });
+    } catch {}
     return transition;
   }
 
@@ -5573,14 +5587,18 @@ export class ReviewController {
     const timing = player.timing;
     const presentationId = player.presentationId;
     const issuedAt = this._now();
+    const view = video.ownerDocument?.defaultView ?? globalThis;
     let callbackId = null;
     let cancel = null;
+    let deadline = null;
     const promise = new Promise((resolve, reject) => {
       let settled = false;
       const finish = (error, observation = null) => {
         if (settled) return;
         settled = true;
+        view.clearTimeout(deadline);
         if (callbackId !== null) video.cancelVideoFrameCallback?.(callbackId);
+        callbackId = null;
         const index = transition.cancellations.indexOf(cancel);
         if (index >= 0) transition.cancellations.splice(index, 1);
         if (error) reject(error);
@@ -5595,6 +5613,7 @@ export class ReviewController {
       };
       const onFrame = (_now, metadata) => {
         callbackId = null;
+        if (settled) return;
         if (!this.isCurrentCameraTransition(player, transition) ||
             player.generation !== generation || player.video !== video ||
             player.hls !== hls || transition.hls !== hls ||
@@ -5639,6 +5658,12 @@ export class ReviewController {
       };
       cancel = () => finish(new Error("Historical frame observation was cancelled."));
       transition.cancellations.push(cancel);
+      // The attempt owns one media-readiness deadline from issue. Stale or unmappable
+      // frames re-arm only the callback; they can never extend the attempt.
+      deadline = view.setTimeout(
+        () => finish(new Error("Historical frame landing timed out.")),
+        this._mediaReadyTimeoutMs
+      );
       arm();
     });
     // The seek/canplay wait can fail before this promise is awaited.
@@ -5802,7 +5827,9 @@ export class ReviewController {
       if (player.reviewPlay !== "not_running") {
         player.reviewPlay = reason === "play_timeout" ? "timeout" : "rejected";
       }
-      this.leaveHistoricalCamera(player, reason, this.clock.absoluteTime, null, "failed");
+      if (this.leaveHistoricalCamera(player, reason, this.clock.absoluteTime, null, "failed")) {
+        this.recordCameraAcquisitionFailure(player);
+      }
       return false;
     } finally {
       playDiagnostic.settledAtMs = this._now();
@@ -5979,7 +6006,8 @@ export class ReviewController {
     report = player.diagnosticReport,
     Hls = null,
     availabilityKnown = false,
-    deferInitialPlacement = false
+    deferInitialPlacement = false,
+    recoveryAttempt = false
   } = {}) {
     const generation = player.generation;
     const requestId = player.requestId;
@@ -6007,6 +6035,7 @@ export class ReviewController {
           boundaryReason: "availability_api_failure",
           targetEpoch
         });
+        this.recordCameraAvailabilityFailure(player);
         return false;
       }
     }
@@ -6024,7 +6053,7 @@ export class ReviewController {
 
     if (player.lifecycleState === "participating") this.holdHistoricalFrame(player, reason);
     this.cleanupHistoricalPlayer(player);
-    const transition = this.beginCameraTransition(player, reason, targetEpoch);
+    const transition = this.beginCameraTransition(player, reason, targetEpoch, { recoveryAttempt });
     try {
       const LoadedHls = Hls ?? await this._loadHls();
       this.assertCurrentCameraTransition(player, transition);
@@ -6175,17 +6204,22 @@ export class ReviewController {
             ? { ...refreshed.containing }
             : null;
         } catch (refreshError) {
-          this.recordCameraBoundary(player, "availability-refresh-after-v2-failed", {
-            targetEpoch, error: sanitizeReviewError(refreshError)
-          });
+          try {
+            this.recordCameraBoundary(player, "availability-refresh-after-v2-failed", {
+              targetEpoch, error: sanitizeReviewError(refreshError)
+            });
+          } catch {}
         }
       }
       if (this.isCurrentCameraTransition(player, transition)) {
-        if (ledgerReason !== "rejoin_target_moved") {
-          this.recordReviewFailure(player, { reason: ledgerReason,
-            outcome: ledgerReason === "authoritative_recording_gap" ? "no_coverage" : "failure",
-            stage: player.reviewStage, targetEpoch });
-        }
+        // Diagnostics observe the failure first; they cannot interrupt its handling.
+        try {
+          if (ledgerReason !== "rejoin_target_moved") {
+            this.recordReviewFailure(player, { reason: ledgerReason,
+              outcome: ledgerReason === "authoritative_recording_gap" ? "no_coverage" : "failure",
+              stage: player.reviewStage, targetEpoch });
+          }
+        } catch {}
         this.cancelCameraTransition(player);
         this.cleanupHistoricalPlayer(player);
         const noCoverage = noRecording || failureReason === "authoritative_recording_gap" ||
@@ -6196,24 +6230,17 @@ export class ReviewController {
           boundaryReason: failureReason,
           targetEpoch
         });
-        if (!noCoverage && (reason === "presentation_window_exhausted" ||
-            reason === "continuation_recovery") &&
-            this.inspectPlayerAvailability(player, this.clock.absoluteTime).containing &&
-            (this.clock.running)) {
-          const attempts = (player.continuationRecovery?.attempts ?? 0) + 1;
-          player.continuationRecovery = {
-            attempts,
-            exhausted: attempts >= REVIEW_CONTINUATION_MAX_ATTEMPTS,
-            nextEligibleAtMs: this._now() + REVIEW_CONTINUATION_RETRY_MS * attempts
-          };
-          // Recovery owns only this camera; transport keeps advancing.
-        }
-        this.syncUnavailable(player.diagnosticReport, generation, player, failureReason);
-        this.recordCameraBoundary(player, "join-failed", {
-          reason, targetEpoch, transitionToken: transition.token,
-          outcome: noRecording ? "no_recording" : "failed",
-          error: sanitizeReviewError(error)
-        });
+        // Recovery owns only this camera; transport keeps advancing. Recording truth,
+        // not this attempt's reason or the transport state, decides whether it is owed.
+        if (!noCoverage) this.recordCameraAcquisitionFailure(player);
+        try {
+          this.syncUnavailable(player.diagnosticReport, generation, player, failureReason);
+          this.recordCameraBoundary(player, "join-failed", {
+            reason, targetEpoch, transitionToken: transition.token,
+            outcome: noRecording ? "no_recording" : "failed",
+            error: sanitizeReviewError(error)
+          });
+        } catch {}
         if (failureReason === "rejoin_target_moved") {
           void this.queueHistoricalAvailabilityEvaluation("rejoin_target_moved");
         }
@@ -6281,16 +6308,19 @@ export class ReviewController {
       return true;
     } catch (error) {
       if (this.isCurrentCameraTransition(player, transition)) {
-        this.recordReviewFailure(player, { reason: player.reviewStage === "seek"
-          ? "mapped_seek_failure" : "initial_landing_failed",
-        stage: player.reviewStage, targetEpoch: transition.targetEpoch });
+        try {
+          this.recordReviewFailure(player, { reason: player.reviewStage === "seek"
+            ? "mapped_seek_failure" : "initial_landing_failed",
+          stage: player.reviewStage, targetEpoch: transition.targetEpoch });
+        } catch {}
         this.cleanupHistoricalPlayer(player);
         this.setCameraLifecycle(player, "failed", {
           message: "Historical playback unavailable.",
           boundaryReason: "initial_landing_failed",
           targetEpoch: transition.targetEpoch
         });
-        this.syncUnavailable(report, generation, player, "initial_landing_failed");
+        this.recordCameraAcquisitionFailure(player);
+        try { this.syncUnavailable(report, generation, player, "initial_landing_failed"); } catch {}
       }
       return false;
     } finally {
@@ -6341,17 +6371,25 @@ export class ReviewController {
         progress?.seekToleranceReached === true && progress.postSeekReady === false
         ? "post_seek_playability_failure" : phaseReason;
       player.initialTimedOut = true;
+      // Retire the initial request too: recovery must not join work that can only fail.
+      player.availabilityRequestToken += 1;
+      player.availabilityPromise = null;
       const ledgerReason = phaseReason === "initial_landing_deadline" &&
         player.reviewStage === "seekable" ? "post_seek_playability_failure" : failureReason;
-      this.recordReviewFailure(player, { reason: ledgerReason,
-        stage: player.reviewStage, targetEpoch: player.lastTargetEpoch });
+      try {
+        this.recordReviewFailure(player, { reason: ledgerReason,
+          stage: player.reviewStage, targetEpoch: player.lastTargetEpoch });
+      } catch {}
       this.cleanupHistoricalPlayer(player);
       this.setCameraLifecycle(player, "failed", {
         message: "Historical playback unavailable.",
         boundaryReason: failureReason,
         targetEpoch: player.lastTargetEpoch
       });
-      this.syncUnavailable(player.diagnosticReport, player.generation, player, failureReason);
+      this.recordCameraAcquisitionFailure(player);
+      try {
+        this.syncUnavailable(player.diagnosticReport, player.generation, player, failureReason);
+      } catch {}
     }
   }
 
@@ -6385,12 +6423,14 @@ export class ReviewController {
     const inspected = this.inspectPlayerAvailability(player, targetEpoch);
     player.nextCoverageStart = inspected.nextStart;
     this.holdHistoricalFrame(player, reason);
-    this.recordReviewFailure(player, { reason,
-      outcome: reason === "authoritative_recording_gap" ? "no_coverage" :
-        reason === "continuous_presentation_exhausted" ? "normal_terminal" : "failure",
-      stage: reason === "continuous_presentation_exhausted" ? "continuation" :
-        reason === "unexpected_media_end" ? "media" : player.reviewStage,
-      targetEpoch });
+    try {
+      this.recordReviewFailure(player, { reason,
+        outcome: reason === "authoritative_recording_gap" ? "no_coverage" :
+          reason === "continuous_presentation_exhausted" ? "normal_terminal" : "failure",
+        stage: reason === "continuous_presentation_exhausted" ? "continuation" :
+          reason === "unexpected_media_end" ? "media" : player.reviewStage,
+        targetEpoch });
+    } catch {}
     this.cleanupHistoricalPlayer(player);
     player.lastTiming = player.timing ?? player.lastTiming ?? null;
     player.timing = null;
@@ -6402,15 +6442,54 @@ export class ReviewController {
       targetEpoch,
       achievedEpoch
     });
-    this.recordCameraBoundary(player, "leave-complete", {
-      reason, targetEpoch, achievedEpoch,
-      nextCoverageStart: inspected.nextStart,
-      outcome: state
-    });
+    try {
+      this.recordCameraBoundary(player, "leave-complete", {
+        reason, targetEpoch, achievedEpoch,
+        nextCoverageStart: inspected.nextStart,
+        outcome: state
+      });
+    } catch {}
     this.updateHistoricalAvailabilityStatus();
     this.updateTransport();
     this.updateDiagnostics();
     return true;
+  }
+
+  // One camera-owned recovery record, player.continuationRecovery, governs every
+  // automatic reacquisition. Eligibility reads only this record, Play intent, document
+  // visibility and the controller clock; lifecycle labels and diagnostics never grant it.
+  // A failed media acquisition (prepare, sign, manifest, readiness, seek, landing or
+  // Play) consumes one attempt. A failed availability query leaves coverage unknown
+  // and, as before, retries at the next evaluation without consuming that budget.
+  // Success clears the record; a new navigation request discards it.
+  recordCameraAcquisitionFailure(player) {
+    const attempts = (player.continuationRecovery?.attempts ?? 0) + 1;
+    player.continuationRecovery = {
+      attempts,
+      exhausted: attempts >= REVIEW_CONTINUATION_MAX_ATTEMPTS,
+      nextEligibleAtMs: this._now() + REVIEW_CONTINUATION_RETRY_MS * attempts,
+      availabilityFailed: false
+    };
+  }
+
+  recordCameraAvailabilityFailure(player) {
+    const recovery = player.continuationRecovery;
+    player.continuationRecovery = {
+      attempts: recovery?.attempts ?? 0,
+      exhausted: recovery?.exhausted ?? false,
+      nextEligibleAtMs: recovery?.nextEligibleAtMs ?? this._now(),
+      availabilityFailed: true
+    };
+  }
+
+  cameraRecoveryDue(player) {
+    const recovery = player.continuationRecovery;
+    if (!recovery || recovery.exhausted) return false;
+    if (recovery.availabilityFailed) return true;
+    // A hidden document cannot present the frame that proves an acquisition.
+    const document = this._root?.ownerDocument ?? this._document;
+    return this.clock.running && document?.visibilityState !== "hidden" &&
+      this._now() >= recovery.nextEligibleAtMs;
   }
 
   async reconcileHistoricalCamera(player, targetEpoch, {
@@ -6420,12 +6499,8 @@ export class ReviewController {
   } = {}) {
     if (!this.isCurrentCameraWork(player, player.generation)) return "stale";
     if (player.lifecycleState === "preparing") return "preparing";
-    const recovery = player.continuationRecovery;
     if (player.lifecycleState === "failed" && !explicit &&
-        player.boundaryReason !== "availability_api_failure" &&
-        (!recovery || recovery.exhausted ||
-          !this.clock.running ||
-          this._now() < recovery.nextEligibleAtMs)) return "failed";
+        !this.cameraRecoveryDue(player)) return "failed";
     if (!explicit && this._historicalPlaybackRange &&
         targetEpoch >= this._historicalPlaybackRange.to) return "at_playback_end";
     const requestId = player.requestId;
@@ -6438,7 +6513,9 @@ export class ReviewController {
           this.isStaleAvailabilityFailure(player, error)) return "superseded";
       if (player.lifecycleState === "participating") {
         if (explicit) {
-          this.leaveHistoricalCamera(player, "availability_api_failure", targetEpoch, null, "failed");
+          if (this.leaveHistoricalCamera(player, "availability_api_failure", targetEpoch, null, "failed")) {
+            this.recordCameraAvailabilityFailure(player);
+          }
           return "availability_failure";
         }
         this.recordReviewFailure(player, { reason: "availability_api_failure",
@@ -6456,16 +6533,32 @@ export class ReviewController {
         boundaryReason: "availability_api_failure",
         targetEpoch
       });
+      this.recordCameraAvailabilityFailure(player);
       return "availability_failure";
     }
     if (requestId !== this._reviewRequestId || !this.isCurrentCameraWork(player, player.generation)) return "stale";
     if (player.lifecycleRevision !== lifecycleRevision) return "superseded";
+    const answered = player.continuationRecovery;
+    if (answered?.availabilityFailed) {
+      // Coverage is known again; only failed acquisitions remain owed a retry.
+      answered.availabilityFailed = false;
+      if (answered.attempts === 0) player.continuationRecovery = null;
+    }
+    const recovery = player.continuationRecovery;
     if (recovery && !explicit && !this.clock.running) return "paused";
     if (explicit || player.lifecycleState !== "participating") {
       targetEpoch = this.clock.absoluteTime;
       if (this.availabilityNeedsRefresh(player, targetEpoch)) {
         try { await this.ensureCameraAvailability(player, targetEpoch, { reason }); }
-        catch { return "availability_failure"; }
+        catch (error) {
+          // Coverage at the current time is still unknown; a failed camera stays owed a retry.
+          if (player.lifecycleState === "failed" && this.isCurrentCameraWork(player, player.generation) &&
+              player.lifecycleRevision === lifecycleRevision &&
+              !this.isStaleAvailabilityFailure(player, error)) {
+            this.recordCameraAvailabilityFailure(player);
+          }
+          return "availability_failure";
+        }
         if (!this.isCurrentCameraWork(player, player.generation) ||
             player.lifecycleRevision !== lifecycleRevision) return "superseded";
       }
@@ -6480,6 +6573,8 @@ export class ReviewController {
         );
         return "left_gap";
       }
+      // A recording gap ends the failure; entering later coverage is an ordinary join.
+      player.continuationRecovery = null;
       this.setCameraLifecycle(player, "unavailable", {
         boundaryReason: "authoritative_recording_gap", targetEpoch
       });
@@ -6549,13 +6644,15 @@ export class ReviewController {
       }
     }
 
+    const recoveryAttempt = !explicit && Boolean(recovery);
     const joined = await this.prepareCameraAtEpoch(player, targetEpoch, {
       reason: explicit ? "explicit_seek_new_presentation" :
-        recovery ? "continuation_recovery" :
+        recoveryAttempt ? "continuation_recovery" :
           reason === "presentation_window_exhausted" ? reason : "availability_entry",
       autoplay,
       followReviewClock: true,
-      availabilityKnown: true
+      availabilityKnown: true,
+      recoveryAttempt
     });
     return joined ? "prepared" : "prepare_failed";
   }
@@ -6723,7 +6820,9 @@ export class ReviewController {
       await this.waitForInitialPhase(candidates, async player => {
         try {
           player.reviewStage = "availability";
-          await this.ensureCameraAvailability(player, targetEpoch, { reason: "initial_selection" });
+          await this.ensureCameraAvailability(player, targetEpoch, {
+            reason: "initial_selection", initialPhase: true
+          });
           if (requestId !== this._reviewRequestId || player.initialTimedOut || !this.isCurrentCameraWork(player)) return;
           const inspected = this.inspectPlayerAvailability(player, this.clock.absoluteTime);
           player.nextCoverageStart = inspected.nextStart;
@@ -6755,6 +6854,7 @@ export class ReviewController {
             message: "Recording availability unavailable.",
             boundaryReason: "availability_api_failure", targetEpoch
           });
+          this.recordCameraAvailabilityFailure(player);
           this.syncUnavailable(report, generation, player, "availability_api_failure");
         } finally {
           if (requestId === this._reviewRequestId) this.settlePlaybackReadiness(player);

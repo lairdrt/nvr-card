@@ -67,8 +67,8 @@ function prepared(camera, origin, target = 1800000000) {
   };
 }
 
-function presentationPrepared(camera, origin, target = 1800000000, logicalEnd = target + 120) {
-  const logicalStart = target - 15;
+function presentationPrepared(camera, origin, target = 1800000000, logicalEnd = target + 120,
+  logicalStart = target - 15) {
   const mediaStart = logicalStart - origin;
   const mediaEnd = logicalEnd - origin;
   return {
@@ -12326,3 +12326,734 @@ test("Snap Past Crap: preparation timeout releases the clock after a committed s
   c.pausePlayback();
   assert.equal(c.evaluateRecordingGapSkip(), false);
 });
+
+// R-14/R-13/R-15 Phase 1: bounded frame landing and one camera-owned recovery policy.
+// Every media-readiness wait, frame landing included, shares one distinctive bound so the
+// controlled view timers below can identify it. The existing 500 ms heartbeat and all
+// view timeouts are captured and driven by hand; no assertion depends on wall time.
+const RECOVERY_TIMEOUT_MS = 4321;
+const RECOVERY_T = 1800000000;
+const RECOVERY_FULL_RUN = [{ start: RECOVERY_T - 7200, end: RECOVERY_T + 7200 }];
+const RECOVERY_FULL_COVERAGE = { drive_up: RECOVERY_FULL_RUN, drive_down: RECOVERY_FULL_RUN };
+const RECOVERY_REJOIN_COVERAGE = {
+  drive_up: RECOVERY_FULL_RUN,
+  drive_down: [{ start: RECOVERY_T + 5, end: RECOVERY_T + 7200 }]
+};
+
+function manualViewTimers(window) {
+  const timeouts = [];
+  const intervals = [];
+  let sequence = 0;
+  const nativeClearTimeout = window.clearTimeout.bind(window);
+  const nativeClearInterval = window.clearInterval.bind(window);
+  window.setTimeout = (callback, delay = 0, ...args) => {
+    const job = { id: `view-timeout-${++sequence}`, callback, delay, args, active: true };
+    timeouts.push(job);
+    return job.id;
+  };
+  window.clearTimeout = id => {
+    const job = timeouts.find(candidate => candidate.id === id);
+    if (job) job.active = false;
+    else nativeClearTimeout(id);
+  };
+  window.setInterval = (callback, delay = 0) => {
+    const job = { id: `view-interval-${++sequence}`, callback, delay, active: true };
+    intervals.push(job);
+    return job.id;
+  };
+  window.clearInterval = id => {
+    const job = intervals.find(candidate => candidate.id === id);
+    if (job) job.active = false;
+    else nativeClearInterval(id);
+  };
+  return {
+    pending: (delay = null) => timeouts.filter(job =>
+      job.active && (delay === null || job.delay === delay)),
+    fire(job) {
+      assert.ok(job?.active, "only an active view timeout can fire");
+      job.active = false;
+      job.callback(...job.args);
+    },
+    heartbeat() {
+      const job = intervals.findLast(candidate => candidate.active && candidate.delay === 500);
+      assert.ok(job, "the Review heartbeat must be active");
+      job.callback();
+    },
+    heartbeatActive: () => intervals.some(job => job.active)
+  };
+}
+
+async function drainReview(controller) {
+  for (let index = 0; index < 6; index += 1) {
+    await controller._availabilityEvaluationPromise;
+    await new Promise(resolve => setImmediate(resolve));
+  }
+}
+
+async function createRecoveryScene(t, {
+  coverage = RECOVERY_REJOIN_COVERAGE, availabilityResponder = null, autoplay = true,
+  debug = false, deferredFrame = new Set(), frameOffsetByCamera = new Map(),
+  presentationResponder = null, playResponder = null, scheduleInitialDeadline = null,
+  preparationTimeoutMs = 0, awaitInitial = true, recordingCoverage = false
+} = {}) {
+  const time = { ms: 1000 };
+  const harness = createHistoricalHarness({
+    now: () => time.ms, mediaReadyTimeoutMs: RECOVERY_TIMEOUT_MS, debug, recordingCoverage,
+    availabilityResponder: availabilityResponder ?? recordingCoverageResponder(coverage),
+    deferredFrame, frameOffsetByCamera, presentationResponder, playResponder,
+    scheduleInitialDeadline, preparationTimeoutMs
+  });
+  t.after(() => harness.close());
+  const timers = manualViewTimers(harness.window);
+  const controller = harness.controller;
+  const scene = {
+    harness, controller, timers, time, deferredFrame,
+    player: name => controller._historicalPlayers.get(name),
+    media: name => harness.mediaControls.findLast(control => control.camera === name),
+    prepares: camera => harness.calls.filter(call =>
+      call.type === "frigate_max/v2/vod/prepare" && call.camera === camera),
+    plays: name => harness.playCalls.filter(call => call.camera === name).length,
+    advance(ms) { time.ms += ms; },
+    async tick() {
+      timers.heartbeat();
+      await drainReview(controller);
+    },
+    landingDeadline(name) {
+      const player = controller._historicalPlayers.get(name);
+      assert.equal(player.reviewStage, "landing", `${name} must be waiting for frame landing`);
+      const pending = timers.pending(RECOVERY_TIMEOUT_MS);
+      assert.equal(pending.length, 1, `${name}'s landing attempt must own exactly one deadline`);
+      return pending[0];
+    },
+    // Captures a healthy peer; the returned check proves nothing reacquired or disturbed it.
+    peer(name = "Drive Up") {
+      const player = controller._historicalPlayers.get(name);
+      const before = { hls: player.hls, seeks: player.video.currentTimeWrites.length,
+        pauses: player.video.pauseCount, plays: scene.plays(name), paused: player.video.paused };
+      return () => {
+        assert.equal(player.lifecycleState, "participating");
+        assert.ok(player.hls === before.hls, `${name} keeps its presentation`);
+        assert.equal(player.video.currentTimeWrites.length, before.seeks, `${name} is not reseeked`);
+        assert.equal(player.video.pauseCount, before.pauses, `${name} is not paused`);
+        assert.equal(scene.plays(name), before.plays, `${name} receives no extra Play`);
+        assert.equal(player.video.paused, before.paused);
+      };
+    }
+  };
+  scene.run = controller.playHistorical(RECOVERY_T, { autoplay });
+  if (awaitInitial) await scene.run;
+  return scene;
+}
+
+// Drive Down enters coverage at T + 5; the heartbeat starts its rejoin with frames withheld.
+async function rejoinIntoLanding(scene, seconds = 6) {
+  scene.deferredFrame.add("Drive Down");
+  scene.advance(seconds * 1000);
+  scene.timers.heartbeat();
+  const down = scene.player("Drive Down");
+  await waitForCondition(() => down.reviewStage === "landing" && down.lifecycleState === "preparing",
+    "Drive Down must reach frame landing");
+  return down;
+}
+
+async function failRejoinLanding(scene) {
+  const down = await rejoinIntoLanding(scene);
+  scene.timers.fire(scene.landingDeadline("Drive Down"));
+  await waitForCondition(() => down.lifecycleState === "failed", "the landing attempt must settle");
+  return down;
+}
+
+const rejectPlayFor = (camera, rejecting) => name => name === camera && rejecting()
+  ? Promise.reject(new Error("synthetic Play rejection")) : Promise.resolve();
+
+test("R-14 landing deadline: a gap rejoin without a presented frame fails only that camera", async t => {
+  const scene = await createRecoveryScene(t);
+  const { controller, timers } = scene;
+  const down = scene.player("Drive Down");
+  assert.equal(down.lifecycleState, "unavailable");
+  const untouched = scene.peer();
+  await rejoinIntoLanding(scene);
+  const deadline = scene.landingDeadline("Drive Down");
+  const media = scene.media("Drive Down");
+  timers.fire(deadline);
+  await waitForCondition(() => down.lifecycleState === "failed", "the landing attempt must settle");
+  // A media failure inside recorded time is never presented as a recording gap.
+  assert.notEqual(down.boundaryReason, "authoritative_recording_gap");
+  assert.equal(controller.reviewCameraStatusIndicator(down), "Unavailable");
+  const record = controller.getRecentReviewFailures().find(item =>
+    item.camera === "Drive Down" && item.outcome === "failure");
+  assert.equal(record.reason, "initial_landing_failed");
+  assert.equal(record.coverage, "covered");
+  assert.equal(down.continuationRecovery.attempts, 1);
+  assert.equal(down.continuationRecovery.exhausted, false);
+  assert.equal(down.continuationRecovery.nextEligibleAtMs, scene.time.ms + 1000);
+  assert.equal(down.transition, null);
+  assert.equal(down.hls, null);
+  assert.equal(media.pendingFrameCallbacks().length, 0, "no RVFC callback survives the attempt");
+  assert.equal(timers.pending().length, 0, "no landing timer survives the attempt");
+  assert.equal(controller.clock.running, true);
+  untouched();
+});
+
+test("R-13 recovery: a failed rejoin reacquires at the current Review time after its backoff", async t => {
+  const scene = await createRecoveryScene(t);
+  const { controller, timers } = scene;
+  const untouched = scene.peer();
+  const down = await failRejoinLanding(scene);
+  scene.deferredFrame.delete("Drive Down");
+  scene.advance(999);
+  await scene.tick();
+  assert.equal(scene.prepares("drive_down").length, 1, "the backoff holds the retry");
+  assert.equal(down.lifecycleState, "failed");
+  scene.advance(1);
+  timers.heartbeat();
+  await waitForCondition(() => down.lifecycleState === "participating" && down.video.paused === false,
+    "the heartbeat must recover the camera");
+  assert.equal(scene.prepares("drive_down").length, 2);
+  // Drive Up's media still reports T; the Review clock alone chooses the rejoin time.
+  assert.equal(scene.player("Drive Up").video.currentTime, 21);
+  assert.equal(scene.prepares("drive_down").at(-1).target, RECOVERY_T + 7);
+  assert.equal(down.initialPlacement.verifiedFrame, true);
+  assert.equal(down.initialPlacement.landedEpoch, RECOVERY_T + 7);
+  assert.equal(controller.clock.absoluteTime, RECOVERY_T + 7);
+  assert.equal(down.continuationRecovery, null);
+  assert.equal(timers.pending().length, 0);
+  untouched();
+});
+
+test("R-14 landing deadline: repeated unmappable frames at a coverage start cannot hold an explicit seek", async t => {
+  const T = RECOVERY_T;
+  const downRuns = [{ start: T - 1000, end: T + 10 }, { start: T + 20, end: T + 2000 }];
+  const scene = await createRecoveryScene(t, {
+    autoplay: false,
+    coverage: { drive_up: RECOVERY_FULL_RUN, drive_down: downRuns },
+    frameOffsetByCamera: new Map([["Drive Down", -0.021]]),
+    presentationResponder: message => {
+      if (message.camera !== "drive_down") {
+        return Promise.resolve(presentationPrepared(message.camera, message.target - 21, message.target));
+      }
+      // As build_presentation_window: the logical start never precedes its coverage run.
+      const run = downRuns.find(item => item.start <= message.target && message.target < item.end);
+      return Promise.resolve(presentationPrepared(message.camera, message.target - 22, message.target,
+        Math.min(run.end, message.target + 120), Math.max(run.start, message.target - 15)));
+    }
+  });
+  const { controller, timers, harness } = scene;
+  const up = scene.player("Drive Up");
+  const down = scene.player("Drive Down");
+  assert.equal(down.lifecycleState, "participating");
+  const seek = track(controller.seekHistoricalToEpoch(T + 20, { autoplay: false }));
+  await waitForCondition(() => down.reviewStage === "landing" && down.reviewLanding === "unmapped_frame",
+    "the first frame lands 21 ms before the presentation's media start");
+  const deadline = scene.landingDeadline("Drive Down");
+  const media = scene.media("Drive Down");
+  for (let index = 0; index < 3; index += 1) media.emitFrame();
+  assert.equal(down.reviewLanding, "unmapped_frame");
+  assert.deepEqual(timers.pending(RECOVERY_TIMEOUT_MS), [deadline],
+    "unmappable frames neither extend nor re-arm the attempt's deadline");
+  assert.equal(seek.settled, false);
+  assert.equal(controller.state.historicalPreparing, true);
+  // While the seek is held, any transport render disables relative seeking.
+  controller.updateTransport();
+  assert.equal(harness.transportRoot.querySelector(".review-back-ten").disabled, true);
+  timers.fire(deadline);
+  assert.equal(await seek.promise, true, "the explicit seek settles");
+  assert.equal(controller.state.historicalPreparing, false);
+  assert.equal(controller.clock.absoluteTime, T + 20);
+  assert.equal(up.lifecycleState, "participating");
+  assert.equal(up.initialPlacement.landedEpoch, T + 20);
+  assert.equal(down.lifecycleState, "failed");
+  assert.equal(controller.reviewCameraStatusIndicator(down), "Unavailable");
+  assert.equal(down.continuationRecovery.attempts, 1);
+  assert.equal(media.pendingFrameCallbacks().length, 0);
+  assert.equal(timers.pending().length, 0);
+  for (const selector of [".review-back-ten", ".review-forward-ten"]) {
+    assert.equal(harness.transportRoot.querySelector(selector).disabled, false);
+  }
+  // Pause is authoritative: no automatic reacquisition while paused.
+  const prepares = scene.prepares("drive_down").length;
+  scene.advance(10000);
+  await scene.tick();
+  await scene.tick();
+  assert.equal(scene.prepares("drive_down").length, prepares);
+  assert.equal(down.lifecycleState, "failed");
+});
+
+test("R-14 landing deadline: VOD continuation without a frame fails, then recovers at current Review time", async t => {
+  const T = RECOVERY_T;
+  const counts = new Map();
+  const scene = await createRecoveryScene(t, {
+    coverage: RECOVERY_FULL_COVERAGE,
+    presentationResponder: message => {
+      const count = (counts.get(message.camera) ?? 0) + 1;
+      counts.set(message.camera, count);
+      const end = message.camera === "drive_up" && count === 1 ? T + 20 : message.target + 120;
+      return Promise.resolve(presentationPrepared(message.camera, message.target - 21,
+        message.target, end));
+    }
+  });
+  const { timers } = scene;
+  const up = scene.player("Drive Up");
+  assert.equal(up.timing.logical_wall_end, T + 20);
+  const untouched = scene.peer("Drive Down");
+  scene.deferredFrame.add("Drive Up");
+  scene.advance(20000);
+  up.video.currentTime = up.timing.logical_media_end_position;
+  timers.heartbeat();
+  await waitForCondition(() => up.reviewStage === "landing" && scene.prepares("drive_up").length === 2,
+    "the successor presentation must reach frame landing");
+  timers.fire(scene.landingDeadline("Drive Up"));
+  await waitForCondition(() => up.lifecycleState === "failed", "the successor landing must settle");
+  assert.equal(up.continuationRecovery.attempts, 1);
+  assert.equal(timers.pending().length, 0);
+  scene.deferredFrame.delete("Drive Up");
+  scene.advance(1000);
+  timers.heartbeat();
+  await waitForCondition(() => up.lifecycleState === "participating" && up.video.paused === false,
+    "the continuation must recover");
+  assert.equal(scene.prepares("drive_up").length, 3);
+  assert.equal(scene.prepares("drive_up").at(-1).target, T + 21);
+  assert.equal(up.initialPlacement.landedEpoch, T + 21);
+  assert.equal(up.continuationRecovery, null);
+  assert.equal(timers.pending().length, 0);
+  untouched();
+});
+
+test("R-14 explicit seek: one camera without frames settles within bounded landing deadlines", async t => {
+  const T = RECOVERY_T;
+  const scene = await createRecoveryScene(t, { coverage: RECOVERY_FULL_COVERAGE, autoplay: false });
+  const { controller, timers, harness } = scene;
+  const up = scene.player("Drive Up");
+  const down = scene.player("Drive Down");
+  scene.deferredFrame.add("Drive Down");
+  const seek = track(controller.seekHistoricalToEpoch(T + 30, { autoplay: false }));
+  await waitForCondition(() => down.reviewStage === "landing" &&
+    up.initialPlacement?.requestedEpoch === T + 30, "the reused presentation must reach landing");
+  const back = harness.transportRoot.querySelector(".review-back-ten");
+  // The reused presentation never presents a frame; neither does the fresh fallback.
+  for (const attempt of [1, 2]) {
+    const deadline = scene.landingDeadline("Drive Down");
+    assert.equal(seek.settled, false);
+    assert.equal(controller.state.historicalPreparing, true);
+    // While the seek is held, any transport render disables relative seeking.
+    controller.updateTransport();
+    assert.equal(back.disabled, true);
+    timers.fire(deadline);
+    if (attempt === 1) {
+      await waitForCondition(() => scene.prepares("drive_down").length === 2 &&
+        down.reviewStage === "landing" && timers.pending(RECOVERY_TIMEOUT_MS).length === 1,
+      "the explicit seek falls back to a fresh presentation");
+    }
+  }
+  assert.equal(await seek.promise, true, "the explicit seek settles");
+  assert.equal(controller.state.historicalPreparing, false);
+  assert.equal(back.disabled, false);
+  assert.equal(controller.clock.absoluteTime, T + 30);
+  assert.equal(controller.clock.running, false);
+  assert.equal(up.lifecycleState, "participating");
+  assert.equal(up.initialPlacement.landedEpoch, T + 30);
+  assert.equal(up.video.currentTimeWrites.length, 2, "the healthy camera seeks once for the operation");
+  assert.equal(down.lifecycleState, "failed");
+  assert.equal(down.continuationRecovery.attempts, 1);
+  assert.equal(timers.pending().length, 0);
+});
+
+test("R-13 recovery: a camera retired by the initial landing deadline recovers while playback runs", async t => {
+  const deadlines = manualInitialDeadlines();
+  const scene = await createRecoveryScene(t, {
+    coverage: RECOVERY_FULL_COVERAGE, awaitInitial: false, preparationTimeoutMs: 1500,
+    deferredFrame: new Set(["Drive Down"]), scheduleInitialDeadline: deadlines.schedule.bind(deadlines)
+  });
+  const { timers } = scene;
+  await waitForCondition(() => scene.player("Drive Up")?.lifecycleState === "participating" &&
+    scene.player("Drive Down")?.reviewStage === "landing", "initial acquisition must reach landing");
+  deadlines.jobs.find(job => job.active && job.delay === 1500).fire();
+  deadlines.fireActive();
+  await scene.run;
+  const down = scene.player("Drive Down");
+  assert.equal(down.lifecycleState, "failed");
+  assert.equal(down.boundaryReason, "initial_landing_deadline");
+  assert.equal(down.continuationRecovery.attempts, 1);
+  assert.equal(timers.pending().length, 0, "the retired landing released its deadline");
+  const untouched = scene.peer();
+  scene.deferredFrame.delete("Drive Down");
+  scene.advance(1000);
+  timers.heartbeat();
+  await waitForCondition(() => down.lifecycleState === "participating" && down.video.paused === false,
+    "the initially failed camera must recover");
+  assert.equal(scene.prepares("drive_down").at(-1).target, RECOVERY_T + 1);
+  assert.equal(down.initialPlacement.landedEpoch, RECOVERY_T + 1);
+  untouched();
+});
+
+test("R-13 recovery: obsolete initial availability work cannot hold or disturb a recovered camera", async t => {
+  const deadlines = manualInitialDeadlines();
+  const answer = recordingCoverageResponder(RECOVERY_FULL_COVERAGE);
+  let releaseInitial = null;
+  const scene = await createRecoveryScene(t, {
+    awaitInitial: false, preparationTimeoutMs: 1500,
+    scheduleInitialDeadline: deadlines.schedule.bind(deadlines),
+    availabilityResponder: message => {
+      if (message.camera !== "drive_down" || releaseInitial) return answer(message);
+      return new Promise(resolve => { releaseInitial = () => resolve(answer(message)); });
+    }
+  });
+  const { harness, timers } = scene;
+  await waitForCondition(() => scene.player("Drive Up")?.lifecycleState === "participating" &&
+    releaseInitial !== null, "the initial availability request must be in flight");
+  deadlines.jobs.find(job => job.active && job.delay === 1500).fire();
+  deadlines.fireActive();
+  await scene.run;
+  const down = scene.player("Drive Down");
+  assert.equal(down.boundaryReason, "initial_availability_deadline");
+  assert.equal(down.continuationRecovery.attempts, 1);
+  scene.advance(1000);
+  timers.heartbeat();
+  await waitForCondition(() => down.lifecycleState === "participating" && down.video.paused === false,
+    "recovery must not wait on the retired initial request");
+  const hls = down.hls;
+  releaseInitial();
+  await drainReview(scene.controller);
+  assert.equal(scene.prepares("drive_down").length, 1, "the obsolete initial work never acquires");
+  assert.equal(harness.calls.filter(call => call.type === "frigate_max/v1/recordings/availability" &&
+    call.camera === "drive_down").length, 2);
+  assert.ok(down.hls === hls, "the recovered presentation is retained");
+  assert.equal(down.lifecycleState, "participating");
+});
+
+test("R-13 recovery: a manifest failure during rejoin recovers after backoff", async t => {
+  const scene = await createRecoveryScene(t);
+  const { controller, timers } = scene;
+  const Base = scene.harness.instances[0].constructor;
+  let failManifest = true;
+  controller._loadHls = async () => class extends Base {
+    loadSource(source) {
+      const camera = this.video?.closest(".review-camera-panel")?.dataset.camera;
+      if (!failManifest || camera !== "Drive Down") return super.loadSource(source);
+      this.source = source;
+      for (const handler of [...(this.handlers.get(Base.Events.ERROR) ?? [])]) {
+        handler(Base.Events.ERROR, { fatal: true, type: "networkError", details: "manifestLoadError" });
+      }
+    }
+  };
+  const down = scene.player("Drive Down");
+  const untouched = scene.peer();
+  scene.advance(6000);
+  timers.heartbeat();
+  await waitForCondition(() => down.lifecycleState === "failed", "the manifest failure must settle");
+  assert.equal(down.boundaryReason, "manifest_failure");
+  assert.equal(down.continuationRecovery.attempts, 1);
+  failManifest = false;
+  scene.advance(1000);
+  timers.heartbeat();
+  await waitForCondition(() => down.lifecycleState === "participating" && down.video.paused === false,
+    "the manifest failure must recover");
+  assert.equal(scene.prepares("drive_down").at(-1).target, RECOVERY_T + 7);
+  assert.equal(down.continuationRecovery, null);
+  untouched();
+});
+
+test("R-13 recovery: rejoin Play rejection recovers after backoff", async t => {
+  let rejecting = true;
+  const scene = await createRecoveryScene(t, {
+    playResponder: rejectPlayFor("Drive Down", () => rejecting)
+  });
+  const { timers } = scene;
+  const down = scene.player("Drive Down");
+  const untouched = scene.peer();
+  scene.advance(6000);
+  timers.heartbeat();
+  await waitForCondition(() => down.lifecycleState === "failed", "the rejected Play must settle");
+  assert.equal(down.boundaryReason, "rejoin_play_rejected");
+  assert.equal(down.continuationRecovery.attempts, 1);
+  assert.equal(down.video.paused, true);
+  rejecting = false;
+  scene.advance(1000);
+  timers.heartbeat();
+  await waitForCondition(() => down.lifecycleState === "participating" && down.video.paused === false,
+    "the rejected Play must recover");
+  assert.equal(scene.prepares("drive_down").at(-1).target, RECOVERY_T + 7);
+  untouched();
+});
+
+test("R-13 recovery: a rejected Play on Resume recovers the camera at the current Review time", async t => {
+  let rejecting = true;
+  const scene = await createRecoveryScene(t, {
+    coverage: RECOVERY_FULL_COVERAGE, autoplay: false,
+    playResponder: rejectPlayFor("Drive Down", () => rejecting)
+  });
+  const { controller, timers } = scene;
+  const down = scene.player("Drive Down");
+  assert.equal(controller.resumePlayback(), true);
+  await waitForCondition(() => down.lifecycleState === "failed", "the rejected Play must settle");
+  assert.equal(down.boundaryReason, "play_rejected");
+  assert.equal(down.continuationRecovery.attempts, 1);
+  const untouched = scene.peer();
+  rejecting = false;
+  scene.advance(1000);
+  timers.heartbeat();
+  await waitForCondition(() => down.lifecycleState === "participating" && down.video.paused === false,
+    "the rejected Play must recover");
+  assert.equal(scene.prepares("drive_down").at(-1).target, RECOVERY_T + 1);
+  untouched();
+});
+
+test("R-14 cancellation: removing a camera during landing releases its deadline and frame callback", async t => {
+  const scene = await createRecoveryScene(t);
+  const { controller, timers } = scene;
+  const untouched = scene.peer();
+  await rejoinIntoLanding(scene);
+  const deadline = scene.landingDeadline("Drive Down");
+  const media = scene.media("Drive Down");
+  // As D6: shrinking the layout retires Drive Down while Drive Up keeps playing.
+  controller.setReviewLayout("1x1");
+  assert.equal(controller._historicalPlayers.has("Drive Down"), false);
+  assert.equal(deadline.active, false, "cancellation releases the landing deadline");
+  assert.equal(media.pendingFrameCallbacks().length, 0, "cancellation releases the frame callback");
+  deadline.callback();
+  await drainReview(controller);
+  assert.equal(scene.prepares("drive_down").length, 1);
+  assert.equal(timers.pending(RECOVERY_TIMEOUT_MS).length, 0, "no media-readiness timer remains");
+  untouched();
+});
+
+test("R-14 Pause: an ordinary rejoin landing still settles, and Resume recovers it", async t => {
+  const scene = await createRecoveryScene(t);
+  const { controller, timers } = scene;
+  const down = await rejoinIntoLanding(scene);
+  assert.equal(controller.pausePlayback(), true);
+  assert.equal(down.lifecycleState, "preparing", "Pause keeps preparatory rejoin work");
+  timers.fire(scene.landingDeadline("Drive Down"));
+  await waitForCondition(() => down.lifecycleState === "failed", "the paused landing must settle");
+  assert.equal(down.continuationRecovery.attempts, 1);
+  scene.deferredFrame.delete("Drive Down");
+  scene.advance(5000);
+  await scene.tick();
+  await scene.tick();
+  assert.equal(scene.prepares("drive_down").length, 1, "no automatic retry while paused");
+  assert.equal(controller.clock.running, false);
+  assert.equal(controller.resumePlayback(), true);
+  await waitForCondition(() => down.lifecycleState === "participating" && down.video.paused === false,
+    "Resume must recover the camera");
+  assert.equal(scene.prepares("drive_down").at(-1).target, RECOVERY_T + 6,
+    "Resume recovers at the paused Review time");
+  assert.equal(controller.clock.running, true);
+  assert.equal(timers.pending().length, 0);
+});
+
+test("R-14 Pause: an in-flight recovery landing is cancelled without consuming an attempt, and Resume retries", async t => {
+  const scene = await createRecoveryScene(t);
+  const { controller, timers } = scene;
+  const down = await failRejoinLanding(scene);
+  scene.advance(1000);
+  timers.heartbeat();
+  await waitForCondition(() => down.reviewStage === "landing" && down.lifecycleState === "preparing" &&
+    scene.prepares("drive_down").length === 2, "the recovery attempt must reach landing");
+  const deadline = scene.landingDeadline("Drive Down");
+  const media = scene.media("Drive Down");
+  assert.equal(controller.pausePlayback(), true);
+  assert.equal(down.lifecycleState, "failed");
+  assert.equal(down.transition, null);
+  assert.equal(deadline.active, false);
+  assert.equal(media.pendingFrameCallbacks().length, 0);
+  assert.equal(down.continuationRecovery.attempts, 1, "cancelled work is not a failed attempt");
+  scene.deferredFrame.delete("Drive Down");
+  scene.advance(5000);
+  await scene.tick();
+  assert.equal(scene.prepares("drive_down").length, 2);
+  assert.equal(controller.resumePlayback(), true);
+  await waitForCondition(() => down.lifecycleState === "participating" && down.video.paused === false,
+    "Resume must retry the cancelled recovery");
+  assert.equal(scene.prepares("drive_down").length, 3);
+  assert.equal(scene.prepares("drive_down").at(-1).target, RECOVERY_T + 7);
+});
+
+test("R-14 leaving Review: pending recovery and its landing leave no timer or later work", async t => {
+  const scene = await createRecoveryScene(t);
+  const { controller, timers, harness } = scene;
+  const down = await failRejoinLanding(scene);
+  scene.advance(1000);
+  timers.heartbeat();
+  await waitForCondition(() => down.reviewStage === "landing" && scene.prepares("drive_down").length === 2,
+    "the recovery attempt must reach landing");
+  const deadline = scene.landingDeadline("Drive Down");
+  const media = scene.media("Drive Down");
+  controller.returnToLive();
+  assert.equal(controller._historicalPlayers.size, 0);
+  assert.equal(timers.pending().length, 0, "no Review timeout survives leaving Review");
+  assert.equal(timers.heartbeatActive(), false, "the heartbeat stops");
+  assert.equal(media.pendingFrameCallbacks().length, 0);
+  deadline.callback();
+  const mediaCalls = () => harness.calls.filter(call => call.type.startsWith("frigate_max/")).length;
+  const calls = mediaCalls();
+  scene.advance(60000);
+  await drainReview(controller);
+  assert.equal(mediaCalls(), calls, "no recovery work runs after leaving Review");
+});
+
+test("R-14 explicit seek supersedes an in-flight recovery and its obsolete deadline", async t => {
+  const scene = await createRecoveryScene(t);
+  const { controller, timers } = scene;
+  const down = await failRejoinLanding(scene);
+  scene.advance(1000);
+  timers.heartbeat();
+  await waitForCondition(() => down.reviewStage === "landing" && scene.prepares("drive_down").length === 2,
+    "the recovery attempt must reach landing");
+  const stale = scene.landingDeadline("Drive Down");
+  scene.deferredFrame.delete("Drive Down");
+  const seek = controller.seekHistoricalToEpoch(RECOVERY_T + 40, { autoplay: false });
+  assert.equal(stale.active, false, "the explicit seek cancels the obsolete landing");
+  assert.equal(await seek, true);
+  assert.equal(down.lifecycleState, "participating");
+  assert.equal(down.initialPlacement.requestedEpoch, RECOVERY_T + 40);
+  assert.equal(down.continuationRecovery, null);
+  const hls = down.hls;
+  stale.callback();
+  await drainReview(controller);
+  assert.equal(down.lifecycleState, "participating");
+  assert.ok(down.hls === hls, "the recovered presentation is retained");
+  assert.equal(timers.pending().length, 0);
+});
+
+test("R-15 recovery budget: backoff, exhaustion without retry storms, then a fresh explicit attempt", async t => {
+  let rejecting = true;
+  const scene = await createRecoveryScene(t, {
+    playResponder: rejectPlayFor("Drive Down", () => rejecting)
+  });
+  const { controller, timers } = scene;
+  const down = scene.player("Drive Down");
+  const untouched = scene.peer();
+  scene.advance(6000);
+  timers.heartbeat();
+  await waitForCondition(() => down.lifecycleState === "failed" &&
+    down.continuationRecovery?.attempts === 1, "the first failure must be recorded");
+  // [elapsed ms, attempts afterwards]: 1 s then 2 s backoff, three failures in total.
+  for (const [ms, attempts] of [[999, 1], [1, 2], [1999, 2], [1, 3]]) {
+    scene.advance(ms);
+    // Several heartbeats inside one backoff window cannot add an attempt.
+    await scene.tick();
+    await scene.tick();
+    await waitForCondition(() => down.lifecycleState === "failed" &&
+      down.continuationRecovery?.attempts === attempts, `attempt ${attempts} must settle`);
+    assert.equal(scene.prepares("drive_down").length, attempts);
+    assert.equal(timers.pending().length, 0, "the policy owns no timer; the heartbeat schedules retries");
+  }
+  assert.equal(down.continuationRecovery.exhausted, true);
+  for (let index = 0; index < 10; index += 1) {
+    scene.advance(10000);
+    await scene.tick();
+  }
+  assert.equal(scene.prepares("drive_down").length, 3, "an exhausted camera is not retried");
+  assert.equal(down.lifecycleState, "failed");
+  assert.equal(controller.reviewCameraStatusIndicator(down), "Unavailable");
+  untouched();
+  rejecting = false;
+  assert.equal(await controller.seekHistoricalToEpoch(controller.clock.absoluteTime, {
+    autoplay: true
+  }), true);
+  await waitForCondition(() => down.lifecycleState === "participating" && down.video.paused === false,
+    "an explicit seek must start a fresh attempt");
+  assert.equal(scene.prepares("drive_down").length, 4);
+  assert.equal(down.continuationRecovery, null);
+});
+
+test("R-21 recovery eligibility: a presentation label cannot grant an acquisition retry", async t => {
+  const scene = await createRecoveryScene(t, { playResponder: rejectPlayFor("Drive Down", () => true) });
+  const down = scene.player("Drive Down");
+  scene.advance(6000);
+  scene.timers.heartbeat();
+  await waitForCondition(() => down.lifecycleState === "failed", "the rejected Play must settle");
+  down.boundaryReason = "availability_api_failure";
+  await scene.tick();
+  await scene.tick();
+  assert.equal(scene.prepares("drive_down").length, 1, "the backoff, not the label, governs");
+});
+
+test("R-21 recovery eligibility: an availability failure retries without reading its label", async t => {
+  const scene = await createAvailabilityOwnershipHarness(t);
+  const { controller, base, outage, requests, up } = scene;
+  outage.delete("drive_up");
+  up.boundaryReason = "renamed_presentation_label";
+  const attempt = track(controller.reconcileHistoricalCamera(up, base, { reason: "relabeled" }));
+  assert.equal(requests.length, 1, "the failed availability query is retried");
+  requests[0].succeed();
+  assert.equal(await attempt.promise, "prepared");
+  assert.equal(up.lifecycleState, "participating");
+  assert.equal(up.continuationRecovery, null);
+  assertPeerUndisturbed(scene);
+});
+
+test("R-15 recovery waits while the document is hidden and resumes when it can present frames", async t => {
+  const scene = await createRecoveryScene(t);
+  const { timers } = scene;
+  let hidden = true;
+  Object.defineProperty(scene.harness.window.document, "visibilityState", {
+    configurable: true, get: () => hidden ? "hidden" : "visible"
+  });
+  const down = await failRejoinLanding(scene);
+  scene.deferredFrame.delete("Drive Down");
+  for (let index = 0; index < 5; index += 1) {
+    scene.advance(2000);
+    await scene.tick();
+  }
+  assert.equal(scene.prepares("drive_down").length, 1, "no reacquisition while frames cannot present");
+  assert.equal(down.continuationRecovery.attempts, 1, "hidden time does not consume the budget");
+  hidden = false;
+  timers.heartbeat();
+  await waitForCondition(() => down.lifecycleState === "participating" && down.video.paused === false,
+    "the camera must recover once visible");
+  assert.equal(scene.prepares("drive_down").at(-1).target, RECOVERY_T + 16);
+});
+
+for (const debug of [false, true]) {
+  for (const failure of ["rejoin Play", "rejoin landing", "resume Play"]) {
+    test(`R-14 diagnostic isolation: throwing recorders cannot strand a ${failure} failure or its recovery (debug=${debug})`, async t => {
+      let rejecting = failure.endsWith("Play");
+      const resume = failure === "resume Play";
+      const scene = await createRecoveryScene(t, {
+        debug, autoplay: !resume, coverage: resume ? RECOVERY_FULL_COVERAGE : RECOVERY_REJOIN_COVERAGE,
+        playResponder: rejectPlayFor("Drive Down", () => rejecting)
+      });
+      const { controller, timers } = scene;
+      const thrown = new Set();
+      const fault = name => {
+        thrown.add(name);
+        throw new Error(`synthetic ${name} failure`);
+      };
+      controller.recordReviewFailure = () => fault("recordReviewFailure");
+      controller.syncUnavailable = () => fault("syncUnavailable");
+      const boundary = controller.recordCameraBoundary.bind(controller);
+      controller.recordCameraBoundary = (player, kind, details) =>
+        ["transition-started", "join-failed", "leave-complete"].includes(kind)
+          ? fault(`recordCameraBoundary:${kind}`) : boundary(player, kind, details);
+      const down = scene.player("Drive Down");
+      if (resume) {
+        assert.equal(controller.resumePlayback(), true);
+      } else {
+        if (failure === "rejoin landing") scene.deferredFrame.add("Drive Down");
+        scene.advance(6000);
+        timers.heartbeat();
+        if (failure === "rejoin landing") {
+          await waitForCondition(() => down.reviewStage === "landing", "the rejoin must reach landing");
+          timers.fire(scene.landingDeadline("Drive Down"));
+        }
+      }
+      await waitForCondition(() => down.lifecycleState === "failed", "failure handling must complete");
+      assert.ok(thrown.has("recordReviewFailure"), "the failure recorder fault was exercised");
+      assert.ok(thrown.has(resume ? "recordCameraBoundary:leave-complete" : "syncUnavailable"));
+      assert.equal(down.transition, null);
+      assert.equal(down.hls, null);
+      assert.equal(down.continuationRecovery.attempts, 1);
+      assert.equal(timers.pending().length, 0);
+      const untouched = scene.peer();
+      rejecting = false;
+      scene.deferredFrame.delete("Drive Down");
+      scene.advance(1000);
+      timers.heartbeat();
+      await waitForCondition(() => down.lifecycleState === "participating" && down.video.paused === false,
+        "recovery must not depend on diagnostics");
+      assert.ok(thrown.has("recordCameraBoundary:transition-started"));
+      untouched();
+    });
+  }
+}
