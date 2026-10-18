@@ -113,6 +113,9 @@ try {
     $InvestigationLabEngineSourceContent = Get-Content -LiteralPath $InvestigationLabEngineSourceFile -Raw -ErrorAction Stop
     $InvestigationLabLongVodSourceFile = Join-Path $InvestigationLabSourceDirectory "long-vod-two-peer-experiment.js"
     $InvestigationLabLongVodSourceContent = Get-Content -LiteralPath $InvestigationLabLongVodSourceFile -Raw -ErrorAction Stop
+    $ReviewControllerSourceFile = Join-Path $ReviewSourceDirectory "review-controller.js"
+    # UTF-8 explicitly: the controller contains non-ASCII text.
+    $ReviewControllerSourceContent = Get-Content -LiteralPath $ReviewControllerSourceFile -Raw -Encoding UTF8 -ErrorAction Stop
 
     $DeployedSourceFiles = @(
         Get-Item -LiteralPath $SourceFile -ErrorAction Stop
@@ -154,6 +157,10 @@ try {
         Write-Error "Build placeholder was not found in the source file: $Placeholder"
         exit 1
     }
+    if (-not $ReviewControllerSourceContent.Contains($Placeholder)) {
+        Write-Error "Build placeholder was not found in the Review controller: $Placeholder"
+        exit 1
+    }
     if (-not $InvestigationLabSourceContent.Contains($LabPlaceholder) -or
         -not $InvestigationLabEngineSourceContent.Contains($LabPlaceholder) -or
         -not $InvestigationLabLongVodSourceContent.Contains($LabPlaceholder)) {
@@ -163,6 +170,9 @@ try {
 
     $DeployedContent = $SourceContent.Replace($Placeholder, $BuildIdentifier)
     $DeployedBytes = $Utf8NoBom.GetBytes($DeployedContent)
+    $DeployedReviewControllerBytes = $Utf8NoBom.GetBytes(
+        $ReviewControllerSourceContent.Replace($Placeholder, $BuildIdentifier)
+    )
     $DeployedInvestigationLabBytes = $Utf8NoBom.GetBytes(
         $InvestigationLabSourceContent.Replace($LabPlaceholder, $LabBuildIdentifier)
     )
@@ -192,6 +202,11 @@ try {
     Copy-Item -Path (Join-Path $ProviderSourceDirectory "*.js") -Destination $ProviderDestinationDirectory -Force -ErrorAction Stop
     New-Item -ItemType Directory -Path $ReviewDestinationDirectory -Force -ErrorAction Stop | Out-Null
     Copy-Item -Path (Join-Path $ReviewSourceDirectory "*.js") -Destination $ReviewDestinationDirectory -Force -ErrorAction Stop
+    # The Review controller versions its own module imports with the build identifier.
+    [System.IO.File]::WriteAllBytes(
+        (Join-Path $ReviewDestinationDirectory "review-controller.js"),
+        $DeployedReviewControllerBytes
+    )
     New-Item -ItemType Directory -Path $Go2RtcVendorDestinationDirectory -Force -ErrorAction Stop | Out-Null
     Copy-Item -Path (Join-Path $Go2RtcVendorSourceDirectory "*") -Destination $Go2RtcVendorDestinationDirectory -Force -ErrorAction Stop
     New-Item -ItemType Directory -Path $FlatpickrVendorDestinationDirectory -Force -ErrorAction Stop | Out-Null
@@ -258,8 +273,25 @@ if (-not (Test-Path -LiteralPath (Join-Path $ProviderDestinationDirectory "friga
     exit 1
 }
 
-if (-not (Test-Path -LiteralPath (Join-Path $ReviewDestinationDirectory "review-controller.js") -PathType Leaf)) {
+$ReviewControllerDestinationFile = Join-Path $ReviewDestinationDirectory "review-controller.js"
+if (-not (Test-Path -LiteralPath $ReviewControllerDestinationFile -PathType Leaf)) {
     Write-Error "Review controller module was not deployed."
+    exit 1
+}
+$Sha256 = [System.Security.Cryptography.SHA256]::Create()
+try { $ReviewControllerHash = ([BitConverter]::ToString($Sha256.ComputeHash($DeployedReviewControllerBytes))).Replace("-", "") }
+finally { $Sha256.Dispose() }
+if ($ReviewControllerHash -ne (Get-FileHash -LiteralPath $ReviewControllerDestinationFile -Algorithm SHA256 -ErrorAction Stop).Hash) {
+    Write-Error "Review controller hash verification failed: $ReviewControllerDestinationFile"
+    exit 1
+}
+if ((Get-Content -LiteralPath $ReviewControllerDestinationFile -Raw -Encoding UTF8).Contains($Placeholder)) {
+    Write-Error "Generated Review controller still contains the build placeholder."
+    exit 1
+}
+
+if (-not (Test-Path -LiteralPath (Join-Path $ReviewDestinationDirectory "review-blackboard.js") -PathType Leaf)) {
+    Write-Error "Review Blackboard module was not deployed."
     exit 1
 }
 

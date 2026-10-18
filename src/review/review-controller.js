@@ -4,6 +4,7 @@ import {
   mediaToEpoch,
   validateHistoricalPresentation
 } from "./historical-presentation.js";
+import { ReviewBlackboard } from "./review-blackboard.js?v=__NVR_BUILD__";
 
 const REVIEW_RANGE_BEFORE_SECONDS = 15;
 const REVIEW_RANGE_AFTER_SECONDS = 120;
@@ -1021,9 +1022,14 @@ export class ReviewController {
       const timer = setTimeout(callback, delay);
       return () => clearTimeout(timer);
     },
-    recordingCoverage = true
+    recordingCoverage = true,
+    // The observational Review Blackboard; false only for parity tests.
+    blackboard = true,
+    buildIdentifier = "development"
   } = {}) {
     this._document = documentRef;
+    this._blackboard = blackboard ? new ReviewBlackboard() : null;
+    this._buildIdentifier = typeof buildIdentifier === "string" ? buildIdentifier : "development";
     this._loadHls = loadHls;
     this._datePickerFactory = datePickerFactory;
     this._datePickers = { from: null, to: null };
@@ -1120,7 +1126,6 @@ export class ReviewController {
     this._timelinePan = null;
     this._timelineRefreshDeferred = false;
     this._timelineClickSuppressionTimer = null;
-    this._sceneExperiment = null;
     this._recordingCoverageRenderPending = false;
     // The single recording-coverage authority. Playback always reads it; the option only
     // decides whether the timeline and Skip Deadspace also consume it.
@@ -1305,6 +1310,143 @@ export class ReviewController {
     }
   }
 
+  // The single isolation boundary for the Review Blackboard. Observation returns nothing
+  // to its caller and never throws into it; repeated faults disable further collection.
+  // Operational code never reads Blackboard state.
+  observe(where, collect) {
+    const board = this._blackboard;
+    if (!board || board.disabled) return;
+    try {
+      collect(board);
+    } catch (error) {
+      // Fault accounting is itself guarded: a broken recorder is simply switched off.
+      try { board.fault(error, where); } catch {
+        try { board.disabled = true; } catch {}
+      }
+    }
+  }
+
+  // Pure reads of operational state for one heartbeat sample.
+  blackboardSample() {
+    const document = this._root?.ownerDocument ?? this._document;
+    const epoch = this.clock.absoluteTime;
+    const cameras = [];
+    let rvfc = null;
+    for (const player of this._historicalPlayers.values()) {
+      const video = player.video;
+      if (video) rvfc = rvfc === true || typeof video.requestVideoFrameCallback === "function";
+      const participating = player.lifecycleState === "participating";
+      const mediaTime = Number(video?.currentTime);
+      const logicalEnd = Number(player.timing?.logical_media_end_position);
+      const recovery = player.continuationRecovery;
+      cameras.push({
+        name: player.camera?.name,
+        lifecycle: player.lifecycleState,
+        reason: player.boundaryReason,
+        transition: Boolean(player.transition) && player.transition.reason !== "play_release",
+        waiting: Boolean(player.endResolution) || (participating && Number.isFinite(mediaTime) &&
+          Number.isFinite(logicalEnd) && mediaTime >= logicalEnd - 0.05),
+        presentation: player.hls,
+        frames: player.presentedFrameCount,
+        mediaEpoch: participating && player.timing ? this.cameraEpochFromMedia(player) : null,
+        frameEpoch: player.latestPresentedFrameEpoch,
+        firstAdvanceAtMs: player.lastPlayAttempt?.firstPresentedAdvance?.atMs ?? null,
+        playIssuedAtMs: player.lastPlayAttempt?.issuedAtMs ?? null,
+        held: Boolean(player.heldCanvas && player.heldCanvas.hidden === false),
+        coverage: this.blackboardCoverage(player, epoch),
+        recovery: recovery ? { attempts: recovery.attempts, exhausted: recovery.exhausted === true,
+          availabilityFailed: recovery.availabilityFailed === true } : null
+      });
+    }
+    return {
+      nowMs: this._now(), wallMs: this._wallClock(), epoch,
+      running: this.clock.running, rate: this.clock.rate,
+      visible: document?.visibilityState !== "hidden",
+      preparing: this._playbackPreparation !== null,
+      navigationPreparing: this._historicalPreparing,
+      requestId: this._reviewRequestId,
+      rvfc, cameras
+    };
+  }
+
+  blackboardCameras(coverageEpoch = this.clock.absoluteTime) {
+    const document = this._root?.ownerDocument ?? this._document;
+    return [...this._historicalPlayers.values()].map(player => ({
+      name: player.camera?.name,
+      frames: player.presentedFrameCount,
+      coverage: this.blackboardCoverage(player, coverageEpoch),
+      verifiedLanding: player.initialPlacement?.verifiedFrame === true,
+      landedEpoch: player.initialPlacement?.landedEpoch,
+      frameEpoch: player.latestPresentedFrameEpoch,
+      visible: document?.visibilityState !== "hidden"
+    }));
+  }
+
+  // Coverage as the shared authority knows it, read without requesting anything.
+  blackboardCoverage(player, epoch) {
+    const own = this.inspectPlayerAvailability(player, epoch);
+    if (own.insideWindow) return own.containing ? "recorded" : "gap";
+    const shared = player.frigateCamera ? this._coverage?.availabilityAt(player.frigateCamera, epoch) : null;
+    if (!shared) return "unknown";
+    const answer = inspectRecordingAvailability(shared, epoch);
+    return answer.containing ? "recorded" : answer.insideWindow ? "gap" : "unknown";
+  }
+
+  getBlackboardReport() {
+    try {
+      if (!this._blackboard) return "FrigateMax Review Blackboard: disabled.";
+      return this._blackboard.report({
+        build: this._buildIdentifier, wallMs: this._wallClock(), nowMs: this._now(),
+        timeZone: this.timeZone,
+        formatEpoch: epoch => formatNvrClockTime(epoch, this.timeZone, this._timeFormat, "diagnostic")
+      });
+    } catch (error) {
+      try { this._blackboard?.fault(error, "report"); } catch {}
+      return "FrigateMax Review Blackboard: report unavailable " +
+        `(${String(error?.name ?? "Error").replace(/[^\w]/g, "").slice(0, 32)}).`;
+    }
+  }
+
+  // Copying reads the Blackboard; it never resets or ends the session.
+  async copyDiagnostics() {
+    const text = this.getBlackboardReport();
+    const view = this._document?.defaultView ?? globalThis;
+    try {
+      const clipboard = view.navigator?.clipboard;
+      if (typeof clipboard?.writeText !== "function") throw new Error("Clipboard unavailable.");
+      await clipboard.writeText(text);
+      this.showCopyDiagnosticsResult(true, text);
+      return "copied";
+    } catch {
+      this.showCopyDiagnosticsResult(false, text);
+      return "fallback";
+    }
+  }
+
+  showCopyDiagnosticsResult(copied, text) {
+    try {
+      const button = this._root?.querySelector(".review-copy-diagnostics");
+      if (button) button.textContent = copied ? "Diagnostics copied" : "Copy diagnostics";
+      let fallback = this._root?.querySelector(".review-diagnostics-fallback");
+      if (copied) {
+        if (fallback) fallback.hidden = true;
+        return;
+      }
+      if (!fallback && button) {
+        fallback = this._document.createElement("textarea");
+        fallback.className = "review-diagnostics-fallback";
+        fallback.readOnly = true;
+        fallback.setAttribute("aria-label", "Review diagnostics report; select and copy");
+        button.after(fallback);
+      }
+      if (!fallback) return;
+      fallback.hidden = false;
+      fallback.value = text;
+      fallback.focus?.();
+      fallback.select?.();
+    } catch {}
+  }
+
   setDebug(enabled) {
     const next = enabled === true;
     if (next === this._debugEnabled) return;
@@ -1405,6 +1547,7 @@ export class ReviewController {
       reason, outcome].join("|");
     if (category.some(entry => entry.key === key)) return;
     category.push({ key, sequence: ++this._reviewFailureSequence, record });
+    this.observe("failure", board => board.failure({ ...record, nowMs: this._now(), wallMs: record.atMs }));
     if (category.length > (category === this._reviewFailures
       ? REVIEW_FAILURE_LIMIT : REVIEW_OUTCOME_LIMIT)) category.shift();
   }
@@ -1633,6 +1776,7 @@ export class ReviewController {
   }
 
   suspend() {
+    this.observe("end", board => board.end("card_suspended", { nowMs: this._now(), wallMs: this._wallClock() }));
     this._suspended = true;
     this.cleanupHistorical();
     this.cleanupTimelineInteraction();
@@ -1672,6 +1816,7 @@ export class ReviewController {
     this.invalidateAutoSnapDecision();
     this._autoSnapArmed = false;
     this._reviewOptions = { ...this._reviewOptions, autoSnapTo: enabled };
+    this.observe("intent", board => board.intent("auto_snap", enabled, { nowMs: this._now(), wallMs: this._wallClock() }));
     const input = this._root?.querySelector(".review-auto-snap-to");
     if (input) input.checked = enabled;
     return true;
@@ -1681,6 +1826,7 @@ export class ReviewController {
     if (typeof enabled !== "boolean" || this._reviewOptions.snapPastCrap === enabled) return false;
     this.invalidateRecordingGapSkip();
     this._reviewOptions = { ...this._reviewOptions, snapPastCrap: enabled };
+    this.observe("intent", board => board.intent("skip_deadspace", enabled, { nowMs: this._now(), wallMs: this._wallClock() }));
     const input = this._root?.querySelector(".review-snap-past-crap");
     if (input) input.checked = enabled;
     return true;
@@ -2594,6 +2740,7 @@ export class ReviewController {
     if (!REVIEW_PLAYBACK_SPEEDS.includes(speed)) return false;
     this._playbackSpeed = speed;
     this.clock.setRate(speed);
+    this.observe("intent", board => board.intent("rate", speed, { nowMs: this._now(), wallMs: this._wallClock() }));
     if (this._presentationMode === "historical") {
       for (const player of this._historicalPlayers.values()) {
         if (player.video) player.video.playbackRate = speed;
@@ -2650,6 +2797,7 @@ export class ReviewController {
   }
 
   returnToLive(preservePosition = false) {
+    this.observe("end", board => board.end("returned_to_live", { nowMs: this._now(), wallMs: this._wallClock() }));
     this.invalidateAutoSnapDecision();
     this._autoSnapArmed = false;
     const previousPosition = this.reviewPosition;
@@ -2665,30 +2813,18 @@ export class ReviewController {
     if (this._active && !this._suspended) this.renderMediaArea();
   }
 
+  // Retired: the scene experiment never ran in production; the Blackboard replaces it.
   getSceneExperimentReport() {
-    if (!this._sceneExperiment) return null;
-    return JSON.parse(JSON.stringify({
-      ...this._sceneExperiment,
-      currentTiEpoch: this.reviewPosition,
-      activeHolds: [...this._historicalPlayers.values()]
-        .filter(player => player.sceneExperimentSerial === this._sceneExperiment.serial &&
-          player.holdStartedAtMs != null)
-        .map(player => ({ camera: player.camera.name,
-          representedEpoch: player.heldFrameEpoch,
-          durationMs: this._now() - player.holdStartedAtMs }))
-    }));
+    return null;
   }
 
   recordSceneEvent(player, kind, details = {}) {
-    if (!this._sceneExperiment || (player &&
-        player.sceneExperimentSerial !== this._sceneExperiment.serial)) return;
-    const events = this._sceneExperiment.events;
-    if (events.length >= 2048) {
-      this._sceneExperiment.droppedEvents += 1;
-      return;
-    }
-    events.push({ atMs: this._now(), tiEpoch: this.reviewPosition,
-      camera: player?.camera?.name ?? null, kind, ...details });
+    if (!player?.camera) return;
+    this.observe("camera_event", board => board.cameraEvent(player.camera.name, kind, {
+      nowMs: this._now(), state: details.state, previousState: details.previousState,
+      boundaryReason: details.boundaryReason,
+      verified: player.initialPlacement?.verifiedFrame === true
+    }));
   }
 
   getEventNavigationInventory() {
@@ -2998,6 +3134,12 @@ export class ReviewController {
     gapSkipInput.addEventListener("change", () => this.setSnapPastCrap(gapSkipInput.checked));
     gapSkipLabel.append(gapSkipInput, "Skip Deadspace");
     optionsContent.appendChild(gapSkipLabel);
+    const copyDiagnostics = this._document.createElement("button");
+    copyDiagnostics.type = "button";
+    copyDiagnostics.className = "review-copy-diagnostics";
+    copyDiagnostics.textContent = "Copy diagnostics";
+    copyDiagnostics.addEventListener("click", () => void this.copyDiagnostics());
+    optionsContent.appendChild(copyDiagnostics);
     controls.appendChild(this.createSection("options", "Options", optionsContent));
     if (this._debugEnabled) {
       const diagnosticContent = this._document.createElement("div");
@@ -3692,6 +3834,7 @@ export class ReviewController {
     if (!Number.isFinite(epoch)) return null;
     drag.previewEpoch = epoch;
     if (this._presentationMode === "historical") this.clock.setAbsolute(epoch);
+    this.observe("clock", board => board.clockJump());
     this.updateClockDisplay();
     return epoch;
   }
@@ -3741,6 +3884,7 @@ export class ReviewController {
     if (Number.isFinite(drag.originalEpoch)) {
       if (this._presentationMode === "historical") this.clock.setAbsolute(drag.originalEpoch);
       else this._reviewPosition = drag.originalEpoch;
+      this.observe("clock", board => board.clockJump());
     }
     if (drag.wasRunning) this.resumePlayback();
     else this.updateClockDisplay();
@@ -4105,6 +4249,7 @@ export class ReviewController {
 
   pausePlayback() {
     if (this._presentationMode !== "historical" || !this.playbackRequested) return false;
+    this.observe("intent", board => board.intent("pause", null, { nowMs: this._now(), wallMs: this._wallClock() }));
     this.cancelPlaybackPreparation();
     this.invalidateAutoSnapDecision();
     this._autoSnapArmed = false;
@@ -4134,6 +4279,7 @@ export class ReviewController {
 
   resumePlayback() {
     if (this._presentationMode !== "historical" || this.playbackRequested) return false;
+    this.observe("intent", board => board.intent("play", null, { nowMs: this._now(), wallMs: this._wallClock() }));
     // Only an owned, bounded navigation hold may defer clock release.
     this.invalidateAutoSnapDecision();
     this._autoSnapArmed = this._reviewOptions.autoSnapTo;
@@ -4193,6 +4339,7 @@ export class ReviewController {
         const upper = Math.min(this._historicalPlaybackRange.to, now);
         if (target >= upper && this._historicalPlaybackRange.to > now) {
           coverageDecision = "live_now";
+          this.observe("end", board => board.noteEnding("reached_live"));
           this.returnToLive();
           completed = true;
           return true;
@@ -4235,6 +4382,11 @@ export class ReviewController {
     const generation = this._generation;
     // Explicit placement supersedes older work even when it reuses the source.
     const requestId = ++this._reviewRequestId;
+    this.observe("navigation", board => board.navigationStart({
+      nowMs: this._now(), wallMs: this._wallClock(), source, target,
+      fromEpoch: this.clock.absoluteTime, autoplay, requestId,
+      previousSettled: !this._historicalPreparing
+    }));
     this._historicalPreparing = true;
     const players = [...this._historicalPlayers.values()];
     // An optional report: failing to start one leaves the seek unreported, not stopped.
@@ -4715,6 +4867,7 @@ export class ReviewController {
       player.transition?.interruptPendingPlay?.();
       player.video?.pause();
     }
+    this.observe("auto_snap", board => board.autoSnapStopped(outcome, { nowMs: this._now() }));
     try { this.recordAutoSnapDecision(outcome, sourceEpoch); } catch {}
     this.updateTransport();
     this.updateDiagnostics();
@@ -4724,6 +4877,8 @@ export class ReviewController {
   seekAutoSnapInterval(interval, target, token, sourceEpoch) {
     this._autoSnapActiveStart = interval.start;
     this._autoSnapActiveEnd = interval.end;
+    this.observe("auto_snap", board => board.autoSnapStart({ nowMs: this._now(), start: interval.start,
+      end: interval.end }, this.blackboardCameras(interval.start)));
     try {
       this.recordAutoSnapDecision("seek_requested", sourceEpoch, target, interval.end);
       this.settleAutoSnapBoundaryCapture(sourceEpoch, "seek_requested", target, interval.end);
@@ -4755,6 +4910,8 @@ export class ReviewController {
     }
     this._autoSnapActiveStart = plan.interval.start;
     this._autoSnapActiveEnd = plan.interval.end;
+    this.observe("auto_snap", board => board.autoSnapStart({ nowMs: this._now(), start: plan.interval.start,
+      end: plan.interval.end }, this.blackboardCameras(plan.interval.start)));
     if (this._historicalPreparing) {
       this.beginPlaybackPreparation([...this._historicalPlayers.values()]
         .filter(player => player.lifecycleState !== "participating"));
@@ -4788,6 +4945,9 @@ export class ReviewController {
     // The capture observes the boundary before it completes; completion never waits on it.
     let boundaryCapture = null;
     try { boundaryCapture = this.captureAutoSnapBoundary(eventStart, end, clockEpoch); } catch {}
+    this.observe("auto_snap", board => board.autoSnapEnd({ nowMs: this._now(), wallMs: this._wallClock(),
+      epoch: clockEpoch, visible: (this._root?.ownerDocument ?? this._document)?.visibilityState !== "hidden" },
+    this.blackboardCameras(eventStart ?? end)));
     this.clock.pause();
     this.clock.setAbsolute(end);
     for (const player of this._historicalPlayers.values()) player.video?.pause();
@@ -6746,6 +6906,7 @@ export class ReviewController {
       availabilityFailed: false,
       healthyProgressMs: 0
     };
+    this.observe("recovery", board => board.recovery(player.camera?.name, player.continuationRecovery));
   }
 
   recordCameraAvailabilityFailure(player) {
@@ -6757,6 +6918,7 @@ export class ReviewController {
       availabilityFailed: true,
       healthyProgressMs: 0
     };
+    this.observe("recovery", board => board.recovery(player.camera?.name, player.continuationRecovery));
   }
 
   // A reacquired camera keeps its attempts; only credited playback progress clears them.
@@ -7043,6 +7205,8 @@ export class ReviewController {
   } = {}) {
     this.invalidateAutoSnapDecision();
     this._autoSnapArmed = false;
+    const previousEpoch = this._presentationMode === "historical" ? this.clock.absoluteTime : null;
+    const previousSettled = !this._historicalPreparing;
     const generation = ++this._generation;
     const requestId = ++this._reviewRequestId;
     this.cleanupHistorical();
@@ -7077,8 +7241,6 @@ export class ReviewController {
       } catch {}
       for (const camera of participatingCameras) {
         const player = this.createHistoricalPlayer(camera, generation, report);
-        player.sceneExperimentSerial = source === "scene snap experiment"
-          ? this._sceneExperiment?.serial : null;
         this._historicalPlayers.set(camera.name, player);
         try {
           const diagnostic = report?.cameras[camera.name];
@@ -7099,11 +7261,20 @@ export class ReviewController {
       this._historicalPreparing = true;
       this._historicalStatus = "Preparing playback…";
       this._presentationMode = "historical";
+      this.observe("open", board => board.open({
+        nowMs: this._now(), wallMs: this._wallClock(), range: this._historicalPlaybackRange,
+        startEpoch: targetEpoch, fromEpoch: previousEpoch, target: targetEpoch,
+        rate: this._playbackSpeed, autoSnap: this._reviewOptions.autoSnapTo,
+        skipDeadspace: this._reviewOptions.snapPastCrap, autoplay, requestId, previousSettled,
+        cameras: participatingCameras.map(camera => camera.name),
+        visible: (this._root?.ownerDocument ?? this._document)?.visibilityState !== "hidden", source
+      }));
       const preparation = autoplay
         ? this.beginPlaybackPreparation([...this._historicalPlayers.values()]) : null;
       const initialStarts = preparation?.starts ?? [];
       const view = this._root?.ownerDocument?.defaultView ?? globalThis;
       this._diagnosticTimer = view.setInterval(() => {
+        this.observe("sample", board => board.sample(this.blackboardSample()));
         if (this.enforceAutoSnapBoundary()) return;
         if (this.enforceHistoricalPlaybackBoundary()) return;
         if (this.evaluateRecordingGapSkip()) return;
@@ -7114,7 +7285,6 @@ export class ReviewController {
         this.updateDiagnostics();
         try {
           this.syncTick(this._syncSession, generation);
-          if (this._sceneExperiment) this.recordSceneEvent(null, "ti-sample");
         } catch {}
       }, 500);
       try {
@@ -7281,9 +7451,12 @@ export class ReviewController {
     const upper = Math.min(this._historicalPlaybackRange.to, now);
     if (!Number.isFinite(absolute) || absolute < upper) return false;
     if (this._historicalPlaybackRange.to > now) {
+      this.observe("end", board => board.noteEnding("reached_live"));
       this.returnToLive();
       return true;
     }
+    this.observe("end", board => board.reachedEnd({ wallMs: this._wallClock(), nowMs: this._now(),
+      visible: (this._root?.ownerDocument ?? this._document)?.visibilityState !== "hidden" }));
     this.clock.pause();
     this.clock.setAbsolute(this._historicalPlaybackRange.to);
     for (const player of this._historicalPlayers.values()) player.video?.pause();

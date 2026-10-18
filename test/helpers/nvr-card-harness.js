@@ -9,6 +9,10 @@ const baseReviewSource = readFileSync(
   new URL("../../src/review/review-controller.js", import.meta.url),
   "utf8"
 );
+const baseBlackboardSource = readFileSync(
+  new URL("../../src/review/review-blackboard.js", import.meta.url),
+  "utf8"
+);
 const baseHistoricalPresentationSource = readFileSync(
   new URL("../../src/review/historical-presentation.js", import.meta.url),
   "utf8"
@@ -337,6 +341,7 @@ export function createTestHarness({
       'import {\n  epochToMedia,\n  mediaToEpoch,\n  validateHistoricalPresentation\n} from "./historical-presentation.js";',
       baseHistoricalPresentationSource
     )
+    .replace('import { ReviewBlackboard } from "./review-blackboard.js?v=__NVR_BUILD__";', baseBlackboardSource)
     .replaceAll("export ", "") +
     "\nwindow.ReviewController = ReviewController; window.ReviewClock = ReviewClock;";
   window.eval(reviewSource);

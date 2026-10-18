@@ -48,6 +48,9 @@ Object.defineProperty(window, "nvrDiagnostics", {
     getSceneExperimentReport() {
       return soleHistoricalSyncController()?.getSceneExperimentReport() ?? null;
     },
+    getBlackboardReport() {
+      return soleHistoricalSyncController()?.getBlackboardReport() ?? null;
+    },
     runContinuousHandoffPrototype(options) {
       const controller = soleHistoricalSyncController();
       if (!controller) throw new Error("No connected NVR card is available.");
@@ -422,7 +425,7 @@ class NVRCard extends HTMLElement {
     this._frigateProvider = new FrigateProvider();
     this._providerPresentations = new Map();
     this._applicationMode = "live";
-    this._reviewController = new ReviewController();
+    this._reviewController = new ReviewController({ buildIdentifier: NVR_BUILD });
     this._legacyViewStateStore = NVR_LEGACY_VIEW_STATE_STORE;
     this._userStateStore = new HomeAssistantUserStateStore(
       () => this._hass
@@ -3242,6 +3245,7 @@ class NVRCard extends HTMLElement {
       .review-when-controls input,
       .review-filter-controls input,
       .review-diagnostics button,
+      .review-copy-diagnostics,
       .review-transport button {
         min-height: 44px;
         border: 1px solid #3b4954;
@@ -3444,9 +3448,17 @@ class NVRCard extends HTMLElement {
         flex-shrink: 0;
       }
 
-      .review-diagnostics button {
+      .review-diagnostics button,
+      .review-copy-diagnostics {
         width: 100%;
         padding: 0 8px;
+      }
+
+      .review-diagnostics-fallback {
+        width: 100%;
+        min-height: 8em;
+        box-sizing: border-box;
+        font: 12px/1.3 monospace;
       }
 
       .review-diagnostic-output {

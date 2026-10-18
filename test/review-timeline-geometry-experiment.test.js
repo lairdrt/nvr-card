@@ -162,11 +162,12 @@ test("browser experiment: repeated zoom/pan shares one marker, TI, and tick pixe
       report = JSON.parse(body); res.end("ok"); return;
     }
     if (req.url === "/") { res.setHeader("Content-Type", "text/html"); res.end(page); return; }
-    const modules = ["/src/review/review-controller.js", "/src/review/historical-presentation.js",
+    const modules = ["/src/review/review-controller.js", "/src/review/historical-presentation.js", "/src/review/review-blackboard.js",
       "/src/vendor/flatpickr/flatpickr-4.6.13.min.js"];
-    if (!modules.includes(req.url)) { res.writeHead(404); res.end(); return; }
+    const path = req.url.split("?")[0];
+    if (!modules.includes(path)) { res.writeHead(404); res.end(); return; }
     res.setHeader("Content-Type", "text/javascript");
-    res.end(readFileSync(new URL(`..${req.url}`, import.meta.url)));
+    res.end(readFileSync(new URL(`..${path}`, import.meta.url)));
   });
   await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
   t.after(() => server.close());
