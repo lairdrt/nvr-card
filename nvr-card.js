@@ -3245,7 +3245,6 @@ class NVRCard extends HTMLElement {
       .review-when-controls input,
       .review-filter-controls input,
       .review-diagnostics button,
-      .review-copy-diagnostics,
       .review-transport button {
         min-height: 44px;
         border: 1px solid #3b4954;
@@ -3448,10 +3447,33 @@ class NVRCard extends HTMLElement {
         flex-shrink: 0;
       }
 
-      .review-diagnostics button,
-      .review-copy-diagnostics {
+      .review-diagnostics button {
         width: 100%;
         padding: 0 8px;
+      }
+
+      .review-copy-diagnostics {
+        width: 100%;
+        min-height: 36px;
+        margin-top: 16px;
+        padding: 0 8px;
+        border: 1px solid #26313b;
+        border-radius: 4px;
+        background: transparent;
+        color: #9fb0ba;
+        font-size: 12px;
+        box-sizing: border-box;
+        cursor: pointer;
+      }
+
+      .review-copy-diagnostics:hover {
+        background: #171f26;
+        color: #dce6ec;
+      }
+
+      .review-copy-diagnostics:focus-visible {
+        outline: 2px solid #6faed9;
+        outline-offset: 2px;
       }
 
       .review-diagnostics-fallback {
@@ -3807,14 +3829,14 @@ class NVRCard extends HTMLElement {
       }
 
       .review-time-truth {
-        display: flex;
+        display: grid;
+        grid-template-columns: minmax(30px, 1fr) auto minmax(30px, 1fr);
         flex: 0 0 34px;
         min-width: 0;
-        padding: 5px 10px;
+        padding: 2px 6px;
         align-items: center;
         justify-content: center;
-        flex-direction: column;
-        gap: 4px;
+        column-gap: 6px;
         border-top: 1px solid #26313b;
         background: #11161c;
         box-sizing: border-box;
@@ -3823,9 +3845,53 @@ class NVRCard extends HTMLElement {
       }
 
       .review-time-truth .review-clock-display {
+        grid-column: 2;
+        grid-row: 1;
         min-width: 0;
+        text-align: center;
         color: #e4ebef;
         font-weight: 600;
+      }
+
+      .review-timeline-edge {
+        display: flex;
+        grid-row: 1;
+        align-items: center;
+        justify-content: center;
+        width: 30px;
+        height: 30px;
+        padding: 0;
+        border: 0;
+        border-radius: 6px;
+        background: transparent;
+        color: #9fb0ba;
+        cursor: pointer;
+        --mdc-icon-size: 18px;
+      }
+
+      .review-timeline-top {
+        grid-column: 1;
+        justify-self: start;
+      }
+
+      .review-timeline-bottom {
+        grid-column: 3;
+        justify-self: end;
+      }
+
+      .review-timeline-edge:hover:not(:disabled) {
+        background: #4a4a4a;
+        color: #dce6ec;
+      }
+
+      .review-timeline-edge:focus-visible {
+        outline: 2px solid #6faed9;
+        outline-offset: 1px;
+      }
+
+      .review-timeline-edge:disabled {
+        opacity: 0.35;
+        cursor: default;
       }
 
       .review-placeholder {

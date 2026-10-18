@@ -2457,6 +2457,70 @@ export class ReviewController {
     return true;
   }
 
+  createTimelineEdgeButton(edge) {
+    const label = edge === "top" ? "Go to top: newest time in the When range"
+      : "Go to bottom: earliest time in the When range";
+    const button = this._document.createElement("button");
+    button.type = "button";
+    button.className = `review-timeline-edge review-timeline-${edge}`;
+    button.title = label;
+    button.setAttribute("aria-label", label);
+    const symbol = this._document.createElement("ha-icon");
+    symbol.setAttribute("icon", edge === "top" ? "mdi:arrow-collapse-up" : "mdi:arrow-collapse-down");
+    symbol.setAttribute("aria-hidden", "true");
+    button.appendChild(symbol);
+    button.addEventListener("click", () => void this.goToTimelineEdge(edge));
+    return button;
+  }
+
+  // The Review time a timeline edge represents. The newest end is never later than now:
+  // Review cannot place time that has not happened, and a later target would leave Review.
+  timelineEdgeTarget(edge) {
+    const range = this._displayedReviewQuery?.range;
+    if (!(range?.from < range?.to)) return null;
+    return edge === "top" ? Math.min(range.to, this._wallClock() / 1000) : range.from;
+  }
+
+  // Shows the newest or earliest end of When (at the current zoom), then navigates Review
+  // time there through the ordinary Timeline selection path, which owns acquisition,
+  // cancellation and coverage. Edge navigation always ends paused: it passes an explicit
+  // autoplay=false, so neither a seek nor a restart of a still-pending navigation (which
+  // otherwise defaults to Play) can start playback, and superseded work is retired by the
+  // new request as for any navigation.
+  async goToTimelineEdge(edge) {
+    if (this._rhsMode !== "timeline" || (edge !== "top" && edge !== "bottom")) return false;
+    const target = this.timelineEdgeTarget(edge);
+    if (!Number.isFinite(target)) return false;
+    const viewport = this.ensureTimelineViewport();
+    const when = this._timelineViewportWhen;
+    const duration = viewport.to - viewport.from;
+    this.setTimelineViewport(edge === "top"
+      ? { from: when.to - duration, to: when.to }
+      : { from: when.from, to: when.from + duration });
+    return this.selectTimelineTime(target, `timeline ${edge} edge`, false, { manualPlacement: true });
+  }
+
+  // A button is unavailable only off the Timeline tab, or when both the viewport and
+  // Review time are already at its endpoint.
+  updateTimelineEdgeControls() {
+    const top = this._root?.querySelector(".review-timeline-top");
+    const bottom = this._root?.querySelector(".review-timeline-bottom");
+    if (!top || !bottom) return;
+    const viewport = this._timelineViewport;
+    const when = this._timelineViewportWhen;
+    const timeline = this._rhsMode === "timeline" && viewport && when;
+    const position = this.reviewPosition;
+    const atEdge = edge => {
+      const target = this.timelineEdgeTarget(edge);
+      const shown = edge === "top" ? viewport.to >= when.to - REVIEW_COVERAGE_EPSILON_SECONDS
+        : viewport.from <= when.from + REVIEW_COVERAGE_EPSILON_SECONDS;
+      return shown && Number.isFinite(position) && Number.isFinite(target) &&
+        Math.abs(position - target) <= REVIEW_COVERAGE_EPSILON_SECONDS;
+    };
+    top.disabled = !timeline || atEdge("top");
+    bottom.disabled = !timeline || atEdge("bottom");
+  }
+
   revealTimelinePosition(epoch, { animateSnap = false } = {}) {
     if (!Number.isFinite(epoch) || this._timelineDrag || this._timelinePan) return false;
     const viewport = this.ensureTimelineViewport();
@@ -3257,6 +3321,7 @@ export class ReviewController {
     const clock = this._document.createElement("time");
     clock.className = "review-clock-display";
     timeTruth.appendChild(clock);
+    for (const edge of ["top", "bottom"]) timeTruth.appendChild(this.createTimelineEdgeButton(edge));
     rhs.append(modes, rhsContent, timeTruth);
     product.append(controls, media, rhs);
     this._root.appendChild(product);
@@ -3530,10 +3595,12 @@ export class ReviewController {
       content.innerHTML = this.renderTimeline({ animateSnap });
       this.attachTimelineSelection(content);
       this.updateTimelineCursor();
+      this.updateTimelineEdgeControls();
       return;
     }
     const title = this._rhsMode[0].toUpperCase() + this._rhsMode.slice(1);
     content.innerHTML = `<div class="review-placeholder"><strong>${title}</strong><span>Foundation placeholder</span><small>Newest / Now at top<br>Earlier time runs downward</small></div>`;
+    this.updateTimelineEdgeControls();
   }
 
   getTimelineLanes() {
@@ -4233,6 +4300,7 @@ export class ReviewController {
 
   updateClockDisplay() {
     for (const player of this._historicalPlayers.values()) this.updateHistoricalVideoStateBadge(player);
+    this.updateTimelineEdgeControls();
     const output = this._root?.querySelector(".review-time-truth .review-clock-display");
     if (!output) return;
     const absolute = this.reviewPosition;

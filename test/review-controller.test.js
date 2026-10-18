@@ -3971,6 +3971,259 @@ test("the fixed RHS footer is the sole authoritative Review time in live, paused
   assert.equal(output.dateTime, "2026-09-10T19:00:00.000Z");
 });
 
+// Timeline footer: Go to Top / Go to Bottom move only the timeline viewport.
+test("Timeline footer places Go to Top left, Review time centred, Go to Bottom right", t => {
+  const harness = createHistoricalHarness();
+  t.after(() => harness.close());
+  const footer = harness.root.querySelector(".review-time-truth");
+  const [clock, top, bottom] = footer.children;
+  assert.equal(footer.children.length, 3);
+  assert.ok(clock.classList.contains("review-clock-display"), "the time display stays the first child");
+  for (const [button, edge, icon, label] of [
+    [top, "top", "mdi:arrow-collapse-up", "Go to top: newest time in the When range"],
+    [bottom, "bottom", "mdi:arrow-collapse-down", "Go to bottom: earliest time in the When range"]
+  ]) {
+    assert.equal(button.tagName, "BUTTON");
+    assert.equal(button.type, "button");
+    assert.ok(button.classList.contains(`review-timeline-${edge}`));
+    assert.equal(button.getAttribute("aria-label"), label);
+    assert.equal(button.title, label);
+    const symbol = button.querySelector("ha-icon");
+    assert.equal(symbol.getAttribute("icon"), icon);
+    assert.equal(symbol.getAttribute("aria-hidden"), "true");
+  }
+  const source = readFileSync(new URL("../nvr-card.js", import.meta.url), "utf8");
+  const rule = selector => source.match(new RegExp(`\\n\\s*${selector.replace(/[.]/g, "\\.")}\\s*{([^}]*)}`))?.[1] ?? "";
+  const footerRule = rule(".review-time-truth");
+  assert.match(footerRule, /display:\s*grid;/);
+  assert.match(footerRule, /grid-template-columns:\s*minmax\(30px, 1fr\) auto minmax\(30px, 1fr\);/,
+    "equal outer columns keep the time exactly centred");
+  assert.match(footerRule, /align-items:\s*center;/);
+  assert.match(footerRule, /flex:\s*0 0 34px;/, "footer height is unchanged");
+  assert.match(rule(".review-time-truth .review-clock-display"), /grid-column:\s*2;[^]*grid-row:\s*1;/);
+  assert.match(rule(".review-timeline-top"), /grid-column:\s*1;[^]*justify-self:\s*start;/);
+  assert.match(rule(".review-timeline-bottom"), /grid-column:\s*3;[^]*justify-self:\s*end;/);
+  const edgeRule = rule(".review-timeline-edge");
+  assert.match(edgeRule, /grid-row:\s*1;/);
+  assert.match(edgeRule, /height:\s*30px;/, "30 px controls fit the 34 px footer");
+  assert.match(edgeRule, /background:\s*transparent;/);
+});
+
+test("Go to Top and Go to Bottom move the viewport and navigate Review time through the Timeline path", async t => {
+  const T = 1800000000;
+  const when = { from: T - 3 * 86400, to: T };
+  const harness = createHistoricalHarness({ initialReviewRange: when, now: () => 1000 });
+  t.after(() => harness.close());
+  const controller = harness.controller;
+  await controller.playHistorical(T - 86400, { autoplay: false, updateDisplayedRange: false, playbackRange: when });
+  await drainReview(controller);
+  const top = harness.root.querySelector(".review-timeline-top");
+  const bottom = harness.root.querySelector(".review-timeline-bottom");
+  controller.resetTimelineViewport();
+  const duration = controller._timelineViewport.to - controller._timelineViewport.from;
+  assert.equal(top.disabled, false);
+  assert.equal(bottom.disabled, false);
+  const prepares = () => harness.calls.filter(call => call.type === "frigate_max/v2/vod/prepare").length;
+  const prepared = prepares();
+  const requestId = controller._reviewRequestId;
+
+  assert.equal(await controller.goToTimelineEdge("top"), true);
+  await drainReview(controller);
+  assert.deepEqual(controller._timelineViewport, { from: when.to - duration, to: when.to });
+  assert.equal(controller.clock.absoluteTime, when.to, "Review time is the newest end of When");
+  assert.equal(controller.clock.running, false, "Pause intent is preserved");
+  assert.equal(controller._presentationMode, "historical");
+  assert.ok(controller._reviewRequestId > requestId, "an ordinary Review navigation request");
+  assert.equal(controller._blackboard.session.navigation.bySource.timeline.requested, 1);
+  assert.equal(top.disabled, true, "viewport and Review time are both at the top");
+  assert.equal(bottom.disabled, false);
+
+  bottom.click();
+  await waitForCondition(() => controller.clock.absoluteTime === when.from);
+  await drainReview(controller);
+  assert.deepEqual(controller._timelineViewport, { from: when.from, to: when.from + duration });
+  assert.ok(prepares() > prepared, "cameras are acquired at the endpoint by the normal path");
+  assert.ok([...controller._historicalPlayers.values()].every(player =>
+    player.lifecycleState === "participating" && player.video.paused));
+  assert.equal(bottom.disabled, true);
+  assert.equal(top.disabled, false);
+});
+
+test("Go to Top and Go to Bottom stay usable when the whole When range fits the viewport", async t => {
+  const harness = createHistoricalHarness({ wallClockMs: HARNESS_CALENDAR_WALL_CLOCK_MS, now: () => 1000 });
+  t.after(() => harness.close());
+  manualViewTimers(harness.window);
+  const controller = harness.controller;
+  await controller.refreshReviewQuery();
+  controller.updateRhs();
+  const when = controller.state.displayedReviewQuery.range;
+  assert.deepEqual(controller._timelineViewport, { from: when.from, to: when.to }, "the viewport is at both edges");
+  const bottom = harness.root.querySelector(".review-timeline-bottom");
+  const top = harness.root.querySelector(".review-timeline-top");
+  assert.equal(bottom.disabled, false, "Review time is elsewhere, so Bottom still navigates");
+  bottom.click();
+  await waitForCondition(() => controller._presentationMode === "historical" &&
+    controller.clock.absoluteTime === when.from);
+  await drainReview(controller);
+  assert.equal(bottom.disabled, true);
+  assert.equal(top.disabled, false);
+  assert.equal(await controller.goToTimelineEdge("top"), true);
+  await drainReview(controller);
+  assert.equal(controller.reviewPosition, Math.min(when.to, HARNESS_CALENDAR_WALL_CLOCK_MS / 1000));
+  assert.equal(top.disabled, true);
+  assert.equal(bottom.disabled, false);
+});
+
+test("Go to Top with a When range ending in the future navigates Review to now, never forcing Live", async t => {
+  const wall = HARNESS_PLAYBACK_WALL_CLOCK_MS / 1000;
+  const when = { from: wall - 1800, to: wall + 1800 };
+  const harness = createHistoricalHarness({ initialReviewRange: when, now: () => 1000 });
+  t.after(() => harness.close());
+  manualViewTimers(harness.window);
+  const controller = harness.controller;
+  controller.updateRhs();
+  assert.equal(await controller.goToTimelineEdge("top"), true);
+  await drainReview(controller);
+  assert.equal(controller._presentationMode, "historical", "an ordinary Review navigation, not Live");
+  assert.equal(controller.clock.absoluteTime, wall, "the newest Review time that exists");
+  assert.equal(controller._timelineViewport.to, when.to);
+});
+
+test("Go to Top and Go to Bottom are unavailable off the Timeline tab", async t => {
+  const T = 1800000000;
+  const when = { from: T - 3 * 86400, to: T };
+  const harness = createHistoricalHarness({ initialReviewRange: when, now: () => 1000 });
+  t.after(() => harness.close());
+  const controller = harness.controller;
+  await controller.playHistorical(T - 86400, { autoplay: false, updateDisplayedRange: false, playbackRange: when });
+  await drainReview(controller);
+  controller.setRhsMode("events");
+  const top = harness.root.querySelector(".review-timeline-top");
+  const bottom = harness.root.querySelector(".review-timeline-bottom");
+  assert.equal(top.disabled, true);
+  assert.equal(bottom.disabled, true);
+  const requestId = controller._reviewRequestId;
+  assert.equal(await controller.goToTimelineEdge("top"), false);
+  assert.equal(controller.clock.absoluteTime, T - 86400);
+  assert.equal(controller._reviewRequestId, requestId);
+  controller.setRhsMode("timeline");
+  assert.equal(top.disabled, false);
+});
+
+// Go to Top / Go to Bottom always end paused: never Play, never resume after acquisition.
+async function edgeScene(t) {
+  const when = { from: RECOVERY_T - 3600, to: RECOVERY_T + 3600 };
+  const scene = await createRecoveryScene(t, { coverage: RECOVERY_FULL_COVERAGE,
+    harnessOptions: { initialReviewRange: when } });
+  const { controller, harness } = scene;
+  const plays = () => harness.playCalls.length;
+  // Paused, nothing playing, nothing pending: the only acceptable end state.
+  const expectPausedAt = async (epoch, message) => {
+    for (let index = 0; index < 4; index += 1) {
+      scene.advance(500);
+      await scene.tick();
+    }
+    assert.equal(controller.clock.running, false, `${message}: the clock stays paused`);
+    assert.equal(controller.playbackRequested, false, `${message}: no Play intent`);
+    assert.equal(controller.clock.absoluteTime, epoch, `${message}: the chosen Review time is kept`);
+    assert.equal(controller._presentationMode, "historical");
+    assert.ok([...controller._historicalPlayers.values()].every(player => !player.video || player.video.paused),
+      `${message}: no video plays`);
+  };
+  return { ...scene, when, plays, expectPausedAt };
+}
+
+test("Go to Top and Go to Bottom from Playing move viewport and Review time and end paused", async t => {
+  const scene = await edgeScene(t);
+  const { controller, when, plays } = scene;
+  await bbPlay(scene, 2000);
+  assert.equal(controller.clock.running, true, "playing before the click");
+  for (const [edge, epoch] of [["top", when.to], ["bottom", when.from]]) {
+    controller.resumePlayback();
+    await drainReview(controller);
+    const before = plays();
+    assert.equal(await controller.goToTimelineEdge(edge), true);
+    await drainReview(controller);
+    await scene.expectPausedAt(epoch, edge);
+    assert.equal(plays(), before, `${edge}: no Play command is issued`);
+    const viewport = controller._timelineViewport;
+    assert.equal(edge === "top" ? viewport.to : viewport.from, epoch);
+  }
+  // Normal Play still works afterwards.
+  assert.equal(controller.resumePlayback(), true);
+  await drainReview(controller);
+  assert.equal(controller.clock.running, true);
+});
+
+test("rapid alternating Top/Bottom clicks while navigation is pending never start Play", async t => {
+  const scene = await edgeScene(t);
+  const { controller, harness, when, plays } = scene;
+  controller.pausePlayback();
+  await drainReview(controller);
+  const before = plays();
+  // Withhold every landing so each navigation is still pending when the next click lands.
+  scene.deferredFrame.add("Drive Up");
+  scene.deferredFrame.add("Drive Down");
+  const top = harness.root.querySelector(".review-timeline-top");
+  const bottom = harness.root.querySelector(".review-timeline-bottom");
+  for (const button of [top, bottom, top, bottom, top, bottom]) {
+    button.click();
+    await Promise.resolve();
+  }
+  scene.deferredFrame.clear();
+  for (const name of ["Drive Up", "Drive Down"]) scene.media(name)?.emitFrame();
+  await drainReview(controller);
+  await scene.expectPausedAt(when.from, "after the last (Bottom) click");
+  assert.equal(plays(), before);
+});
+
+test("a superseded Play-intent seek completing late cannot resume playback after Go to Bottom", async t => {
+  const scene = await edgeScene(t);
+  const { controller, when, plays } = scene;
+  await bbPlay(scene, 1000);
+  // A Play-intent navigation whose acquisition is still pending.
+  scene.deferredFrame.add("Drive Up");
+  scene.deferredFrame.add("Drive Down");
+  const stale = controller.seekHistoricalToEpoch(RECOVERY_T + 1800, { autoplay: true });
+  await Promise.resolve();
+  const before = plays();
+  assert.equal(await controller.goToTimelineEdge("bottom"), true);
+  // The superseded acquisition now completes.
+  scene.deferredFrame.clear();
+  for (const name of ["Drive Up", "Drive Down"]) scene.media(name)?.emitFrame();
+  assert.equal(await stale, false, "the superseded seek reports supersession");
+  await drainReview(controller);
+  await scene.expectPausedAt(when.from, "after the late completion");
+  assert.equal(plays(), before);
+  // Other navigation keeps its own Play semantics.
+  assert.equal(await controller.seekHistoricalToEpoch(RECOVERY_T + 600, { autoplay: true }), true);
+  await drainReview(controller);
+  assert.equal(controller.clock.running, true);
+});
+
+test("Copy Diagnostics sits apart from the playback options with quieter styling", t => {
+  const harness = createHistoricalHarness();
+  t.after(() => harness.close());
+  const options = harness.root.querySelector(".review-options-controls");
+  const copy = options.querySelector(".review-copy-diagnostics");
+  assert.ok(copy, "always available, without a setting");
+  assert.strictEqual(options.lastElementChild, copy);
+  assert.ok(copy.previousElementSibling.querySelector(".review-snap-past-crap"),
+    "it follows the final playback option");
+  assert.equal(copy.textContent, "Copy diagnostics");
+  const source = readFileSync(new URL("../nvr-card.js", import.meta.url), "utf8");
+  const copyRule = source.match(/\n\s*\.review-copy-diagnostics\s*{([^}]*)}/)?.[1] ?? "";
+  assert.match(copyRule, /margin-top:\s*16px;/);
+  assert.match(copyRule, /background:\s*transparent;/);
+  assert.match(copyRule, /color:\s*#9fb0ba;/);
+  assert.match(copyRule, /min-height:\s*36px;/);
+  assert.match(source, /\.review-copy-diagnostics:focus-visible\s*{[^}]*outline:\s*2px solid #6faed9;/);
+  // No longer part of the prominent filled button style.
+  const primary = source.match(/\.review-diagnostics button,\s*\n\s*\.review-transport button\s*{[^}]*}/)?.[0] ?? "";
+  assert.match(primary, /min-height:\s*44px;/);
+  assert.doesNotMatch(source, /\.review-copy-diagnostics,\s*\n\s*\.review-transport button/);
+});
+
 test("Review Timeline exposes clean empty and error states", async t => {
   const empty = createHistoricalHarness();
   t.after(() => empty.close());
