@@ -2051,7 +2051,7 @@ test("Blackboard short event: a verified landing with no further frames is LANDE
     /^- Drive Up: PROBLEM DETECTED \(recovered; R-09 short events\)\n {4}Steady playback: PROBLEM DETECTED \(recovered\) - not presenting/,
     "a visited short event is never evidence of healthy playback");
   assert.match(bbVerdict(report, "Drive Up"), /\n {4}Short events: 1\/1 below visible-playback criterion \(flash 0, landed_only 1, nothing 0\)$/);
-  assert.match(report, /Drive Up @ .*\(1\.00s\): landed_only; frames 0, span 0\.00s, landing verified, .*exit held, next reached yes/);
+  assert.match(report, /\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{2} \S+ \[1800000100\.00\] Drive Up 1\.00s LANDED_ONLY: frames 0, span 0\.00s; landing verified \(\+0\.00s from event start\); acquisition [^;]+; exit held; next event reached/);
 });
 
 

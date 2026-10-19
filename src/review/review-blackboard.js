@@ -79,8 +79,11 @@ const BIN_FIELDS = 9;
 const INCIDENT_FIRST = 16;
 const INCIDENT_RECENT = 48;
 const INCIDENT_WORST = 8;
+// Deficient events keep their first and last examples per class, so a flood of one class
+// (FLASH) cannot push out a rare, more severe one (NOTHING). Exact totals live in the matrix.
+const EVENT_EXAMPLE_CLASSES = ["nothing", "landed_only", "flash"];   // most severe first
 const EVENT_EXAMPLES_FIRST = 8;
-const EVENT_EXAMPLES_RECENT = 16;
+const EVENT_EXAMPLES_RECENT = 8;
 const NAVIGATION_RECENT = 16;
 const GAP_RING = 16;
 const CHANGE_RING = 16;
@@ -252,7 +255,8 @@ export class ReviewBlackboard {
         total: 0, dropped: 0, sequence: 0 },
       navigation: { bySource: {}, recent: [], pending: null },
       autoSnap: { intervals: 0, interrupted: 0, stops: {}, active: null, pendingExit: [], sequence: 0,
-        examples: { first: [], recent: [], dropped: 0 }, deadTimeHist: new Float64Array(7),
+        examples: Object.fromEntries(EVENT_EXAMPLE_CLASSES.map(cls => [cls, { first: [], recent: [] }])),
+        deadTimeHist: new Float64Array(7),
         lastEndMs: null },
       skip: { count: 0, seconds: 0, max: 0 },
       spreadHist: new Float64Array(7),
@@ -510,6 +514,13 @@ export class ReviewBlackboard {
         }
         if (record.preparingTrigger !== "play") {
           const outcome = state === "participating" ? "landed" : state === "failed" ? "failed" : "abandoned";
+          // The interval that started this acquisition learns how it ended, at the moment it ended.
+          const during = session.autoSnap.active;
+          const trackedHere = during && during.id === record.preparingInterval
+            ? during.cameras.get(record.name) : null;
+          if (trackedHere && outcome === "landed" && bbFinite(nowMs)) {
+            trackedHere.landedMs = Math.max(0, nowMs - during.startedMs);
+          } else if (trackedHere && outcome === "failed") trackedHere.failed = true;
           if (outcome === "landed") {
             record.acquisitions.landed += 1;
             if (details.verified === true) record.acquisitions.verified += 1;
@@ -559,11 +570,20 @@ export class ReviewBlackboard {
     }
     if (record.lastEvent?.id !== interval) return;
     counts.abandonedLinked[record.lastEvent.cls] = (counts.abandonedLinked[record.lastEvent.cls] ?? 0) + 1;
-    const examples = session.autoSnap.examples;
-    for (const example of [...session.autoSnap.pendingExit.map(item => item.example), ...examples.first,
-      ...examples.recent]) {
-      if (example.intervalId === interval && example.camera === record.name) example.abandoned = reason;
+    for (const example of [...session.autoSnap.pendingExit.map(item => item.example),
+      ...this.retainedExamples()]) {
+      if (example.intervalId === interval && example.camera === record.name) {
+        example.abandoned = reason;
+        example.acquisition = "abandoned";
+      }
     }
+  }
+
+  retainedExamples() {
+    return EVENT_EXAMPLE_CLASSES.flatMap(cls => {
+      const bucketOf = this.session.autoSnap.examples[cls];
+      return [...bucketOf.first, ...bucketOf.recent];
+    });
   }
 
   failure(record) {
@@ -644,7 +664,8 @@ export class ReviewBlackboard {
       const name = safeName(camera.name);
       if (!this.camera(name)) continue;
       active.cameras.set(name, { frames0: bbFinite(camera.frames) ? camera.frames : 0,
-        unobserved: camera.visible === false, acquisition: false, abandoned: null });
+        unobserved: camera.visible === false, acquisition: false, abandoned: null,
+        landedMs: null, failed: false });
     }
     session.autoSnap.active = active;
   }
@@ -700,10 +721,22 @@ export class ReviewBlackboard {
         record.acquisitions.abandonedLinked[cls] = (record.acquisitions.abandonedLinked[cls] ?? 0) + 1;
       }
       if (kind === E.flash || kind === E.landed_only || kind === E.nothing) {
+        // How this interval's own acquisition stood at the boundary, from what was observed.
+        let acquisition = "none_begun";
+        let unfinished = false;
+        if (tracked.acquisition) {
+          unfinished = tracked.landedMs === null && !tracked.failed && !tracked.abandoned &&
+            record.preparingInterval === active.id && record.preparingSinceMs !== null;
+          acquisition = tracked.abandoned ? "abandoned" : tracked.failed ? "failed"
+            : tracked.landedMs !== null ? "landed" : unfinished ? "unfinished" : "unknown";
+        }
+        const verified = camera.verifiedLanding === true;
         session.autoSnap.pendingExit.push({ record, example: {
           intervalId: active.id, camera: name, start: active.start, duration,
-          cls: BLACKBOARD_EVENT_CLASSES[kind], frames, span, landed, acquisition: tracked.acquisition,
-          abandoned: tracked.abandoned, exit: null, nextReached: false, atWall: spec.wallMs ?? null },
+          cls: BLACKBOARD_EVENT_CLASSES[kind], frames, span, verified, landed,
+          landingOffset: verified && landedEpoch !== null ? landedEpoch - active.start : null,
+          acquisition, unfinished, landedAfterMs: tracked.landedMs, abandoned: tracked.abandoned,
+          exit: null, nextReached: false },
           dueMs: nowMs });
       }
     }
@@ -731,12 +764,9 @@ export class ReviewBlackboard {
       }
       item.example.exit = !prev || prev.nowMs <= item.dueMs ? "unknown" : prev.held ? "held"
         : prev.lifecycle === "participating" ? "own_video" : "empty";
-      const examples = session.autoSnap.examples;
-      if (examples.first.length < EVENT_EXAMPLES_FIRST) examples.first.push(item.example);
-      else {
-        if (examples.recent.length >= EVENT_EXAMPLES_RECENT) examples.dropped += 1;
-        ring(examples.recent, item.example, EVENT_EXAMPLES_RECENT);
-      }
+      const bucketOf = session.autoSnap.examples[item.example.cls];
+      if (bucketOf.first.length < EVENT_EXAMPLES_FIRST) bucketOf.first.push(item.example);
+      else ring(bucketOf.recent, item.example, EVENT_EXAMPLES_RECENT);
     }
     session.autoSnap.pendingExit = remaining;
   }
@@ -1307,8 +1337,7 @@ export class ReviewBlackboard {
     const incidents = session.incidents;
     bytes += (incidents.first.length + incidents.recent.length + incidents.worst.length +
       incidents.open.size) * 320;
-    bytes += (session.autoSnap.examples.first.length + session.autoSnap.examples.recent.length +
-      session.autoSnap.pendingExit.length) * 256;
+    bytes += (this.retainedExamples().length + session.autoSnap.pendingExit.length) * 320;
     bytes += (session.navigation.recent.length + session.observation.gaps.length +
       session.changes.length) * 160;
     bytes += Object.keys(session.navigation.bySource).length * 200;
@@ -1505,6 +1534,11 @@ export class ReviewBlackboard {
         out(essential, `${record.name}: ${rows.join(" | ") || "none"}`);
       }
       out(essential, `Dead time between intervals: ${this.histText(session.autoSnap.deadTimeHist, LATENCY_EDGES_MS, "ms")}`);
+      const deficient = EVENT_EXAMPLE_CLASSES.map(cls => [cls, shortEvents.counts[cls]]);
+      const total = deficient.reduce((sum, [, count]) => sum + count, 0);
+      out(essential, `Deficient events (exact totals): ${total} of ${shortEvents.expected} expected camera-events` +
+        ` (${deficient.map(([cls, count]) => `${cls} ${count}`).join(", ")}); the list below is a bounded sample` +
+        ` (first ${EVENT_EXAMPLES_FIRST} and last ${EVENT_EXAMPLES_RECENT} per class).`);
     }
 
     // Incidents summary.
@@ -1530,14 +1564,9 @@ export class ReviewBlackboard {
       detail.push("", `== ${title} ==`, ...lines);
     };
     section("WORST INCIDENTS", session.incidents.worst.map(item => this.incidentText(item, epochText, wallText)));
+    section("DEFICIENT EVENTS (R-09): Auto Snap intervals without adequate visible playback",
+      this.deficientEventLines(timeZone));
     section("HEALTH STRIPS (one character per time bin of recording time)", this.strips(epochText));
-    const examples = session.autoSnap.examples;
-    section("PROBLEMATIC SHORT EVENTS", [...examples.first, ...examples.recent].map(item =>
-      `${item.camera} @ ${epochText(item.start)} (${item.duration.toFixed(2)}s): ${item.cls}; frames ${item.frames},` +
-      ` span ${item.span.toFixed(2)}s, landing ${item.landed ? "verified" : "none"}, acquisition ` +
-      `${item.acquisition ? "yes" : "no"}${item.abandoned ? ` (abandoned: ${item.abandoned})` : ""}, exit ` +
-      `${item.exit ?? "pending"}, next reached ${item.nextReached ? "yes" : "no"}`)
-      .concat(examples.dropped ? [`[${examples.dropped} more omitted; counts above are complete]`] : []));
     section("NAVIGATION (outcomes: settled_observed = a heartbeat saw it settled; settled_unsampled = settled" +
       " between heartbeats; unsettled_replaced = still unsettled when the next request began)",
     Object.entries(session.navigation.bySource).map(([source, value]) =>
@@ -1585,6 +1614,69 @@ export class ReviewBlackboard {
       text = `${text.slice(0, REPORT_CAP_BYTES - 64)}\n[report truncated at the hard cap]`;
     }
     return text;
+  }
+
+  // Review-time-zone timestamp with centisecond precision, plus the absolute epoch: usable to
+  // locate a short event in the Review timeline and When range, copied as plain text.
+  preciseTime(epoch, timeZone) {
+    if (!bbFinite(epoch)) return "unknown time";
+    const attempt = zone => {
+      const parts = Object.fromEntries(new Intl.DateTimeFormat("en-CA", {
+        ...(zone ? { timeZone: zone } : { timeZone: "UTC" }),
+        year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit",
+        second: "2-digit", hourCycle: "h23", timeZoneName: "short"
+      }).formatToParts(new Date(Math.floor(epoch) * 1000)).map(part => [part.type, part.value]));
+      const centis = String(Math.floor((epoch - Math.floor(epoch)) * 100)).padStart(2, "0");
+      return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second}.${centis}` +
+        ` ${String(parts.timeZoneName).replace(/[^\w+:-]/g, "").slice(0, 12)}`;
+    };
+    let text;
+    try { text = attempt(timeZone ? String(timeZone) : null); } catch { text = attempt(null); }
+    return `${text} [${epoch.toFixed(2)}]`;
+  }
+
+  deficientEventLines(timeZone) {
+    const session = this.session;
+    const counts = this.shortEventAssessment().counts;
+    const pending = session.autoSnap.pendingExit.map(item => item.example);
+    const lines = [
+      "Times are the Review time zone with centiseconds, then the absolute recording time in seconds [epoch].",
+      "Each entry is an Auto Snap interval (a merged event span), not proof of video. Evidence is shown",
+      "as observed; \"not observed\" or \"unknown\" means it could not be established. Totals are exact;",
+      "only the listed sample is bounded."
+    ];
+    for (const cls of EVENT_EXAMPLE_CLASSES) {
+      const bucketOf = session.autoSnap.examples[cls];
+      const listed = [...bucketOf.first, ...bucketOf.recent, ...pending.filter(example => example.cls === cls)];
+      const total = counts[cls];
+      if (!total && !listed.length) continue;
+      lines.push(`${cls.toUpperCase()}: ${total} total, ${listed.length} listed` +
+        `${total > listed.length ? `, ${total - listed.length} omitted from the list` : ""}`);
+      listed.forEach((item, index) => {
+        if (index === bucketOf.first.length && bucketOf.recent.length && total > listed.length) {
+          lines.push(`  ... ${total - listed.length} more ${cls} events between the first and last listed ...`);
+        }
+        lines.push("  " + this.deficientEventText(item, timeZone));
+      });
+    }
+    return lines.length > 4 ? lines : [];
+  }
+
+  deficientEventText(item, timeZone) {
+    const offset = item.landingOffset === null ? null
+      : `${item.landingOffset >= 0 ? "+" : ""}${item.landingOffset.toFixed(2)}s from event start`;
+    const landing = item.landed ? `verified (${offset})`
+      : item.verified ? `verified but outside the event window (${offset})` : "not verified";
+    const acquisition = item.acquisition === "none_begun" ? "none begun in this interval"
+      : item.acquisition === "landed" ? `landed ${Math.round(item.landedAfterMs)} ms after interval start (wall)`
+        : item.acquisition === "abandoned"
+          ? `${item.unfinished ? "unfinished at boundary, then " : ""}abandoned (${item.abandoned ?? "other"})`
+          : item.acquisition === "unfinished" ? "unfinished at boundary"
+            : item.acquisition === "failed" ? "failed" : "unknown";
+    const exit = item.exit === null ? "not observed" : item.exit;
+    return `${this.preciseTime(item.start, timeZone)} ${item.camera} ${item.duration.toFixed(2)}s ` +
+      `${item.cls.toUpperCase()}: frames ${item.frames}, span ${item.span.toFixed(2)}s; landing ${landing}; ` +
+      `acquisition ${acquisition}; exit ${exit}; next event ${item.nextReached ? "reached" : "not reached"}`;
   }
 
   histText(hist, edges, unit, timeWeighted = false) {

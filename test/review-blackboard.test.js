@@ -153,7 +153,7 @@ test("Blackboard memory stays bounded for 16 cameras over a 7-day investigation"
   assert.ok(bytes - afterDay < 40 * 1024, "growth is limited to the bounded rings");
   assert.equal(session.bins.count, 168);
   assert.ok(session.incidents.first.length + session.incidents.recent.length <= 64);
-  assert.ok(session.autoSnap.examples.first.length + session.autoSnap.examples.recent.length <= 24);
+  assert.ok(board.retainedExamples().length <= 48);
   assert.equal(session.autoSnap.intervals, 3000);
   const report = board.report({ wallMs: sim.state.wallMs });
   assert.ok(report.length <= 64 * 1024, `report ${report.length} bytes`);
@@ -545,5 +545,164 @@ test("Blackboard reproduces the 645-interval Auto Snap report with corrected acc
   assert.match(report, /auto_snap: requested 645; settled_observed 617, settled_unsampled 20, unsettled_replaced 8, unsettled_window 0, indeterminate 0/);
   assert.match(report, /^Review time traversed continuously: 3h 26m observed \+ 0ms unobserved \(2\.0% of the range\)\. ReviewClock motion only/m);
   assert.match(report, /^Outside visited time: before first visit 6m 23s, after last visit /m);
-  assert.match(report, /acquisition yes \(abandoned: superseded_by_explicit_seek\)/);
+  assert.match(report, /acquisition unfinished at boundary, then abandoned \(superseded_by_explicit_seek\)/);
+});
+
+// ---- R-09 diagnostic evidence: locatable, severity-aware deficient-event reporting ----
+
+// One Auto Snap interval on the single-camera simulation. Cameras report what the controller
+// would: frames presented, whether a verified landing exists and where, and coverage.
+function interval(sim, { start, duration = 1, frames = 0, verified = false, landedAt = null, acquire = null,
+  tickAfter = true }) {
+  const { board, st, tick } = sim;
+  board.autoSnapStart({ nowMs: st.nowMs, start, end: start + duration }, [{ name: "Drive Up", frames: st.frames }]);
+  if (acquire) {
+    board.cameraEvent("Drive Up", "lifecycle", { nowMs: st.nowMs, state: "preparing",
+      previousState: "participating", boundaryReason: "explicit_seek" });
+    if (acquire.landAfterMs !== undefined) {
+      board.cameraEvent("Drive Up", "lifecycle", { nowMs: st.nowMs + acquire.landAfterMs, state: "participating",
+        previousState: "preparing", verified });
+    } else if (acquire.fail) {
+      board.cameraEvent("Drive Up", "lifecycle", { nowMs: st.nowMs + 50, state: "failed",
+        previousState: "preparing", boundaryReason: "camera_prepare_failed" });
+    }
+  }
+  board.autoSnapEnd({ nowMs: st.nowMs + 100 }, [{ name: "Drive Up", frames: st.frames + frames, coverage: "recorded",
+    verifiedLanding: verified, landedEpoch: landedAt, frameEpoch: start + 0.5 }]);
+  if (tickAfter) tick(2);
+}
+
+const deficientLines = report => {
+  const lines = report.split("\n");
+  const start = lines.findIndex(line => line.startsWith("== DEFICIENT EVENTS"));
+  if (start < 0) return [];
+  const out = [];
+  for (let index = start + 1; index < lines.length && lines[index] !== ""; index += 1) out.push(lines[index]);
+  return out;
+};
+
+test("Blackboard deficient events carry locatable timestamps and keep FLASH, LANDED_ONLY and NOTHING distinct", () => {
+  const sim = singleCamera();
+  const { board } = sim;
+  const T = T0 + 3600.25;            // 2027-01-14 17:00:00.25 PST
+  sim.tick(4);
+  interval(sim, { start: T, duration: 1.24, frames: 1, verified: true, landedAt: T + 0.03 });        // FLASH
+  interval(sim, { start: T + 100, duration: 2, frames: 0, verified: true, landedAt: T + 100 });      // LANDED_ONLY
+  interval(sim, { start: T + 200.5, duration: 1, frames: 0, verified: false });                       // NOTHING
+  // A verified landing that fell outside the event window is still NOTHING, and says so.
+  interval(sim, { start: T + 300, duration: 1, frames: 0, verified: true, landedAt: T + 303.5, tickAfter: false });
+  const report = board.report({ wallMs: 0, nowMs: sim.st.nowMs, timeZone: "America/Los_Angeles" });
+  const lines = deficientLines(report);
+  const text = lines.join("\n");
+  assert.match(text, /^NOTHING: 2 total, 2 listed$/m);
+  assert.match(text, /^LANDED_ONLY: 1 total, 1 listed$/m);
+  assert.match(text, /^FLASH: 1 total, 1 listed$/m);
+  assert.ok(lines.findIndex(line => line.startsWith("NOTHING")) < lines.findIndex(line => line.startsWith("LANDED_ONLY")) &&
+    lines.findIndex(line => line.startsWith("LANDED_ONLY")) < lines.findIndex(line => line.startsWith("FLASH")),
+  "most severe first");
+  // Absolute time with centiseconds in the Review time zone, plus the epoch.
+  assert.match(text, /^ {2}2027-01-14 17:00:00\.25 PST \[1799974800\.25\] Drive Up 1\.24s FLASH: frames 1, span \d+\.\d{2}s; landing verified \(\+0\.03s from event start\);/m);
+  assert.match(text, /^ {2}2027-01-14 17:01:40\.25 PST \[1799974900\.25\] Drive Up 2\.00s LANDED_ONLY: frames 0, span 0\.00s; landing verified \(\+0\.00s from event start\);/m);
+  assert.match(text, /^ {2}2027-01-14 17:03:20\.75 PST \[1799975000\.75\] Drive Up 1\.00s NOTHING: frames 0, span 0\.00s; landing not verified;/m);
+  assert.match(text, /\[1799975100\.25\] Drive Up 1\.00s NOTHING: .*landing verified but outside the event window \(\+3\.50s from event start\)/);
+  // Evidence that was never observed is stated as such, not invented.
+  assert.match(text, /\[1799975100\.25\][^\n]*exit not observed; next event not reached$/m);
+  assert.match(text, /\[1799975000\.75\][^\n]*acquisition none begun in this interval;/);
+  assert.match(text, /\[1799974800\.25\][^\n]*exit (held|own_video|empty|unknown);/);
+  // Exact totals in the summary, distinct from the listed sample.
+  assert.match(report, /^Deficient events \(exact totals\): 4 of 4 expected camera-events \(nothing 2, landed_only 1, flash 1\); the list below is a bounded sample \(first 8 and last 8 per class\)\.$/m);
+  // Without a zone the timestamp is explicit UTC.
+  assert.match(board.report({ wallMs: 0, nowMs: sim.st.nowMs }), /2027-01-15 01:00:00\.25 UTC \[1799974800\.25\]/);
+});
+
+test("Blackboard deficient events state how their own acquisition ended, from observed lifecycle only", () => {
+  const sim = singleCamera();
+  const { board } = sim;
+  const T = T0 + 1000;
+  sim.tick(4);
+  interval(sim, { start: T, frames: 0, verified: true, landedAt: T, acquire: { landAfterMs: 800 } });   // landed
+  interval(sim, { start: T + 10, frames: 0, verified: false, acquire: { fail: true } });                // failed
+  interval(sim, { start: T + 20, frames: 0, verified: false, acquire: {} });                            // unfinished
+  // The next navigation begins and supersedes the unfinished acquisition.
+  board.autoSnapStart({ nowMs: sim.st.nowMs, start: T + 30, end: T + 31 }, [{ name: "Drive Up", frames: sim.st.frames }]);
+  board.cameraEvent("Drive Up", "lifecycle", { nowMs: sim.st.nowMs, state: "unavailable", previousState: "preparing",
+    boundaryReason: "superseded_by_explicit_seek" });
+  interval(sim, { start: T + 40, frames: 0, verified: false, acquire: {} });                            // unfinished
+  board.autoSnapStart({ nowMs: sim.st.nowMs, start: T + 50, end: T + 51 }, [{ name: "Drive Up", frames: sim.st.frames }]);
+  board.cameraEvent("Drive Up", "lifecycle", { nowMs: sim.st.nowMs, state: "unavailable", previousState: "preparing",
+    boundaryReason: "some_unlisted_reason" });
+  const text = deficientLines(board.report({ wallMs: 0, nowMs: sim.st.nowMs, timeZone: "UTC" })).join("\n");
+  const line = offset => text.split("\n").find(entry => entry.includes(`[${(T + offset).toFixed(2)}]`)) ?? "";
+  assert.match(line(0), /acquisition landed 800 ms after interval start \(wall\);/);
+  assert.match(line(10), /acquisition failed;/);
+  assert.match(line(20), /acquisition unfinished at boundary, then abandoned \(superseded_by_explicit_seek\);/);
+  assert.match(line(40), /acquisition unfinished at boundary, then abandoned \(other\);/,
+    "an unlisted reason is reported as other, never echoed");
+  assert.ok(!text.includes("some_unlisted_reason"));
+  const acquisitions = board.session.cameras.get("Drive Up").acquisitions;
+  assert.deepEqual(acquisitions.abandonedByReason, { superseded_by_explicit_seek: 1, other: 1 });
+  assert.deepEqual(acquisitions.abandonedLinked, { nothing: 2 }, "linked by interval identity");
+  // The event whose acquisition had not ended when the report was taken says so.
+  const open = singleCamera();
+  open.tick(4);
+  interval(open, { start: T0 + 500, frames: 0, verified: false, acquire: {}, tickAfter: false });
+  assert.match(deficientLines(open.board.report({ wallMs: 0, nowMs: open.st.nowMs })).join("\n"),
+    /acquisition unfinished at boundary;/);
+});
+
+test("Blackboard keeps early and late deficient events of every class after hundreds of events", () => {
+  const sim = singleCamera({ rate: 4 });
+  const { board } = sim;
+  sim.tick(4);
+  const T = T0 + 600;
+  const total = { nothing: 0, landed_only: 0, flash: 0 };
+  const stamp = {};
+  for (let index = 0; index < 600; index += 1) {
+    // Two rare, severe events among a flood of flashes; a few landings only.
+    const cls = index === 3 || index === 598 ? "nothing" : index % 50 === 7 ? "landed_only" : "flash";
+    total[cls] += 1;
+    const start = T + index * 10 + 0.1;
+    stamp[`${cls}${total[cls]}`] = start;
+    interval(sim, { start, duration: 1, frames: cls === "flash" ? 1 : 0, verified: cls !== "nothing",
+      landedAt: cls === "nothing" ? null : start });
+  }
+  const report = board.report({ wallMs: 0, nowMs: sim.st.nowMs, timeZone: "UTC" });
+  const text = deficientLines(report).join("\n");
+  // Exact totals survive; the sample is bounded per class.
+  assert.match(report, new RegExp(`Deficient events \\(exact totals\\): 600 of 600 expected camera-events \\(nothing ${total.nothing}, landed_only ${total.landed_only}, flash ${total.flash}\\)`));
+  assert.match(text, /^NOTHING: 2 total, 2 listed$/m, "a flood of flashes cannot displace the rare severe events");
+  assert.match(text, new RegExp(`^LANDED_ONLY: ${total.landed_only} total, ${total.landed_only} listed$`, "m"));
+  assert.match(text, new RegExp(`^FLASH: ${total.flash} total, 16 listed, ${total.flash - 16} omitted from the list$`, "m"));
+  assert.match(text, new RegExp(`\\.\\.\\. ${total.flash - 16} more flash events between the first and last listed \\.\\.\\.`));
+  const listedEpoch = epoch => text.includes(`[${epoch.toFixed(2)}]`);
+  assert.ok(listedEpoch(stamp.flash1) && listedEpoch(stamp[`flash${total.flash}`]), "earliest and latest FLASH");
+  assert.ok(listedEpoch(stamp.nothing1) && listedEpoch(stamp.nothing2), "both rare NOTHING events");
+  assert.ok(!listedEpoch(stamp.flash20), "a middle flash is honestly omitted");
+  assert.ok(board.retainedExamples().length <= 48, "bounded retention");
+  assert.ok(report.length <= 64 * 1024);
+  assert.ok(board.retainedBytes() < 250 * 1024);
+});
+
+test("Blackboard deficient-event list stays sanitized and the verdict stays consistent with the evidence", () => {
+  const board = new ReviewBlackboard();
+  board.open({ nowMs: 0, wallMs: 0, range: { from: T0, to: T0 + 3600 }, startEpoch: T0, rate: 4,
+    cameras: ["<b>Front \"door\"</b> https://x.test/a?token=SECRET"], visible: true });
+  const name = [...board.session.cameras.keys()][0];
+  board.sample({ nowMs: 500, wallMs: 500, epoch: T0, running: true, rate: 4, visible: true, preparing: false,
+    navigationPreparing: false, requestId: null, rvfc: true, cameras: [{ name, lifecycle: "participating",
+      reason: null, transition: false, waiting: false, presentation: {}, frames: 0, mediaEpoch: T0, frameEpoch: T0,
+      held: false, coverage: "recorded", recovery: null }] });
+  board.autoSnapStart({ nowMs: 500, start: T0 + 5, end: T0 + 6 }, [{ name, frames: 0 }]);
+  board.autoSnapEnd({ nowMs: 600 }, [{ name, frames: 0, coverage: "recorded", verifiedLanding: false }]);
+  const report = board.report({ wallMs: 0, nowMs: 700, timeZone: "Not/AZone" });
+  // The label is operator text; its URL, markup and quoting structure is stripped.
+  for (const forbidden of ["<", "://", "token=", "\"door\""]) {
+    assert.ok(!report.includes(forbidden), `report must not contain ${forbidden}`);
+  }
+  assert.ok(!/[<>"\/?=]/.test(name), `the label keeps no markup, slash, query or quoting characters: ${name}`);
+  assert.ok(report.includes(`${name} 1.00s NOTHING:`) || report.includes(`${name} `), "the sanitized label is what is listed");
+  assert.match(report, /NOTHING: 1 total, 1 listed/);
+  assert.match(report, /2027-01-15 \d{2}:\d{2}:\d{2}\.00 UTC \[\d+\.00\]/, "an invalid zone falls back to UTC");
+  assert.match(report, /^- [^\n]+: PROBLEM DETECTED \(R-09 short events\)$/m);
+  assert.match(report, /Short events: 1\/1 below visible-playback criterion \(flash 0, landed_only 0, nothing 1\)/);
 });
